@@ -1,0 +1,8 @@
+---
+micolab_technitium_stage_dir: /var/lib/microlab/staged
+micolab_technitium_release_marker: /var/lib/microlab/technitium-release.sha256
+micolab_technitium_runtime_marker: /var/lib/microlab/dotnet-runtime.sha256
+micolab_technitium_systemd_unit: /etc/systemd/system/{{ micolab_technitium_service_name }}.service
+micolab_technitium_logrotate_file: /etc/logrotate.d/technitium-dns
+micolab_technitium_health_retries: 30
+micolab_technitium_health_delay: 2

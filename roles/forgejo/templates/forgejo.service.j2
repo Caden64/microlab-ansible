@@ -1,0 +1,35 @@
+[Unit]
+Description=Forgejo (MicroLab native systemd service)
+Documentation=https://forgejo.org/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User={{ micolab_forgejo_user }}
+Group={{ micolab_forgejo_group }}
+WorkingDirectory={{ micolab_forgejo_data_dir }}
+RuntimeDirectory=forgejo
+RuntimeDirectoryMode=0750
+Environment=USER={{ micolab_forgejo_user }}
+Environment=HOME={{ micolab_forgejo_home }}
+Environment=FORGEJO_WORK_DIR={{ micolab_forgejo_data_dir }}
+ExecStart={{ micolab_forgejo_binary_path }} web --config {{ micolab_forgejo_config_file }}
+Restart=always
+RestartSec=2s
+UMask=0027
+LimitNOFILE=524288
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths={{ micolab_forgejo_data_dir }} {{ micolab_forgejo_home }}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=MicroLab offline DNS recursion fixture ({{ micolab_dns_fixture_zone }})
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 {{ micolab_dns_fixture_script_path }} --listen {{ micolab_dns_fixture_listen_address }} --port {{ micolab_dns_fixture_port | int }} --zone {{ micolab_dns_fixture_zone }} --name {{ micolab_dns_fixture_name }} --answer {{ micolab_dns_fixture_expected_ip }} --ttl {{ micolab_dns_fixture_ttl | int }}
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

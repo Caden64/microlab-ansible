@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  role_name: step_ca
+  author: MicroLab
+  description: Deploy an offline-root-signed step-ca intermediate CA on Debian.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+  galaxy_tags:
+    - pki
+    - stepca
+    - acme
+
+dependencies: []

@@ -1,0 +1,68 @@
+---
+# Pinned official Forgejo arch binary. Supply version + SHA-256 and a staged file.
+micolab_forgejo_version: ""
+micolab_forgejo_checksums: {}
+micolab_forgejo_artifact_src_amd64: ""
+micolab_forgejo_artifact_src_arm64: ""
+micolab_forgejo_staged_artifact_name: "forgejo"
+micolab_forgejo_allow_online_download: false
+micolab_forgejo_download_base_url: "https://codeberg.org/forgejo/forgejo/releases/download"
+micolab_forgejo_binary_path: "/usr/local/bin/forgejo"
+micolab_forgejo_install_root: "/opt/microlab/forgejo"
+micolab_forgejo_cache_dir: "/var/cache/microlab/forgejo"
+micolab_forgejo_service_name: "forgejo"
+
+# OS account and paths.
+micolab_forgejo_user: "git"
+micolab_forgejo_group: "git"
+micolab_forgejo_home: "/home/git"
+micolab_forgejo_config_dir: "/etc/forgejo"
+micolab_forgejo_config_file: "/etc/forgejo/app.ini"
+micolab_forgejo_data_dir: "/var/lib/forgejo"
+micolab_forgejo_app_data_path: "/var/lib/forgejo/data"
+micolab_forgejo_repo_root: "/var/lib/forgejo/data/forgejo-repositories"
+micolab_forgejo_db_path: "/var/lib/forgejo/data/forgejo.db"
+micolab_forgejo_bootstrap_marker: "/var/lib/forgejo/.microlab-admin-bootstrapped"
+micolab_forgejo_required_local_filesystems:
+  - ext4
+  - xfs
+  - btrfs
+  - f2fs
+
+# Public service contract.
+micolab_forgejo_domain: "git.microlab.hnh"
+micolab_forgejo_root_url: "https://git.microlab.hnh/"
+micolab_forgejo_http_addr: "127.0.0.1"
+micolab_forgejo_http_port: 3000
+micolab_forgejo_ssh_domain: "git.microlab.hnh"
+micolab_forgejo_ssh_port: 22
+micolab_forgejo_health_url: "http://127.0.0.1:3000/api/healthz"
+micolab_forgejo_health_retries: 30
+micolab_forgejo_health_delay: 5
+
+# Durable secrets. There are deliberately no defaults; the role fails closed.
+micolab_forgejo_secret_key: ""
+micolab_forgejo_internal_token: ""
+micolab_forgejo_jwt_secret: ""
+micolab_forgejo_lfs_jwt_secret: ""
+micolab_forgejo_admin_username: ""
+micolab_forgejo_admin_email: ""
+micolab_forgejo_admin_password: ""
+micolab_forgejo_admin_password_min_length: 16
+
+# Hard requirements from the deployment plan.
+micolab_forgejo_install_lock: true
+micolab_forgejo_disable_registration: true
+micolab_forgejo_actions_enabled: false
+micolab_forgejo_lfs_enabled: true
+
+# System OpenSSH on port 22; Forgejo manages the git user's authorized_keys.
+micolab_forgejo_manage_sshd: true
+micolab_forgejo_sshd_service: "ssh"
+micolab_forgejo_sshd_dropin: "/etc/ssh/sshd_config.d/90-microlab-forgejo.conf"
+micolab_forgejo_require_local_filesystem: true
+
+# Non-secret limits that are useful for a small self-hosted forge.
+micolab_forgejo_upload_max_mb: 512
+micolab_forgejo_attachment_max_mb: 512
+micolab_forgejo_upload_max_files: 20

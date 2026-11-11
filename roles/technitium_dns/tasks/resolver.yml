@@ -1,0 +1,185 @@
+---
+- name: Ensure the acceptance directory exists
+  ansible.builtin.file:
+    path: "{{ micolab_dns_acceptance_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect the host resolver file
+  ansible.builtin.stat:
+    path: "{{ micolab_dns_resolv_conf }}"
+  register: micolab_dns_resolv_stat
+
+- name: Refuse to manage a symlinked resolver file
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_resolv_stat.stat.exists
+      - not micolab_dns_resolv_stat.stat.islnk | bool
+      - not micolab_dns_resolv_stat.stat.isdir | bool
+    fail_msg: >-
+      {{ micolab_dns_resolv_conf }} is missing, a symlink, or a directory.
+      This role will not silently replace a systemd-resolved or
+      NetworkManager-managed symlink. Disable the stub resolver and provide a
+      regular file, or set micolab_dns_manage_resolv_conf=false.
+    quiet: true
+  when: micolab_dns_manage_resolv_conf | bool
+
+- name: Check for an existing resolver backup
+  ansible.builtin.stat:
+    path: "{{ micolab_dns_resolv_backup }}"
+  register: micolab_dns_resolv_backup_stat
+  when: micolab_dns_manage_resolv_conf | bool
+
+- name: Preserve the pre-deployment resolver configuration
+  ansible.builtin.copy:
+    src: "{{ micolab_dns_resolv_conf }}"
+    dest: "{{ micolab_dns_resolv_backup }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - micolab_dns_manage_resolv_conf | bool
+    - not micolab_dns_resolv_backup_stat.stat.exists
+
+- name: Re-check the backup after a possible first-run creation
+  ansible.builtin.stat:
+    path: "{{ micolab_dns_resolv_backup }}"
+    checksum_algorithm: sha256
+  register: micolab_dns_resolv_backup_ready
+  when: micolab_dns_manage_resolv_conf | bool
+
+- name: Require a usable backup before changing the resolver
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_resolv_backup_ready.stat.exists
+      - micolab_dns_resolv_backup_ready.stat.isreg
+      - micolab_dns_resolv_backup_ready.stat.checksum | default('') | length == 64
+    fail_msg: >-
+      The resolver backup {{ micolab_dns_resolv_backup }} was not created or is
+      not a regular file. Refusing to switch {{ micolab_dns_resolv_conf }}
+      without a restorable copy.
+    quiet: true
+  when: micolab_dns_manage_resolv_conf | bool
+
+- name: Switch the host resolver only after all DNS gates
+  block:
+    - name: Point the host resolver at the local Technitium instance
+      ansible.builtin.copy:
+        content: |
+          # Managed by MicroLab Ansible. Backup: {{ micolab_dns_resolv_backup }}
+          nameserver 127.0.0.1
+          options edns0
+        dest: "{{ micolab_dns_resolv_conf }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Resolve every loopback service through the switched resolver
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/getent
+          - ahostsv4
+          - "{{ item.key }}.{{ micolab_domain }}"
+      register: micolab_dns_getent
+      changed_when: false
+      failed_when: false
+      retries: "{{ micolab_dns_health_retries }}"
+      delay: "{{ micolab_dns_health_delay }}"
+      until: >-
+        micolab_dns_getent.rc == 0
+        and (micolab_dns_getent.stdout_lines
+             | select('match', '^' ~ (item.value | micolab_canonical_ip | regex_escape) ~ '\\s')
+             | list | length > 0)
+      loop: "{{ micolab_dns_addresses | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}.{{ micolab_domain }}"
+
+    - name: Gate on resolver-switched answers
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - item.stdout_lines
+            | select('match', '^' ~ (item.item.value | micolab_canonical_ip | regex_escape) ~ '\\s')
+            | list | length > 0
+        fail_msg: >-
+          After switching {{ micolab_dns_resolv_conf }}, getent did not return
+          {{ item.item.value }} for {{ item.item.key }}.{{ micolab_domain }}.
+        quiet: true
+      loop: "{{ micolab_dns_getent.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+  when: micolab_dns_manage_resolv_conf | bool
+
+  rescue:
+    - name: Restore the pre-deployment resolver configuration
+      ansible.builtin.copy:
+        src: "{{ micolab_dns_resolv_backup }}"
+        dest: "{{ micolab_dns_resolv_conf }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: micolab_dns_resolv_restore
+      failed_when: false
+
+    - name: Verify the restored resolver content matches the preserved backup
+      ansible.builtin.stat:
+        path: "{{ micolab_dns_resolv_conf }}"
+        checksum_algorithm: sha256
+      register: micolab_dns_resolv_restored_stat
+      failed_when: false
+
+    - name: Fail after attempting the resolver rollback
+      ansible.builtin.fail:
+        msg: >-
+          {% if micolab_dns_resolv_restored_stat.stat.checksum | default('') == micolab_dns_resolv_backup_ready.stat.checksum | default('__never__') %}
+          The resolver switch was rolled back because resolution through
+          127.0.0.1 failed. {{ micolab_dns_resolv_conf }} was restored byte-for-byte
+          from {{ micolab_dns_resolv_backup }}. Technitium passed direct-query
+          gates, so inspect the host resolver/NSS path before retrying.
+          {% else %}
+          The resolver switch failed AND the rollback did NOT restore
+          {{ micolab_dns_resolv_conf }} from {{ micolab_dns_resolv_backup }}.
+          The host resolver may still point at 127.0.0.1. Restore the backup
+          manually before retrying. Restore result:
+          {{ micolab_dns_resolv_restore | default({}) }}
+          {% endif %}
+
+- name: Record whether the host resolver was switched
+  ansible.builtin.set_fact:
+    micolab_dns_resolver_switched: "{{ micolab_dns_manage_resolv_conf | bool }}"
+
+- name: Write the DNS acceptance record consumed by the verify phase
+  ansible.builtin.copy:
+    content: >-
+      {{ {
+           'schema': 2,
+           'zone': micolab_dns_zone,
+           'domain': micolab_domain,
+           'primary_ns': micolab_dns_primary_ns,
+           'admin_endpoint': micolab_technitium_admin_bind_address ~ ':' ~ micolab_technitium_admin_port,
+           'technitium_version': micolab_technitium_version,
+           'local_gates': micolab_dns_local_gates,
+           'local_recursion': micolab_dns_local_recursion_result,
+           'local_recursion_status': micolab_dns_local_recursion_status,
+           'local_recursion_fixture': micolab_dns_local_recursion_fixture,
+           'fixture_upstream_verified': micolab_dns_fixture_upstream_verified | bool,
+           'public_recursion_check': micolab_dns_public_recursion_check | bool,
+           'public_recursion_status': micolab_dns_public_recursion_status | default('not-run'),
+           'external_gates': micolab_dns_external_gates | default([]),
+           'external_acl_verified': micolab_dns_external_acl_verified | bool,
+           'external_acl_override': (micolab_dns_accept_unverified_external_acl | bool)
+                                    and (micolab_dns_remote_probes | length == 0),
+           'unexecuted_gates': micolab_dns_unexecuted_gates | default([]),
+           'remote_probe_count': micolab_dns_remote_probes | length,
+           'resolver_managed': micolab_dns_manage_resolv_conf | bool,
+           'managed_records': micolab_dns_desired_records | map(attribute='key') | list
+         } | to_nice_json }}
+    dest: "{{ micolab_dns_acceptance_file }}"
+    owner: root
+    group: root
+    mode: "0644"

@@ -1,0 +1,15 @@
+[Unit]
+Description=MicroLab nftables ingress policy
+Documentation=file://{{ micolab_baseline_firewall_dir }}/firewall.nft
+After=network-pre.target
+Wants=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/microlab-firewall
+ExecReload=/usr/local/sbin/microlab-firewall
+
+[Install]
+WantedBy=multi-user.target

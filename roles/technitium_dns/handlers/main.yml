@@ -1,0 +1,20 @@
+---
+- name: Technitium DNS restart for persistence gate
+  ansible.builtin.systemd:
+    name: "{{ micolab_technitium_service_name }}"
+    state: restarted
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Record that the persistence-gate restart ran
+  ansible.builtin.set_fact:
+    micolab_dns_restart_gate_ran: true
+
+- name: Restart the MicroLab offline recursion fixture
+  ansible.builtin.systemd:
+    name: "{{ micolab_dns_fixture_service_name }}"
+    state: restarted
+    daemon_reload: true
+  when:
+    - micolab_dns_fixture_manage_service | bool
+    - not ansible_check_mode

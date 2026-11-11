@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: caddy
+  author: MicroLab
+  description: Pinned stock Caddy TLS frontend for the MicroLab management host.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+  galaxy_tags:
+    - microlab
+    - caddy
+    - tls
+dependencies: []

@@ -1,0 +1,16 @@
+---
+- name: Restart step-ca
+  ansible.builtin.systemd_service:
+    name: "{{ microlab_step_ca_service_name }}"
+    state: restarted
+    daemon_reload: true
+
+- name: Reload systemd units
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Update CA trust
+  ansible.builtin.command:
+    argv:
+      - update-ca-certificates
+  changed_when: true

@@ -1,0 +1,9 @@
+---
+# The shared variables in group_vars/all.yml are the public interface. These
+# defaults only keep the role self-describing; they never mask a required
+# inventory value with a usable fallback.
+micolab_baseline_state_dir: /var/lib/microlab
+micolab_baseline_helper_dir: /usr/local/lib/microlab
+micolab_baseline_firewall_dir: /etc/microlab
+micolab_nft_binary: /usr/sbin/nft
+micolab_baseline_ss_command: /usr/bin/ss

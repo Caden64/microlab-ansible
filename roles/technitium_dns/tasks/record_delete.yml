@@ -1,0 +1,34 @@
+---
+- name: Delete one stale record owned by this role
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/records/delete"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body: >-
+      {{ {'domain': dns_record.name, 'zone': micolab_dns_zone, 'type': dns_record.micolab_type}
+         | combine({'ipAddress': dns_record.micolab_raw_value | default(dns_record.micolab_value)}
+                   if dns_record.micolab_type in ['A', 'AAAA']
+                   else {'nameServer': dns_record.micolab_raw_value | default(dns_record.micolab_value)}) }}
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_record_delete
+  failed_when: false
+  changed_when: >-
+    micolab_dns_record_delete.status | default(0) == 200
+    and (micolab_dns_record_delete.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful stale record deletion
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_record_delete.status | default(0) == 200
+      - (micolab_dns_record_delete.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected deletion of owned stale record {{ dns_record.micolab_key }}:
+      {{ (micolab_dns_record_delete.json | default({})).errorMessage | default('no error message') }}
+    quiet: true

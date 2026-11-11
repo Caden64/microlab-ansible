@@ -1,0 +1,836 @@
+---
+# Isolated restore workflow for a MicroLab management-host backup.
+#
+# Safety model:
+#   - Default is dry-run: micolab_restore_commit is false.
+#   - Requires an exact confirmation phrase, an isolated target marker, and an
+#     operator-supplied SHA-256 that matches the archive.
+#   - Refuses hosts in the production group.
+#   - Validates every archive member and every symlink/hardlink target against
+#     a canonical allowlist before any state is touched.
+#   - Extracts into a root-only staging directory, moves existing state to a
+#     timestamped quarantine, and installs only the allowlisted state.
+#   - Preserves archived modes, ACLs, and xattrs; ownership may be normalized
+#     separately by name, but modes are never recursively rewritten.
+#   - Holds the same durable renewal flock for the whole commit.
+#   - Leaves services and the renewal timer stopped unless explicitly started.
+#   - Does not restore offline root escrow material (and refuses archives that
+#     contain documented escrow names, including root_ca_private* variants).
+- name: Restore a MicroLab management-host backup on an isolated target
+  hosts: microlab_management
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  vars_files:
+    - vars/technitium_tls_interface.yml
+  vars:
+    # Interface values owned by roles/technitium_tls.  Read them, never edit
+    # that role here.  vars/technitium_tls_interface.yml resolves the canonical
+    # role names, the supported shared aliases, and the role-derived defaults in
+    # exactly the order the role itself uses.  There is no restore-specific
+    # override: an override here could move or restore a different lock or
+    # certificate than the renewal runtime uses.
+    micolab_restore_technitium_state_directory_name_effective: >-
+      {{ micolab_technitium_interface_state_directory_name }}
+    micolab_restore_technitium_state_dir_effective: >-
+      {{ micolab_technitium_interface_state_dir }}
+    micolab_restore_technitium_cert_dir_effective: >-
+      {{ micolab_technitium_interface_cert_dir }}
+    micolab_restore_technitium_cert_path_effective: >-
+      {{ micolab_technitium_interface_cert_path }}
+    micolab_restore_technitium_key_path_effective: >-
+      {{ micolab_technitium_interface_key_path }}
+    micolab_restore_technitium_pfx_path_effective: >-
+      {{ micolab_technitium_interface_pfx_path }}
+    micolab_restore_technitium_pfx_password_file_effective: >-
+      {{ micolab_technitium_interface_pfx_password_file }}
+    micolab_restore_technitium_ca_root_cert_effective: >-
+      {{ micolab_technitium_interface_ca_root_cert }}
+    micolab_restore_technitium_ca_chain_cert_effective: >-
+      {{ micolab_technitium_interface_ca_chain_cert }}
+    micolab_restore_renewal_env_file_effective: >-
+      {{ micolab_technitium_interface_renewal_env_file }}
+    micolab_restore_renewal_config_dir_effective: >-
+      {{ micolab_restore_renewal_env_file_effective | dirname }}
+    micolab_restore_renewal_timer_unit_effective: >-
+      {{ micolab_technitium_interface_timer_unit }}
+    micolab_restore_renewal_lock_file_effective: >-
+      {{ micolab_technitium_interface_lock_file }}
+
+    # Recovery helper wiring.  See the matching note in backup.yml.
+    micolab_restore_helper_dir: /usr/local/lib/microlab
+    micolab_restore_helper_owner: root
+    micolab_restore_helper_group: root
+    micolab_restore_python: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+    micolab_restore_root_prefix: "/"
+
+    micolab_restore_services_effective: >-
+      {{ micolab_restore_services | default(['caddy', 'forgejo', 'step-ca', 'dns']) }}
+    # Role-owned path interfaces.  The fallbacks match the documented role
+    # defaults so a site that moves state must only set the role variable.
+    micolab_restore_forgejo_data_dir_effective: >-
+      {{ (micolab_restore_forgejo_data_dir
+         | default(micolab_forgejo_data_dir | default('/var/lib/forgejo'))).rstrip('/') }}
+    micolab_restore_forgejo_config_file_effective: >-
+      {{ (micolab_restore_forgejo_config_file
+         | default(micolab_forgejo_config_file | default('/etc/forgejo/app.ini'))).rstrip('/') }}
+    micolab_restore_forgejo_db_path_effective: >-
+      {{ (micolab_forgejo_db_path
+          | default(micolab_restore_forgejo_data_dir_effective ~ '/data/forgejo.db')).rstrip('/') }}
+    micolab_restore_forgejo_repo_root_effective: >-
+      {{ (micolab_forgejo_repo_root
+          | default(micolab_restore_forgejo_data_dir_effective ~ '/data/forgejo-repositories')).rstrip('/') }}
+    micolab_restore_caddy_state_dir_effective: >-
+      {{ (micolab_restore_caddy_state_dir
+         | default(micolab_caddy_state_dir | default('/var/lib/caddy'))).rstrip('/') }}
+    micolab_restore_ca_dir_effective: >-
+      {{ (micolab_restore_ca_dir
+         | default(microlab_step_ca_home | default('/etc/step-ca'))).rstrip('/') }}
+    micolab_restore_dns_dir_effective: >-
+      {{ (micolab_restore_dns_dir
+         | default(micolab_technitium_interface_config_dir)).rstrip('/') }}
+
+    micolab_restore_include_paths_effective: >-
+      {{ micolab_restore_include_paths | default(
+           [
+             micolab_restore_forgejo_data_dir_effective,
+             micolab_restore_forgejo_config_file_effective,
+             micolab_restore_ca_dir_effective,
+             micolab_restore_dns_dir_effective,
+             micolab_restore_caddy_state_dir_effective,
+             micolab_restore_renewal_config_dir_effective
+           ]
+         ) }}
+    micolab_restore_forbidden_patterns_effective: >-
+      {{ micolab_restore_forbidden_patterns | default([
+           '(^|/)(root_ca_key[^/]*|root_ca\.key[^/]*|root_ca_private[^/]*|offline[-_]root[^/]*)(/|$)'
+         ]) }}
+    micolab_restore_required_members_effective: >-
+      {{ micolab_restore_required_members | default([]) }}
+    micolab_restore_required_files_effective: >-
+      {{ micolab_restore_required_files | default(
+           ([
+             micolab_restore_forgejo_db_path_effective,
+             micolab_restore_forgejo_config_file_effective,
+             micolab_restore_renewal_env_file_effective
+           ] + micolab_restore_renewal_material_paths_effective)
+           | map('regex_replace', '^/', '') | list
+         ) }}
+    micolab_restore_required_dirs_effective: >-
+      {{ micolab_restore_required_dirs | default(
+           ([
+             micolab_restore_forgejo_repo_root_effective,
+             micolab_restore_caddy_state_dir_effective,
+             micolab_restore_ca_dir_effective,
+             micolab_restore_dns_dir_effective,
+             micolab_restore_renewal_config_dir_effective
+           ])
+           | map('regex_replace', '^/', '') | list
+         ) }}
+    micolab_restore_renewal_material_paths_effective: >-
+      {{ [
+           micolab_restore_technitium_pfx_path_effective,
+           micolab_restore_technitium_cert_path_effective,
+           micolab_restore_technitium_key_path_effective,
+           micolab_restore_technitium_pfx_password_file_effective,
+           micolab_restore_technitium_ca_root_cert_effective,
+           micolab_restore_technitium_ca_chain_cert_effective
+         ] }}
+    micolab_restore_required_coverage_paths_effective: >-
+      {{ [
+           micolab_restore_forgejo_data_dir_effective,
+           micolab_restore_forgejo_config_file_effective,
+           micolab_restore_forgejo_db_path_effective,
+           micolab_restore_forgejo_repo_root_effective,
+           micolab_restore_caddy_state_dir_effective,
+           micolab_restore_ca_dir_effective,
+           micolab_restore_dns_dir_effective,
+           micolab_restore_renewal_config_dir_effective
+         ] + micolab_restore_renewal_material_paths_effective }}
+    micolab_restore_start_order_effective: >-
+      {{ (micolab_restore_services
+          | default(['caddy', 'forgejo', 'step-ca', 'dns'])) | reverse | list }}
+    micolab_restore_checksum_hex: >-
+      {{ (micolab_restore_checksum | default('')) | regex_replace('^sha256:', '') | lower }}
+    micolab_restore_quarantine_root: >-
+      {{ micolab_restore_quarantine_dir | default('/var/lib/microlab/restore-quarantine') }}
+    micolab_restore_quarantine_path: >-
+      {{ micolab_restore_quarantine_root.rstrip('/') }}/{{ ansible_date_time.iso8601_basic_short }}
+    micolab_restore_staging_root: >-
+      {{ micolab_restore_staging_dir | default('/var/lib/microlab/restore-staging') }}
+    micolab_restore_staging_path: >-
+      {{ micolab_restore_staging_root.rstrip('/') }}/{{ ansible_date_time.iso8601_basic_short }}
+    micolab_restore_guard_spec:
+      archive: "{{ micolab_restore_archive | default('') }}"
+      expected_sha256: "{{ micolab_restore_checksum_hex }}"
+      allowed_roots: "{{ micolab_restore_include_paths_effective }}"
+      required_members: "{{ micolab_restore_required_members_effective }}"
+      required_files: "{{ micolab_restore_required_files_effective }}"
+      required_dirs: "{{ micolab_restore_required_dirs_effective }}"
+      forbidden_patterns: "{{ micolab_restore_forbidden_patterns_effective }}"
+    micolab_restore_guard_spec_b64: "{{ micolab_restore_guard_spec | to_json | b64encode }}"
+
+  tasks:
+    - name: Refuse renewal aliases the renewal role never consumes
+      ansible.builtin.assert:
+        that:
+          - micolab_technitium_enabled is not defined
+          - micolab_technitium_state_directory_name is not defined
+          - micolab_technitium_state_dir is not defined
+          - micolab_technitium_lock_file is not defined
+          - micolab_technitium_status_file is not defined
+          - micolab_technitium_renewal_env_file is not defined
+          - micolab_technitium_helper_path is not defined
+          - micolab_technitium_service_unit is not defined
+          - micolab_technitium_timer_unit is not defined
+          - micolab_technitium_cert_dir is not defined
+          - micolab_technitium_cert_path is not defined
+          - micolab_technitium_key_path is not defined
+          - micolab_technitium_pfx_path is not defined
+          - micolab_technitium_pfx_password_file is not defined
+          - micolab_technitium_ca_root_cert is not defined
+          - micolab_technitium_ca_chain_cert is not defined
+        fail_msg: >-
+          Unsupported renewal interface variables are set. The real
+          roles/technitium_tls runtime never reads micolab_technitium_enabled,
+          micolab_technitium_state_directory_name, micolab_technitium_state_dir,
+          micolab_technitium_lock_file, micolab_technitium_status_file,
+          micolab_technitium_renewal_env_file,
+          micolab_technitium_helper_path,
+          micolab_technitium_service_unit,
+          micolab_technitium_timer_unit, micolab_technitium_cert_dir,
+          micolab_technitium_cert_path, micolab_technitium_key_path,
+          micolab_technitium_pfx_path,
+          micolab_technitium_pfx_password_file,
+          micolab_technitium_ca_root_cert, or
+          micolab_technitium_ca_chain_cert. Using one here would make the
+          restore hold or restore something other than the live renewal state.
+          There is no supported enabled=false bypass. Remove it and set the
+          canonical microlab_technitium_* variable. The only supported shared
+          aliases are
+          micolab_technitium_tls_cert_path,
+          micolab_technitium_tls_key_path,
+          micolab_technitium_tls_cert_password, and
+          micolab_technitium_config_dir.
+      tags:
+        - always
+
+    - name: Refuse restore flags that cannot disable the renewal runtime
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_renewal_enabled is not defined
+          - micolab_restore_renewal_env_file is not defined
+          - micolab_restore_renewal_config_dir is not defined
+          - micolab_restore_renewal_timer_unit is not defined
+          - micolab_restore_renewal_lock_file is not defined
+          - micolab_restore_renewal_material_paths is not defined
+        fail_msg: >-
+          Unsupported restore renewal override or disable flag is set. There is
+          no supported enabled=false bypass: playbooks/site.yml includes
+          roles/technitium_tls unconditionally and the role starts its renewal
+          timer without consulting an enabled flag. An override here would move
+          the restore lock or material away from the runtime. Remove the flag
+          and set the canonical microlab_technitium_* role variable instead.
+      tags:
+        - always
+
+    - name: Require all restore guards
+      ansible.builtin.assert:
+        that:
+          - (micolab_restore_confirm | default('')) == 'RESTORE-ISOLATED-MICROLAB'
+          - micolab_restore_isolated | default(false) | bool
+          - (micolab_restore_archive | default('')) | length > 0
+          - (micolab_restore_archive | default('')) is match('^/')
+          - micolab_restore_checksum_hex is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          Restore refused. Set micolab_restore_confirm=RESTORE-ISOLATED-MICROLAB,
+          micolab_restore_isolated=true, micolab_restore_archive to an absolute
+          path, and micolab_restore_checksum to the archive SHA-256. This is not
+          an automatic failover path.
+
+    - name: Validate restore input shapes
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_services_effective | length > 0
+          - micolab_restore_services_effective | unique | length
+            == micolab_restore_services_effective | length
+          - micolab_restore_include_paths_effective | length > 0
+          - micolab_restore_include_paths_effective | unique | length
+            == micolab_restore_include_paths_effective | length
+          - "'/' not in micolab_restore_include_paths_effective"
+          - micolab_restore_required_files_effective | length > 0
+          - micolab_restore_required_dirs_effective | length > 0
+          - micolab_restore_forbidden_patterns_effective | length > 0
+          - (micolab_restore_archive | default('')) not in micolab_restore_include_paths_effective
+          - micolab_restore_quarantine_path != '/'
+          - micolab_restore_staging_path != '/'
+        fail_msg: >-
+          Restore inputs are incomplete or ambiguous. Service, allowlist,
+          required-file, required-directory, and forbidden-pattern lists must
+          be non-empty, and the archive must not be one of the restored paths.
+
+    - name: Require configured state and renewal material inside a restored tree
+      ansible.builtin.assert:
+        that:
+          - item is match('^(' ~ (micolab_restore_include_paths_effective
+                                  | map('regex_replace', '/+$', '')
+                                  | map('regex_escape') | join('|')) ~ ')(/|$)')
+        fail_msg: >-
+          Configured state or renewal material {{ item }} is not below any
+          micolab_restore_include_paths entry. Set the role path variable or add
+          its directory to the restore allowlist.
+      loop: "{{ micolab_restore_required_coverage_paths_effective }}"
+
+    - name: Refuse to restore onto a production host
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname not in (groups[micolab_restore_production_group | default('microlab_production')] | default([]))
+        fail_msg: >-
+          Restore targets must be isolated. Remove the host from the production
+          group or use a separate isolated host.
+
+    - name: Require the operator-created isolated-target marker
+      ansible.builtin.stat:
+        path: "{{ micolab_restore_isolated_marker | default('/etc/microlab/isolated-restore-target') }}"
+      register: micolab_restore_marker
+
+    - name: Fail closed without the isolated-target marker
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_marker.stat.exists
+          - micolab_restore_marker.stat.isreg
+        fail_msg: >-
+          Create the isolated-target marker file manually after proving this is
+          a disposable/isolated host. The restore playbook will not infer it.
+
+    - name: Inspect the restore archive
+      ansible.builtin.stat:
+        path: "{{ micolab_restore_archive }}"
+      register: micolab_restore_archive_stat
+
+    - name: Require the archive to exist as a regular file
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_archive_stat.stat.exists
+          - micolab_restore_archive_stat.stat.isreg
+          - not (micolab_restore_archive_stat.stat.world_readable | default(false))
+          - not (micolab_restore_archive_stat.stat.woth | default(false))
+        fail_msg: >-
+          The restore archive must exist as a regular, non-world-readable,
+          non-world-writable file. The archive contains secrets.
+
+    - name: Hash the restore archive
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - "{{ micolab_restore_archive }}"
+      register: micolab_restore_sha256
+      changed_when: false
+      check_mode: false
+
+    - name: Fail closed on a restore archive checksum mismatch
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_sha256.stdout.split()[0] | lower == micolab_restore_checksum_hex
+        fail_msg: >-
+          The archive SHA-256 does not match micolab_restore_checksum. Refusing
+          to touch any state.
+
+    - name: Resolve the canonical archive path
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ micolab_restore_archive }}"
+      register: micolab_restore_archive_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve every canonical restore allowlist root
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ item }}"
+      loop: "{{ micolab_restore_include_paths_effective }}"
+      register: micolab_restore_include_realpaths
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the canonical quarantine and staging roots
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ item }}"
+      loop:
+        - "{{ micolab_restore_quarantine_path }}"
+        - "{{ micolab_restore_staging_path }}"
+      register: micolab_restore_work_realpaths
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the canonical renewal lock path
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ micolab_restore_renewal_lock_file_effective }}"
+      register: micolab_restore_lock_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Record canonical restore paths
+      ansible.builtin.set_fact:
+        micolab_restore_archive_real: "{{ micolab_restore_archive_realpath.stdout }}"
+        micolab_restore_quarantine_real: "{{ micolab_restore_work_realpaths.results[0].stdout }}"
+        micolab_restore_staging_real: "{{ micolab_restore_work_realpaths.results[1].stdout }}"
+        micolab_restore_lock_real: "{{ micolab_restore_lock_realpath.stdout }}"
+        micolab_restore_include_real_map: >-
+          {{ micolab_restore_include_real_map | default({})
+             | combine({item.item: item.stdout}) }}
+      loop: "{{ micolab_restore_include_realpaths.results }}"
+
+    - name: Refuse a filesystem-root restore allowlist after realpath
+      ansible.builtin.assert:
+        that:
+          - item.value != '/'
+        fail_msg: >-
+          Restore allowlist entry {{ item.key }} resolves to /. Refusing to
+          restore the whole filesystem.
+      loop: "{{ micolab_restore_include_real_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+
+    - name: Require the archive, quarantine, staging, and lock outside restored state
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_archive_real != item.value
+          - not micolab_restore_archive_real.startswith(item.value ~ '/')
+          - micolab_restore_quarantine_real != item.value
+          - not micolab_restore_quarantine_real.startswith(item.value ~ '/')
+          - micolab_restore_staging_real != item.value
+          - not micolab_restore_staging_real.startswith(item.value ~ '/')
+          - micolab_restore_lock_real | length == 0 or
+            (micolab_restore_lock_real != '/' and
+             micolab_restore_lock_real != item.value and
+             not micolab_restore_lock_real.startswith(item.value ~ '/'))
+        fail_msg: >-
+          The archive, quarantine, staging directory, or renewal lock resolves
+          inside restored state {{ item.key }} ({{ item.value }}). Restoring
+          that would move the archive or replace the lock inode/directory
+          while it is held.
+      loop: "{{ micolab_restore_include_real_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+
+    - name: Require the archive and lock outside quarantine and staging
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_quarantine_real != '/'
+          - micolab_restore_staging_real != '/'
+          - micolab_restore_archive_real != micolab_restore_quarantine_real
+          - not micolab_restore_archive_real.startswith(micolab_restore_quarantine_real ~ '/')
+          - micolab_restore_archive_real != micolab_restore_staging_real
+          - not micolab_restore_archive_real.startswith(micolab_restore_staging_real ~ '/')
+          - micolab_restore_lock_real | length == 0 or
+            (micolab_restore_lock_real != micolab_restore_quarantine_real and
+             not micolab_restore_lock_real.startswith(micolab_restore_quarantine_real ~ '/') and
+             micolab_restore_lock_real != micolab_restore_staging_real and
+             not micolab_restore_lock_real.startswith(micolab_restore_staging_real ~ '/'))
+        fail_msg: >-
+          The archive or renewal lock resolves inside the quarantine or staging
+          directory. Use separate paths so the held lock and the archive are
+          not moved during the restore.
+
+    - name: Require distinct quarantine and staging directories
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_quarantine_real != micolab_restore_staging_real
+          - not micolab_restore_quarantine_real.startswith(micolab_restore_staging_real ~ '/')
+          - not micolab_restore_staging_real.startswith(micolab_restore_quarantine_real ~ '/')
+        fail_msg: >-
+          The quarantine and staging directories must be distinct and must not
+          nest inside each other.
+
+    - name: Inspect the timestamped quarantine and staging paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ micolab_restore_quarantine_path }}"
+        - "{{ micolab_restore_staging_path }}"
+      register: micolab_restore_work_stats
+
+    - name: Refuse to reuse an existing quarantine or staging path
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists
+        fail_msg: >-
+          {{ item.item }} already exists. Retry in a new second or move the
+          previous directory deliberately.
+      loop: "{{ micolab_restore_work_stats.results }}"
+
+    - name: Validate every archive member and link target against the allowlist
+      ansible.builtin.script:
+        cmd: "{{ playbook_dir }}/files/micolab_archive_guard.py --spec-json {{ micolab_restore_guard_spec_b64 }}"
+      register: micolab_restore_guard
+      changed_when: false
+      check_mode: false
+      tags:
+        - micolab-guard-integration
+
+    - name: Record the archive guard result
+      ansible.builtin.set_fact:
+        micolab_restore_guard_result: "{{ micolab_restore_guard.stdout | from_json }}"
+      tags:
+        - micolab-guard-integration
+
+    - name: Fail closed when any archive member or link target is not allowed
+      ansible.builtin.assert:
+        that:
+          - micolab_restore_guard_result.ok | bool
+        fail_msg: >-
+          Archive rejected: {{
+          (micolab_restore_guard_result.violations
+           + micolab_restore_guard_result.required_missing) | join('; ') }}
+      tags:
+        - micolab-guard-integration
+
+    - name: Inspect the renewal timer unit
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - -p
+          - LoadState
+          - --value
+          - "{{ micolab_restore_renewal_timer_unit_effective }}"
+      register: micolab_restore_renewal_timer_state
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Default the renewal timer state before inspection
+      ansible.builtin.set_fact:
+        micolab_restore_renewal_timer_loaded: false
+
+    - name: Record whether the renewal timer is installed
+      ansible.builtin.set_fact:
+        micolab_restore_renewal_timer_loaded: >-
+          {{ (micolab_restore_renewal_timer_state.stdout | default('') | trim) == 'loaded' }}
+
+    - name: Report dry-run result when commit is not set
+      ansible.builtin.debug:
+        msg:
+          - "DRY RUN: checksum, canonical allowlist, every member and link target, required state, and service units validated."
+          - "Validated {{ micolab_restore_guard_result.member_count }} archive members."
+          - "No service was stopped, no state was moved or extracted, and no helper was installed."
+          - "Set micolab_restore_commit=true on the isolated target to proceed."
+      when: not (micolab_restore_commit | default(false) | bool)
+
+    - name: Report check-mode result
+      ansible.builtin.debug:
+        msg:
+          - "CHECK MODE: validation passed; no changes were made."
+          - "Run without --check and with micolab_restore_commit=true on the isolated target to commit."
+      when: ansible_check_mode
+
+    - name: Restore state on the isolated target
+      when:
+        - micolab_restore_commit | default(false) | bool
+        - not ansible_check_mode
+      block:
+        - name: Stop the renewal timer before restoring encrypted-DNS state
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_restore_renewal_timer_unit_effective }}"
+            state: stopped
+          when: micolab_restore_renewal_timer_loaded | bool
+
+        - name: Ensure the protected recovery helper directory exists
+          ansible.builtin.file:
+            path: "{{ micolab_restore_helper_dir }}"
+            state: directory
+            owner: "{{ micolab_restore_helper_owner }}"
+            group: "{{ micolab_restore_helper_group }}"
+            mode: "0755"
+          tags:
+            - micolab-helper-integration
+
+        - name: Install the restore recovery helpers
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/{{ item }}"
+            dest: "{{ micolab_restore_helper_dir }}/{{ item }}"
+            owner: "{{ micolab_restore_helper_owner }}"
+            group: "{{ micolab_restore_helper_group }}"
+            mode: "0755"
+          loop:
+            - micolab_lock.py
+            - micolab_archive_guard.py
+            - micolab_restore_commit.py
+          tags:
+            - micolab-helper-integration
+
+        - name: Build the restore commit specification
+          ansible.builtin.set_fact:
+            micolab_restore_spec:
+              archive: "{{ micolab_restore_archive }}"
+              checksum: "{{ micolab_restore_checksum_hex }}"
+              root_prefix: "{{ micolab_restore_root_prefix }}"
+              allowed_roots: "{{ micolab_restore_include_paths_effective }}"
+              install_paths: "{{ micolab_restore_include_paths_effective }}"
+              required_members: "{{ micolab_restore_required_members_effective }}"
+              required_files: "{{ micolab_restore_required_files_effective }}"
+              required_dirs: "{{ micolab_restore_required_dirs_effective }}"
+              forbidden_patterns: "{{ micolab_restore_forbidden_patterns_effective }}"
+              quarantine_root: "{{ micolab_restore_quarantine_path }}"
+              staging_root: "{{ micolab_restore_staging_path }}"
+              services: "{{ micolab_restore_services_effective }}"
+              systemctl: "{{ micolab_restore_systemctl_binary | default('systemctl') }}"
+              tar: "{{ micolab_restore_tar_binary | default('tar') }}"
+              lock_file: "{{ micolab_restore_renewal_lock_file_effective }}"
+              lock_timeout_seconds: "{{ micolab_restore_renewal_lock_timeout | default(600) }}"
+          tags:
+            - micolab-helper-integration
+
+        - name: Extract, quarantine, and install approved state under the lock
+          ansible.builtin.command:
+            argv:
+              - "{{ micolab_restore_python }}"
+              - "{{ micolab_restore_helper_dir }}/micolab_restore_commit.py"
+            stdin: "{{ micolab_restore_spec | to_nice_json }}"
+          register: micolab_restore_commit_result
+          changed_when: true
+          check_mode: false
+          tags:
+            - micolab-helper-integration
+
+        - name: Record the restore commit result
+          ansible.builtin.set_fact:
+            micolab_restore_commit_data: "{{ micolab_restore_commit_result.stdout | from_json }}"
+
+        - name: Report the committed restore
+          ansible.builtin.debug:
+            msg:
+              - "Installed: {{ micolab_restore_commit_data.installed | join(', ') }}"
+              - "Quarantine: {{ micolab_restore_commit_data.quarantine }}"
+              - "Services stopped: {{ micolab_restore_commit_data.services_stopped | join(', ') }}"
+              - "Renewal lock held for {{ micolab_restore_commit_data.lock_held_seconds }}s"
+
+        - name: Normalize Forgejo state ownership without changing archived modes
+          ansible.builtin.file:
+            path: "{{ micolab_restore_forgejo_data_dir | default(micolab_restore_forgejo_data_dir_effective) }}"
+            state: directory
+            owner: "{{ micolab_restore_forgejo_user | default('git') }}"
+            group: "{{ micolab_restore_forgejo_group | default('git') }}"
+            recurse: true
+            follow: false
+          when: micolab_restore_apply_ownership | default(true) | bool
+
+        - name: Ensure the Forgejo config directory has the site mode
+          ansible.builtin.file:
+            path: "{{ micolab_restore_forgejo_config_dir | default(micolab_restore_forgejo_config_file_effective | dirname) }}"
+            state: directory
+            owner: root
+            group: "{{ micolab_restore_forgejo_group | default('git') }}"
+            mode: "0750"
+
+        - name: Normalize Forgejo config ownership without changing archived modes
+          ansible.builtin.file:
+            path: "{{ micolab_restore_forgejo_config_file | default(micolab_restore_forgejo_config_file_effective) }}"
+            state: file
+            owner: root
+            group: "{{ micolab_restore_forgejo_group | default('git') }}"
+          when: micolab_restore_apply_ownership | default(true) | bool
+
+        - name: Normalize Caddy state ownership without changing archived modes
+          ansible.builtin.file:
+            path: "{{ micolab_restore_caddy_state_dir | default(micolab_restore_caddy_state_dir_effective) }}"
+            state: directory
+            owner: "{{ micolab_restore_caddy_user | default('caddy') }}"
+            group: "{{ micolab_restore_caddy_group | default('caddy') }}"
+            recurse: true
+            follow: false
+          when: micolab_restore_apply_ownership | default(true) | bool
+
+        - name: Normalize CA, DNS, and renewal top-level ownership without chmod  # noqa: risky-file-permissions
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: "{{ item.owner }}"
+            group: "{{ item.group }}"
+            follow: false
+          loop:
+            - path: "{{ micolab_restore_ca_dir | default(micolab_restore_ca_dir_effective) }}"
+              owner: "{{ micolab_restore_ca_user | default('step') }}"
+              group: "{{ micolab_restore_ca_group | default('step') }}"
+            - path: "{{ micolab_restore_dns_dir | default(micolab_restore_dns_dir_effective) }}"
+              owner: "{{ micolab_restore_dns_user | default('dns-server') }}"
+              group: "{{ micolab_restore_dns_group | default('dns-server') }}"
+            - path: "{{ micolab_restore_renewal_config_dir_effective }}"
+              owner: root
+              group: root
+          when:
+            - micolab_restore_apply_ownership | default(true) | bool
+
+        - name: Ensure the Forgejo SSH directory exists with a restrictive mode
+          ansible.builtin.file:
+            path: "{{ micolab_restore_git_home | default('/home/git') }}/.ssh"
+            state: directory
+            owner: "{{ micolab_restore_forgejo_user | default('git') }}"
+            group: "{{ micolab_restore_forgejo_group | default('git') }}"
+            mode: "0700"
+
+        - name: Leave restored services stopped unless explicitly requested
+          ansible.builtin.debug:
+            msg:
+              - "Restore files are in place; services and the renewal timer remain stopped."
+              - "Inspect logs, ownership, and the documented acceptance checks before starting."
+          when: not (micolab_restore_start_services | default(false) | bool)
+
+        - name: Require the renewal timer unit when its start is explicitly requested
+          ansible.builtin.assert:
+            that:
+              - micolab_restore_renewal_timer_loaded | bool
+            fail_msg: >-
+              micolab_restore_start_renewal_timer=true was requested, but
+              {{ micolab_restore_renewal_timer_unit_effective }} is not loaded.
+              Install the Technitium TLS role units on the isolated target first.
+          when:
+            - micolab_restore_start_services | default(false) | bool
+            - micolab_restore_start_renewal_timer | default(false) | bool
+
+        - name: Start restored services when explicitly requested
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            enabled: true
+            state: started
+          loop: "{{ micolab_restore_start_order_effective }}"
+          when: micolab_restore_start_services | default(false) | bool
+
+        - name: Wait for restored services when explicitly requested
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - is-active
+              - "{{ item }}"
+          loop: "{{ micolab_restore_start_order_effective }}"
+          register: micolab_restore_started
+          until: (micolab_restore_started.stdout | trim) == 'active'
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when: micolab_restore_start_services | default(false) | bool
+
+        - name: Regenerate Forgejo-managed SSH keys after a started restore
+          ansible.builtin.command:
+            argv:
+              - "{{ micolab_restore_forgejo_binary | default('/usr/local/bin/forgejo') }}"
+              - --config
+              - "{{ micolab_restore_forgejo_config_file | default(micolab_restore_forgejo_config_file_effective) }}"
+              - --work-path
+              - "{{ micolab_restore_forgejo_data_dir | default(micolab_restore_forgejo_data_dir_effective) }}"
+              - admin
+              - regenerate
+              - keys
+          become: true
+          become_user: "{{ micolab_restore_forgejo_user | default('git') }}"
+          environment:
+            HOME: "{{ micolab_restore_git_home | default('/home/git') }}"
+            USER: "{{ micolab_restore_forgejo_user | default('git') }}"
+          changed_when: false
+          no_log: true
+          when: micolab_restore_start_services | default(false) | bool
+
+        - name: Health-gate Forgejo after a started restore
+          ansible.builtin.uri:
+            url: "{{ micolab_restore_forgejo_health_url | default('http://127.0.0.1:3000/api/healthz') }}"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+          register: micolab_restore_forgejo_health
+          until: micolab_restore_forgejo_health.status == 200
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when: micolab_restore_start_services | default(false) | bool
+
+        - name: Health-gate the public git endpoint after a started restore
+          ansible.builtin.uri:
+            url: "https://{{ micolab_restore_git_host | default('git.microlab.hnh') }}/api/healthz"
+            ca_path: "{{ micolab_restore_tls_root | default('/usr/local/share/ca-certificates/microlab-root.crt') }}"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+            validate_certs: true
+          register: micolab_restore_caddy_health
+          until: micolab_restore_caddy_health.status == 200
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when:
+            - micolab_restore_start_services | default(false) | bool
+            - "'caddy' in micolab_restore_services_effective"
+
+        - name: Start the renewal timer only when explicitly requested
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_restore_renewal_timer_unit_effective }}"
+            enabled: true
+            state: started
+          when:
+            - micolab_restore_start_services | default(false) | bool
+            - micolab_restore_start_renewal_timer | default(false) | bool
+
+    # Debug/report only.  It performs no host changes and is not selected by a
+    # normal run; the integration tests select it with
+    # --tags micolab-interface-report to resolve the real play-level variables.
+    - name: Report the resolved restore renewal interface
+      ansible.builtin.debug:
+        msg:
+          micolab_restore_renewal_env_file_effective: "{{ micolab_restore_renewal_env_file_effective }}"
+          micolab_restore_renewal_config_dir_effective: "{{ micolab_restore_renewal_config_dir_effective }}"
+          micolab_restore_renewal_timer_unit_effective: "{{ micolab_restore_renewal_timer_unit_effective }}"
+          micolab_restore_renewal_lock_file_effective: "{{ micolab_restore_renewal_lock_file_effective }}"
+          micolab_restore_technitium_state_directory_name_effective: "{{ micolab_restore_technitium_state_directory_name_effective }}"
+          micolab_restore_technitium_state_dir_effective: "{{ micolab_restore_technitium_state_dir_effective }}"
+          micolab_restore_technitium_cert_dir_effective: "{{ micolab_restore_technitium_cert_dir_effective }}"
+          micolab_restore_technitium_cert_path_effective: "{{ micolab_restore_technitium_cert_path_effective }}"
+          micolab_restore_technitium_key_path_effective: "{{ micolab_restore_technitium_key_path_effective }}"
+          micolab_restore_technitium_pfx_path_effective: "{{ micolab_restore_technitium_pfx_path_effective }}"
+          micolab_restore_technitium_pfx_password_file_effective: "{{ micolab_restore_technitium_pfx_password_file_effective }}"
+          micolab_restore_technitium_ca_root_cert_effective: "{{ micolab_restore_technitium_ca_root_cert_effective }}"
+          micolab_restore_technitium_ca_chain_cert_effective: "{{ micolab_restore_technitium_ca_chain_cert_effective }}"
+          micolab_technitium_interface_pfx_password_sha256: "{{ micolab_technitium_interface_pfx_password_sha256 }}"
+          micolab_technitium_interface_cert_dir: "{{ micolab_technitium_interface_cert_dir }}"
+          micolab_technitium_interface_cert_path: "{{ micolab_technitium_interface_cert_path }}"
+          micolab_technitium_interface_key_path: "{{ micolab_technitium_interface_key_path }}"
+          micolab_technitium_interface_pfx_path: "{{ micolab_technitium_interface_pfx_path }}"
+          micolab_technitium_interface_pfx_password_file: "{{ micolab_technitium_interface_pfx_password_file }}"
+          micolab_technitium_interface_config_dir: "{{ micolab_technitium_interface_config_dir }}"
+          micolab_technitium_interface_ca_root_cert: "{{ micolab_technitium_interface_ca_root_cert }}"
+          micolab_technitium_interface_ca_chain_cert: "{{ micolab_technitium_interface_ca_chain_cert }}"
+          micolab_technitium_interface_state_directory_name: "{{ micolab_technitium_interface_state_directory_name }}"
+          micolab_technitium_interface_state_dir: "{{ micolab_technitium_interface_state_dir }}"
+          micolab_technitium_interface_lock_file: "{{ micolab_technitium_interface_lock_file }}"
+          micolab_technitium_interface_status_file: "{{ micolab_technitium_interface_status_file }}"
+          micolab_technitium_interface_renewal_env_file: "{{ micolab_technitium_interface_renewal_env_file }}"
+          micolab_technitium_interface_helper_path: "{{ micolab_technitium_interface_helper_path }}"
+          micolab_technitium_interface_service_unit: "{{ micolab_technitium_interface_service_unit }}"
+          micolab_technitium_interface_timer_unit: "{{ micolab_technitium_interface_timer_unit }}"
+          micolab_restore_renewal_material_paths_effective: "{{ micolab_restore_renewal_material_paths_effective }}"
+          micolab_restore_include_paths_effective: "{{ micolab_restore_include_paths_effective }}"
+          micolab_restore_required_files_effective: "{{ micolab_restore_required_files_effective }}"
+          micolab_restore_required_dirs_effective: "{{ micolab_restore_required_dirs_effective }}"
+          micolab_restore_required_coverage_paths_effective: "{{ micolab_restore_required_coverage_paths_effective }}"
+          micolab_restore_dns_dir_effective: "{{ micolab_restore_dns_dir_effective }}"
+          micolab_restore_ca_dir_effective: "{{ micolab_restore_ca_dir_effective }}"
+      when: micolab_report_effective_interface | default(false) | bool
+      tags:
+        - micolab-interface-report

@@ -1,0 +1,114 @@
+---
+- name: Install offline runtime dependencies
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - openssl
+      - tar
+    state: present
+    update_cache: false
+
+- name: Create pinned binary installation directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ microlab_step_ca_extract_dir }}"
+    - "{{ microlab_step_cli_extract_dir }}"
+
+- name: Stage pinned step-ca archive from the offline artifact store
+  ansible.builtin.get_url:
+    url: "{{ microlab_step_ca_artifact_base_url }}/{{ microlab_step_ca_archive_name }}"
+    dest: "{{ microlab_step_ca_archive_path }}"
+    checksum: "sha256:{{ microlab_step_ca_checksums[microlab_step_ca_arch] }}"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart step-ca
+
+- name: Extract the pinned step-ca binary
+  ansible.builtin.unarchive:
+    src: "{{ microlab_step_ca_archive_path }}"
+    dest: "{{ microlab_step_ca_extract_dir }}"
+    remote_src: true
+    creates: "{{ microlab_step_ca_extract_dir }}/step-ca"
+    mode: "0755"
+  notify: Restart step-ca
+
+- name: Link the pinned step-ca binary
+  ansible.builtin.file:
+    src: "{{ microlab_step_ca_extract_dir }}/step-ca"
+    dest: "{{ microlab_step_ca_bin }}"
+    state: link
+    force: true
+  notify: Restart step-ca
+
+- name: Verify the installed step-ca version
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_step_ca_bin }}"
+      - --version
+  register: microlab_step_ca_version_check
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Require the pinned step-ca version to be the running binary
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_version_check.rc == 0
+      - microlab_step_ca_version in microlab_step_ca_version_check.stdout
+    fail_msg: >-
+      The staged step-ca archive did not produce the pinned version
+      {{ microlab_step_ca_version }}. Refusing to continue.
+    quiet: true
+
+- name: Stage pinned step CLI archive from the offline artifact store
+  ansible.builtin.get_url:
+    url: "{{ microlab_step_ca_artifact_base_url }}/{{ microlab_step_cli_archive_name }}"
+    dest: "{{ microlab_step_cli_archive_path }}"
+    checksum: "sha256:{{ microlab_step_cli_checksums[microlab_step_ca_arch] }}"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Extract the pinned step CLI
+  ansible.builtin.unarchive:
+    src: "{{ microlab_step_cli_archive_path }}"
+    dest: "{{ microlab_step_cli_extract_dir }}"
+    remote_src: true
+    creates: "{{ microlab_step_cli_extract_dir }}/step_{{ microlab_step_cli_version }}/bin/step"
+    mode: "0755"
+
+- name: Link the pinned step CLI
+  ansible.builtin.file:
+    src: "{{ microlab_step_cli_extract_dir }}/step_{{ microlab_step_cli_version }}/bin/step"
+    dest: "{{ microlab_step_cli_bin }}"
+    state: link
+    force: true
+
+- name: Verify the installed step CLI version and architecture
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_step_cli_bin }}"
+      - version
+  register: microlab_step_cli_version_check
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Require the pinned step CLI version and target architecture
+  ansible.builtin.assert:
+    that:
+      - microlab_step_cli_version_check.rc == 0
+      - microlab_step_cli_version in microlab_step_cli_version_check.stdout
+      - microlab_step_ca_arch in microlab_step_cli_version_check.stdout
+    fail_msg: >-
+      The staged step CLI archive did not match the pinned version
+      {{ microlab_step_cli_version }} and architecture
+      {{ microlab_step_ca_arch }}. Refusing to continue.
+    quiet: true

@@ -1,0 +1,14 @@
+[Unit]
+Description=MicroLab serialized Technitium DNS TLS renewal timer
+Documentation=file:/etc/technitium-tls/renewal.env
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+AccuracySec=1min
+Persistent=true
+Unit={{ microlab_technitium_service_unit }}
+
+[Install]
+WantedBy=timers.target

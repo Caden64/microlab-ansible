@@ -1,0 +1,31 @@
+[Unit]
+Description=MicroLab step-ca intermediate certificate authority
+Documentation=https://smallstep.com/docs/step-ca/configuration/
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty={{ microlab_step_ca_config_file }}
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{ microlab_step_ca_user }}
+Group={{ microlab_step_ca_group }}
+WorkingDirectory={{ microlab_step_ca_home }}
+ExecStart={{ microlab_step_ca_bin }} {{ microlab_step_ca_config_file }} --password-file {{ microlab_step_ca_password_dest }}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ microlab_step_ca_db_dir }}
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

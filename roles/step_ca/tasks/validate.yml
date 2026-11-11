@@ -1,0 +1,221 @@
+---
+- name: Require Debian on a supported 64-bit architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == "Debian"
+      - ansible_facts['architecture'] in microlab_step_ca_arch_map
+    fail_msg: >-
+      step_ca supports Debian on x86_64 (amd64) and aarch64 (arm64) only;
+      got os_family={{ ansible_facts['os_family'] }} architecture={{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Resolve the mapped Debian artifact architecture
+  ansible.builtin.set_fact:
+    microlab_step_ca_arch: "{{ microlab_step_ca_arch_map[ansible_facts['architecture']] }}"
+
+- name: Resolve deployed artifact paths
+  ansible.builtin.set_fact:
+    microlab_step_ca_root_cert_dest: "{{ microlab_step_ca_certs_dir }}/root_ca.crt"
+    microlab_step_ca_intermediate_cert_dest: "{{ microlab_step_ca_certs_dir }}/intermediate_ca.crt"
+    microlab_step_ca_intermediate_key_dest: "{{ microlab_step_ca_secrets_dir }}/intermediate_ca_key"
+    microlab_step_ca_password_dest: "{{ microlab_step_ca_secrets_dir }}/password"
+    microlab_step_ca_config_file: "{{ microlab_step_ca_config_dir }}/ca.json"
+    microlab_step_ca_archive_name: "step-ca_linux_{{ microlab_step_ca_version }}_{{ microlab_step_ca_arch }}.tar.gz"
+    microlab_step_cli_archive_name: "step_linux_{{ microlab_step_cli_version }}_{{ microlab_step_ca_arch }}.tar.gz"
+    microlab_step_ca_extract_dir: "{{ microlab_step_ca_install_root }}/step-ca/{{ microlab_step_ca_version }}"
+    microlab_step_cli_extract_dir: "{{ microlab_step_ca_install_root }}/step-cli/{{ microlab_step_cli_version }}"
+    microlab_step_ca_root_fingerprint_normalized: >-
+      {{ microlab_step_ca_root_fingerprint_sha256
+         | regex_replace('[^0-9A-Fa-f]', '')
+         | upper }}
+
+- name: Resolve offline artifact archive paths
+  ansible.builtin.set_fact:
+    microlab_step_ca_archive_path: "{{ microlab_step_ca_extract_dir }}/{{ microlab_step_ca_archive_name }}"
+    microlab_step_cli_archive_path: "{{ microlab_step_cli_extract_dir }}/{{ microlab_step_cli_archive_name }}"
+
+- name: Require an offline artifact base unless remote artifacts are explicitly allowed
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_artifact_base_url is string
+      - microlab_step_ca_artifact_base_url | length > 0
+      - microlab_step_ca_artifact_base_url.startswith('file:///')
+    fail_msg: >-
+      Offline operation requires microlab_step_ca_artifact_base_url to be a
+      file:/// URL. Set microlab_step_ca_allow_remote_artifacts=true only for a
+      reviewed mirror, never for an unpinned download.
+    quiet: true
+  when: not (microlab_step_ca_allow_remote_artifacts | bool)
+
+- name: Require pinned step-ca version and per-architecture checksum
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_version is string
+      - microlab_step_ca_version | length > 0
+      - microlab_step_ca_checksums is mapping
+      - microlab_step_ca_arch in microlab_step_ca_checksums
+      - microlab_step_ca_checksums[microlab_step_ca_arch] is string
+      - microlab_step_ca_checksums[microlab_step_ca_arch] is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      Set microlab_step_ca_version and
+      microlab_step_ca_checksums['{{ microlab_step_ca_arch }}'] to a reviewed
+      SHA-256 value. This role never downloads an unpinned binary.
+    quiet: true
+
+- name: Require pinned step CLI version and per-architecture checksum
+  ansible.builtin.assert:
+    that:
+      - microlab_step_cli_version is string
+      - microlab_step_cli_version | length > 0
+      - microlab_step_cli_checksums is mapping
+      - microlab_step_ca_arch in microlab_step_cli_checksums
+      - microlab_step_cli_checksums[microlab_step_ca_arch] is string
+      - microlab_step_cli_checksums[microlab_step_ca_arch] is match('^[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      Set microlab_step_cli_version and
+      microlab_step_cli_checksums['{{ microlab_step_ca_arch }}'] to a reviewed
+      SHA-256 value. The step CLI is needed for protected enrollment and
+      renewal verification.
+    quiet: true
+
+- name: Require the supported badgerv2 database backend
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_db_type == 'badgerv2'
+    fail_msg: >-
+      This role supports only the local badgerv2 CA database backend. A
+      different backend would require a reviewed database migration and is
+      never selected implicitly.
+    quiet: true
+
+- name: Require offline-issued CA material and a pinned root fingerprint
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_root_cert_src is string
+      - microlab_step_ca_root_cert_src | length > 0
+      - microlab_step_ca_intermediate_cert_src is string
+      - microlab_step_ca_intermediate_cert_src | length > 0
+      - microlab_step_ca_intermediate_key_src is string
+      - microlab_step_ca_intermediate_key_src | length > 0
+      - microlab_step_ca_root_fingerprint_sha256 is string
+      - microlab_step_ca_root_fingerprint_sha256 | length > 0
+      - microlab_step_ca_root_fingerprint_sha256 is match('^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|^[0-9A-Fa-f]{64}$')
+    fail_msg: >-
+      Supply the offline-issued root certificate, intermediate certificate and
+      encrypted intermediate key, plus the reviewed SHA-256 root fingerprint.
+      See docs/ca-recovery.md. This role never initializes a CA.
+    quiet: true
+
+- name: Require the intermediate key password from protected inventory
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_intermediate_key_password is string
+      - microlab_step_ca_intermediate_key_password | length > 0
+    fail_msg: >-
+      microlab_step_ca_intermediate_key_password must come from an encrypted
+      inventory/vault entry.
+    quiet: true
+  no_log: true
+
+- name: Fail if a root private key input is offered to this role
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_root_key_src is not defined
+      - microlab_step_ca_root_private_key_src is not defined
+    fail_msg: >-
+      The root private key must never be deployed. Keep it offline and provide
+      only the public root certificate.
+    quiet: true
+
+- name: Require the seven-day lifetime and forbid renewal after expiry
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_cert_lifetime in ['168h', '168h0m0s', '604800s']
+      - not (microlab_step_ca_allow_renewal_after_expiry | bool)
+    fail_msg: >-
+      MicroLab certificates use a seven-day (168h) lifetime. Renewal after
+      expiry must remain disabled (allowRenewalAfterExpiry=false).
+    quiet: true
+
+- name: Require the CA listener and advertised names to match the documented design
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_address == '127.0.0.1:' ~ (microlab_step_ca_health_port | string)
+      - microlab_step_ca_health_port | int == 4443
+      - microlab_step_ca_ca_url == 'https://127.0.0.1:' ~ (microlab_step_ca_health_port | string)
+      - microlab_step_ca_common_name == 'ca.microlab.hnh'
+      - microlab_step_ca_health_host == 'ca.microlab.hnh'
+      - microlab_step_ca_dns_names is sequence
+      - microlab_step_ca_dns_names is not string
+      - "'ca.microlab.hnh' in microlab_step_ca_dns_names"
+      - "'127.0.0.1' in microlab_step_ca_dns_names"
+    fail_msg: >-
+      The CA backend must listen on 127.0.0.1:4443 and present both the
+      ca.microlab.hnh DNS SAN and the 127.0.0.1 IP SAN.
+    quiet: true
+
+- name: Forbid IPv6 SANs and IPv6 policy entries unless IPv6 is explicitly enabled
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_dns_names | select('search', ':') | list | length == 0
+      - microlab_step_ca_allowed_ip_addresses | select('search', ':') | list | length == 0
+      - microlab_step_ca_allowed_dns_names | select('search', ':') | list | length == 0
+    fail_msg: >-
+      No IPv6 SAN or policy entry may be published unless IPv6 support is
+      explicitly designed and enabled. See docs/certificate-renewal.md.
+    quiet: true
+  when: not (microlab_step_ca_ipv6_enabled | bool)
+
+- name: Require the Caddy ACME provisioner to be named exactly acme
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_caddy_provisioner_name == 'acme'
+    fail_msg: >-
+      The Caddy ACME provisioner name is part of the published interface and
+      must be exactly "acme"; Caddy uses
+      https://ca.microlab.hnh:4443/acme/acme/directory. Do not deploy the
+      legacy microlab-caddy name.
+    quiet: true
+
+- name: Require both distinct provisioners and their restricted Technitium names
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_caddy_provisioner_name is string
+      - microlab_step_ca_caddy_provisioner_name | length > 0
+      - microlab_step_ca_technitium_provisioner_name is string
+      - microlab_step_ca_technitium_provisioner_name | length > 0
+      - microlab_step_ca_caddy_provisioner_name != microlab_step_ca_technitium_provisioner_name
+      - microlab_step_ca_technitium_cert_names is sequence
+      - microlab_step_ca_technitium_cert_names is not string
+      - microlab_step_ca_technitium_cert_names | length > 0
+      - >-
+        (microlab_step_ca_technitium_cert_names
+         | select('search',
+                  '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+         | list
+         | length)
+        == (microlab_step_ca_technitium_cert_names | length)
+    fail_msg: >-
+      Configure one dedicated ACME provisioner for Caddy and one restricted
+      JWK provisioner for Technitium. Technitium names must be concrete,
+      lowercase DNS names (no wildcards and no IP literals).
+    quiet: true
+
+- name: Require Technitium JWK material from the offline CA workflow
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_technitium_jwk_key is mapping
+      - microlab_step_ca_technitium_jwk_key.kty is defined
+      - microlab_step_ca_technitium_jwk_key.kid is defined
+      - microlab_step_ca_technitium_jwk_key.x is defined
+      - microlab_step_ca_technitium_jwk_key.y is defined
+      - microlab_step_ca_technitium_jwk_key.d is not defined
+      - microlab_step_ca_technitium_jwk_key.p is not defined
+      - microlab_step_ca_technitium_jwk_key.q is not defined
+      - microlab_step_ca_technitium_jwk_encrypted_key is string
+      - microlab_step_ca_technitium_jwk_encrypted_key | length > 0
+    fail_msg: >-
+      Copy the public JWK and encryptedKey for the restricted Technitium
+      provisioner from the offline CA initialization into protected inventory.
+    quiet: true
+  no_log: true

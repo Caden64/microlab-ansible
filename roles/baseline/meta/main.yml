@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: baseline
+  author: MicroLab
+  description: Fail-closed host baseline validation and nftables ingress policy.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+dependencies: []

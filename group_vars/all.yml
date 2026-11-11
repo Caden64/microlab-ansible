@@ -1,0 +1,266 @@
+---
+# Shared MicroLab interface variables.
+#
+# Every variable in this repository uses the microlab_ prefix. Values marked
+# REQUIRED are expected from the encrypted inventory; the roles fail closed
+# when they are missing, empty, or still contain a REPLACE_ marker.
+
+# ---------------------------------------------------------------------------
+# Topology
+# ---------------------------------------------------------------------------
+micolab_management_group: microlab_management
+micolab_challenge_group: microlab_challenge
+
+# The management host is deliberately separate from every challenge workload.
+# playbooks/site.yml only targets microlab_management and baseline asserts that
+# the host is not a member of microlab_challenge.
+
+# ---------------------------------------------------------------------------
+# DNS / internal PKI naming
+# ---------------------------------------------------------------------------
+micolab_domain: microlab.hnh
+micolab_dns_zone: hnh
+# Legacy alias of micolab_domain (the service domain, NOT the zone apex). The
+# verify role never builds names from it and fails closed if it differs from
+# micolab_domain. The authoritative zone queried for NS is micolab_dns_zone.
+micolab_dns_zone_fqdn: "microlab.hnh"
+micolab_dns_primary_ns: ns1.microlab.hnh
+micolab_dns_admin_email: hostmaster@microlab.hnh
+
+# REQUIRED in inventory: IPv4 address of every loopback service. All four
+# services live on the management host, so these may legitimately repeat the
+# management address. Keys are used to build <key>.microlab.hnh.
+#   ns1 -> ns1.microlab.hnh (NS target and glue)
+#   ca  -> ca.microlab.hnh
+#   dns -> dns.microlab.hnh
+#   git -> git.microlab.hnh
+micolab_dns_addresses: {}
+
+# IPv6 is disabled unless explicitly enabled. When enabled, each key above
+# needs an address in micolab_dns_ipv6_addresses; AAAA records are never
+# created from an IPv4 value or by guessing.
+micolab_dns_ipv6_enabled: false
+micolab_dns_ipv6_addresses: {}
+
+# Optional additional records owned by this role. Each item must contain:
+#   name (FQDN inside the zone), type (A or AAAA), value, ttl (optional)
+micolab_dns_extra_records: []
+
+# Recursion is allowed only to these networks. The role merges this list with
+# itself on every run; it never replaces unrecognised ACL entries. Entries are
+# canonicalised exactly as Technitium prints them (/32 and /128 are omitted,
+# IPv6 is compressed) so a rerun is idempotent.
+micolab_dns_recursion_allow_cidrs: []
+
+# Networks that may reach plain DNS/DoT/DoQ but must NOT recurse. They are
+# added to the nftables DNS sets only (never to HTTP/HTTPS), and deliberately
+# are not added to Technitium's recursionNetworkACL. Use these for the
+# DNS-reachable recursion-denied remote probe class. They must not overlap
+# admin/client/recursion-allow networks; baseline rejects an overlap.
+micolab_dns_authoritative_only_cidrs: []
+micolab_dns_authoritative_only_cidrs_v6: []
+
+# Online (public) forwarders are opt-in only. Recursion is the default.
+micolab_dns_forwarders: []
+micolab_dns_allow_online_forwarders: false
+
+# REQUIRED: controlled local recursion fixture for cold, WAN-disconnected
+# acceptance. These are not public names and must not be the hnh zone or a
+# subdomain of micolab_domain. The role creates a conditional-forwarder zone
+# for the fixture zone on a reachable local upstream and requires the known A
+# answer with AA clear. The managed fixture service (default) is a tiny stdlib
+# UDP responder on IPv4 loopback, so no internet or extra package is needed.
+# Set manage_service=false only when an equivalent local upstream is staged
+# externally at exactly micolab_dns_fixture_upstream.
+micolab_dns_fixture_upstream: ""             # REQUIRED "127.0.0.1:5353"
+micolab_dns_fixture_zone: ""                 # REQUIRED, distinct from hnh
+micolab_dns_fixture_name: ""                 # REQUIRED, inside the fixture zone
+micolab_dns_fixture_expected_ip: ""          # REQUIRED, known A answer
+micolab_dns_fixture_manage_service: true
+micolab_dns_fixture_listen_address: "127.0.0.1"
+micolab_dns_fixture_port: 5353
+
+# The Technitium admin console is reached only through Caddy on IPv4
+# loopback. Caddy overwrites X-Real-IP. Trust exactly that proxy address and
+# that header; never merge arbitrary proxy networks or add ::1 unless the
+# actual Caddy upstream uses it.
+micolab_dns_admin_reverse_proxy_address: "127.0.0.1"
+micolab_dns_admin_real_ip_header: "X-Real-IP"
+
+# Optional connected public recursion check. It is never part of offline
+# acceptance and is disabled by default; the required gate uses the local
+# fixture above.
+micolab_dns_public_recursion_check: false
+micolab_dns_public_recursion_name: example.com
+
+# Retention values are enforced through Technitium settings and logrotate.
+micolab_dns_log_retention_days: 14
+micolab_dns_stats_retention_days: 30
+micolab_dns_log_queries: false
+
+# The host resolver is switched to 127.0.0.1 only after all local DNS health
+# gates pass. Set false to leave resolv.conf untouched.
+micolab_dns_manage_resolv_conf: true
+
+# External ACL acceptance. Local queries from 127.0.0.1 can prove authoritative
+# answers and local recursion, but they cannot prove the host firewall or the
+# recursion ACL from a real client network. Provide all three probe classes, or
+# acknowledge explicitly that external ACLs are unverified. The role never
+# silently treats a local-only test as acceptance.
+micolab_dns_require_remote_probes: true
+micolab_dns_accept_unverified_external_acl: false
+micolab_dns_remote_probes: []
+# Each probe runs dig on `host` and binds `source_address` so the firewall and
+# recursion class is unambiguous. `access` is one of:
+#   recursion-allowed  source is in admin/client/recursion-allow; expects an
+#                      authoritative AA answer for fqdn and NOERROR, AA clear,
+#                      and micolab_dns_fixture_expected_ip for the local
+#                      fixture name
+#   recursion-denied   source is in micolab_dns_authoritative_only_cidrs;
+#                      expects an authoritative AA answer for fqdn and REFUSED
+#                      for the same local fixture name
+#   firewall-denied    source is outside every firewall-admitted DNS network;
+#                      expects no reply at all (timeout, no RCODE)
+# Recursion probes use the controlled local fixture, never a public name.
+# Example probes:
+#   - host: lab-client-1
+#     dns_server: <management-ip>       # real address of the management host
+#     source_address: <client-ip>       # address bound with dig -b
+#     access: recursion-allowed
+#     fqdn: ca.microlab.hnh
+#     expect_ip: <management-ip>
+#   - host: lab-client-1
+#     dns_server: <management-ip>
+#     source_address: <authoritative-only-ip>
+#     access: recursion-denied
+#     fqdn: ca.microlab.hnh
+#     expect_ip: <management-ip>
+#   - host: outside-client
+#     dns_server: <management-ip>
+#     source_address: <outside-ip>
+#     access: firewall-denied
+#     fqdn: ca.microlab.hnh
+#     expect_ip: <management-ip>
+
+# Encrypted DNS is owned by technitium_tls. These variables also let the
+# firewall open only the ports that are actually enabled. technitium_dns never
+# writes enableDnsOverTls/Https/Quic, so re-running it cannot switch them off.
+micolab_dns_enable_dot: true
+micolab_dns_enable_doh: true
+micolab_dns_enable_doq: false
+micolab_dns_dot_port: 853
+# Technitium DoH is a loopback upstream behind Caddy; public HTTPS stays 443.
+micolab_dns_doh_port: 8053
+micolab_dns_doq_port: 853
+
+# ---------------------------------------------------------------------------
+# Technitium installation (offline, pinned artifacts)
+# ---------------------------------------------------------------------------
+micolab_technitium_version: ""             # REQUIRED
+micolab_technitium_service_name: dns
+micolab_technitium_user: dns-server
+micolab_technitium_group: dns-server
+# Aliases consumed by technitium_tls.
+micolab_technitium_service_user: "{{ micolab_technitium_user }}"
+micolab_technitium_service_group: "{{ micolab_technitium_group }}"
+micolab_technitium_install_dir: /opt/technitium/dns
+micolab_technitium_config_dir: /etc/dns
+micolab_technitium_log_dir: /var/log/technitium/dns
+micolab_dotnet_install_dir: /opt/dotnet
+micolab_dotnet_binary: /usr/local/bin/dotnet
+micolab_technitium_runtime_major: "10"      # Technitium 15.x requires .NET 10
+micolab_technitium_admin_bind_address: 127.0.0.1
+micolab_technitium_admin_port: 5380
+micolab_technitium_dns_port: 53
+
+# REQUIRED: administrator password from an encrypted vault. The bootstrap
+# password is the upstream first-run default and is used only once, on
+# localhost, to rotate to the vaulted value.
+micolab_technitium_admin_user: admin
+micolab_technitium_admin_password: ""      # REQUIRED, vaulted, never "admin"
+micolab_technitium_bootstrap_password: admin
+
+# REQUIRED: offline artifacts. Each item is:
+#   name: technitium | dotnet-aspnetcore-runtime | <other role artifact>
+#   version: exact version string
+#   path: absolute path on the controller (not downloaded by Ansible)
+#   sha256: 64 lowercase or uppercase hex characters
+micolab_staged_artifacts: []
+
+# ---------------------------------------------------------------------------
+# Baseline validation
+# ---------------------------------------------------------------------------
+micolab_expected_os: Debian
+micolab_supported_debian_majors: ["12", "13"]
+micolab_expected_architecture: ""          # REQUIRED: arm64 or amd64
+micolab_required_packages:
+  - bind9-dnsutils
+  - ca-certificates
+  - curl
+  - git
+  - gzip
+  - iproute2
+  - knot-dnsutils
+  - logrotate
+  - nftables
+  - openssl
+  - tar
+micolab_required_package_prefixes:
+  - libicu
+micolab_min_free_bytes: 2147483648
+micolab_required_storage_path: "{{ micolab_technitium_config_dir }}"
+micolab_admin_cidrs: []                    # REQUIRED (SSH and admin web)
+micolab_client_cidrs: []                   # REQUIRED (lab/VPN DNS and web)
+micolab_admin_cidrs_v6: []                 # optional IPv6 admin networks
+micolab_client_cidrs_v6: []                # optional IPv6 client networks
+micolab_ssh_port: 22
+micolab_firewall_enable: true
+micolab_firewall_table: micolab_filter
+micolab_firewall_allow_icmp: true
+micolab_trust_targets: []                  # REQUIRED for step_ca consumers
+micolab_max_powered_off_interval_seconds: 0 # REQUIRED, positive integer
+
+# ---------------------------------------------------------------------------
+# Cross-role interface (implemented by other agents, documented here)
+# ---------------------------------------------------------------------------
+micolab_caddy_enable_git: false
+micolab_caddy_admin_upstream: "127.0.0.1:5380"
+micolab_caddy_admin_upstream_host: "{{ micolab_caddy_admin_upstream.rsplit(':', 1)[0] }}"
+micolab_caddy_admin_upstream_port: "{{ micolab_caddy_admin_upstream.rsplit(':', 1)[1] | int }}"
+micolab_caddy_forgejo_upstream: "127.0.0.1:3000"
+micolab_caddy_acme_trusted_roots: "{{ micolab_trust_bundle_path }}"
+micolab_step_ca_caddy_provisioner_name: acme
+micolab_step_ca_technitium_provisioner_name: microlab-technitium
+micolab_caddy_acme_provisioner: "{{ micolab_step_ca_caddy_provisioner_name }}"
+micolab_caddy_management_cidrs: "{{ micolab_admin_cidrs | unique | list }}"
+micolab_caddy_dns_client_cidrs: "{{ (micolab_admin_cidrs + micolab_client_cidrs) | unique | list }}"
+micolab_caddy_admin_cidrs: "{{ micolab_admin_cidrs | unique | list }}"
+micolab_step_ca_domain: ca.microlab.hnh
+micolab_step_ca_url: "https://ca.microlab.hnh"
+micolab_forgejo_domain: git.microlab.hnh
+micolab_forgejo_http_addr: "127.0.0.1"
+micolab_forgejo_http_port: 3000
+micolab_trust_bundle_path: /usr/local/share/ca-certificates/microlab-root.crt
+micolab_technitium_tls_cert_path: /etc/dns/tls/dns.pfx
+micolab_technitium_tls_cert_password: ""   # REQUIRED only when a TLS protocol is enabled
+micolab_technitium_tls_key_path: /etc/dns/tls/dns.key
+# technitium_tls consumes these protected values. Create the API token through
+# the loopback API and store both values in the encrypted vault; this role never
+# prints or persists them in plaintext.
+micolab_technitium_api_token: ""             # REQUIRED for technitium_tls
+micolab_technitium_enrollment_token: ""      # REQUIRED for first enrollment
+micolab_verify_challenge_group: "{{ micolab_challenge_group }}"
+micolab_verify_tls_root: "{{ micolab_trust_bundle_path }}"
+micolab_verify_required_services:
+  - caddy
+  - forgejo
+  - step-ca
+  - dns
+micolab_verify_management_cidrs: "{{ micolab_admin_cidrs | unique | list }}"
+micolab_verify_dns_client_cidrs: "{{ micolab_client_cidrs | unique | list }}"
+micolab_verify_admin_cidrs: "{{ micolab_admin_cidrs | unique | list }}"
+micolab_verify_expected_a_records:
+  ns1.microlab.hnh: "{{ micolab_dns_addresses.ns1 }}"
+  ca.microlab.hnh: "{{ micolab_dns_addresses.ca }}"
+  dns.microlab.hnh: "{{ micolab_dns_addresses.dns }}"
+  git.microlab.hnh: "{{ micolab_dns_addresses.git }}"

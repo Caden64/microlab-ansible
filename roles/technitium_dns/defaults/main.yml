@@ -1,0 +1,39 @@
+---
+micolab_dns_api_base: "http://{{ micolab_technitium_admin_bind_address }}:{{ micolab_technitium_admin_port }}"
+micolab_dns_record_ttl: 300
+micolab_dns_ns_ttl: 3600
+micolab_dns_managed_comment: "micolab-managed"
+micolab_dns_health_retries: 20
+micolab_dns_health_delay: 3
+micolab_dns_restart_wait_retries: 30
+micolab_dns_restart_wait_delay: 2
+micolab_dns_acceptance_file: /var/lib/microlab/dns-acceptance.json
+micolab_dns_resolv_conf: /etc/resolv.conf
+micolab_dns_resolv_backup: /etc/resolv.conf.microlab.bak
+
+# The admin console is reached only through Caddy on IPv4 loopback. Caddy
+# overwrites X-Real-IP, so trust exactly that proxy address and that header.
+# Do not add arbitrary proxy networks or ::1 here.
+micolab_dns_admin_reverse_proxy_address: "127.0.0.1"
+micolab_dns_admin_real_ip_header: "X-Real-IP"
+
+# Controlled offline recursive-resolution fixture. The role creates a
+# conditional-forwarder zone for micolab_dns_fixture_zone pointing at this
+# local upstream, then requires a known non-authoritative answer for
+# micolab_dns_fixture_name. With manage_service=true the role runs a tiny
+# stdlib UDP responder on loopback; set it false to use an externally staged
+# local upstream instead.
+micolab_dns_fixture_manage_service: true
+micolab_dns_fixture_listen_address: "127.0.0.1"
+micolab_dns_fixture_port: 5353
+micolab_dns_fixture_ttl: 60
+micolab_dns_fixture_service_name: microlab-dns-fixture
+micolab_dns_fixture_script_path: /usr/local/lib/microlab/dns_fixture.py
+micolab_dns_fixture_unit_path: /etc/systemd/system/microlab-dns-fixture.service
+# Durable ownership of the fixture Conditional Forwarder zone is carried by
+# this exact comment line on the single apex FWD record. The local file is only
+# a creation-intent/resume marker: it never proves ownership by itself and is
+# used solely to finish an empty Forwarder zone that this role created before a
+# crash, after re-reading the complete FWD set and validating the exact zone.
+micolab_dns_fixture_zone_marker: "micolab-managed:fixture-forwarder"
+micolab_dns_fixture_zone_state_path: /var/lib/microlab/dns-fixture-zone.state

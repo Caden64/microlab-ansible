@@ -1,0 +1,77 @@
+---
+# Pinned stock Caddy binary. Supply version + SHA-256 and an offline artifact.
+micolab_caddy_version: ""
+micolab_caddy_checksums: {}
+micolab_caddy_artifact_src_amd64: ""
+micolab_caddy_artifact_src_arm64: ""
+micolab_caddy_staged_artifact_name: "caddy"
+micolab_caddy_allow_online_download: false
+micolab_caddy_download_base_url: "https://github.com/caddyserver/caddy/releases/download"
+
+micolab_caddy_binary_path: "/usr/local/bin/caddy"
+micolab_caddy_install_root: "/opt/microlab/caddy"
+micolab_caddy_cache_dir: "/var/cache/microlab/caddy"
+micolab_caddy_config_dir: "/etc/caddy"
+micolab_caddy_config_file: "/etc/caddy/Caddyfile"
+micolab_caddy_service_name: "caddy"
+
+# Persistent state/trust. The trusted root is a public PEM file, never a key.
+micolab_caddy_user: "caddy"
+micolab_caddy_group: "caddy"
+micolab_caddy_home: "/var/lib/caddy"
+micolab_caddy_state_dir: "/var/lib/caddy"
+micolab_caddy_storage_dir: "/var/lib/caddy/.local/share/caddy"
+micolab_caddy_admin_host: "127.0.0.1"
+micolab_caddy_admin_port: 2019
+micolab_caddy_acme_provisioner: "acme"
+micolab_caddy_acme_directory: "https://127.0.0.1:4443/acme/{{ micolab_caddy_acme_provisioner }}/directory"
+# The deployment contract is exactly this endpoint. Caddy never adopts a
+# different live provisioner; a mismatch is a hard failure.
+micolab_caddy_acme_directory_required: "https://127.0.0.1:4443/acme/acme/directory"
+micolab_caddy_acme_trusted_roots: "/usr/local/share/ca-certificates/microlab-root.crt"
+
+# Initial sites. All backends are loopback on the shared management host.
+micolab_caddy_enable_ca: true
+micolab_caddy_enable_dns: true
+micolab_caddy_enable_git: false
+micolab_caddy_zone: "microlab.hnh"
+micolab_caddy_ca_host: "ca.microlab.hnh"
+micolab_caddy_dns_host: "dns.microlab.hnh"
+micolab_caddy_git_host: "git.microlab.hnh"
+micolab_caddy_http_port: 80
+micolab_caddy_https_port: 443
+
+micolab_caddy_ca_upstream_host: "127.0.0.1"
+micolab_caddy_ca_upstream_port: 4443
+micolab_caddy_dns_upstream_host: "127.0.0.1"
+micolab_caddy_dns_upstream_port: 8053
+# Technitium's admin web console. It is never exposed directly; the dns
+# hostname proxies every non-DoH path here for the admin CIDRs only.
+micolab_caddy_admin_upstream_host: "127.0.0.1"
+micolab_caddy_admin_upstream_port: 5380
+micolab_caddy_forgejo_upstream: "127.0.0.1:3000"
+micolab_caddy_forgejo_upstream_host: "{{ micolab_caddy_forgejo_upstream.rsplit(':', 1)[0] }}"
+micolab_caddy_forgejo_upstream_port: "{{ micolab_caddy_forgejo_upstream.rsplit(':', 1)[1] | int }}"
+micolab_caddy_forgejo_health_url: "http://127.0.0.1:3000/api/healthz"
+micolab_caddy_dns_probe_name: "ns1.{{ micolab_caddy_zone }}"
+micolab_caddy_ca_probe_path: "/"
+
+# Access control. Loopback is always allowed for local health gates; these
+# lists govern remote clients and are kept separate per route class.
+micolab_caddy_management_cidrs: []
+micolab_caddy_dns_client_cidrs: []
+micolab_caddy_admin_cidrs: []
+
+# Backend readiness / certificate gates.
+micolab_caddy_backend_wait_timeout: 30
+micolab_caddy_health_retries: 30
+micolab_caddy_health_delay: 5
+micolab_caddy_certificate_retries: 30
+micolab_caddy_certificate_delay: 5
+micolab_caddy_expected_issuer_contains: ""
+# The DoH backend on 8053 is created by technitium_tls, which runs after the
+# first Caddy pass. The first pass renders the dns vhost (admin proxy + DoH
+# route) and proves its certificate/admin routing, but must not require the
+# not-yet-enabled 8053 listener. A later pass sets this true once encrypted DNS
+# is healthy, which runs the real DoH probe.
+micolab_caddy_verify_doh: true

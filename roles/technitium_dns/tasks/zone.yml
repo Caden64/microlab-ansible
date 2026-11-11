@@ -1,0 +1,76 @@
+---
+- name: List the authoritative zone
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/list?filterName={{ micolab_dns_zone | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_zone_list
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require zone list access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_zone_list.status | default(0) == 200
+      - (micolab_dns_zone_list.json | default({})).status | default('') == 'ok'
+    fail_msg: Unable to list authoritative zones; no zone was created.
+    quiet: true
+
+- name: Find the exact zone
+  ansible.builtin.set_fact:
+    micolab_dns_zone_matches: >-
+      {{ micolab_dns_zone_list.json.response.zones
+         | selectattr('name', 'equalto', micolab_dns_zone)
+         | list }}
+
+- name: Refuse a disabled or non-primary existing zone
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_zone_matches[0].type == 'Primary'
+      - micolab_dns_zone_matches[0].disabled | default(false) is false
+    fail_msg: >-
+      Zone {{ micolab_dns_zone }} exists but is not an enabled Primary zone.
+      Refusing to convert or enable it implicitly.
+    quiet: true
+  when: micolab_dns_zone_matches | length > 0
+
+- name: Create the hnh Primary zone when absent
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/create"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body:
+      zone: "{{ micolab_dns_zone }}"
+      type: Primary
+      useSoaSerialDateScheme: "false"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_zone_create
+  when: micolab_dns_zone_matches | length == 0
+  failed_when: false
+  changed_when: >-
+    micolab_dns_zone_create.status | default(0) == 200
+    and (micolab_dns_zone_create.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful zone creation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_zone_create.status | default(0) == 200
+      - (micolab_dns_zone_create.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected creation of zone {{ micolab_dns_zone }}:
+      {{ (micolab_dns_zone_create.json | default({})).errorMessage | default('no error message') }}
+    quiet: true
+  when: micolab_dns_zone_matches | length == 0

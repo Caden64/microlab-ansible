@@ -1,0 +1,113 @@
+---
+# Cold-start recursion fixture. The fixture upstream must be reachable before
+# any Technitium setting or zone is mutated, and it must answer the known name
+# without the AA flag. A public resolver or the authoritative hnh zone cannot
+# substitute for this local, controlled upstream.
+
+- name: Manage the isolated offline recursion fixture service
+  when: micolab_dns_fixture_manage_service | bool
+  block:
+    - name: Ensure the fixture script directory exists
+      ansible.builtin.file:
+        path: "{{ micolab_dns_fixture_script_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the offline recursion fixture responder
+      ansible.builtin.copy:
+        src: dns_fixture.py
+        dest: "{{ micolab_dns_fixture_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart the MicroLab offline recursion fixture
+
+    - name: Install the isolated fixture service unit
+      ansible.builtin.template:
+        src: microlab-dns-fixture.service.j2
+        dest: "{{ micolab_dns_fixture_unit_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart the MicroLab offline recursion fixture
+
+    - name: Enable and start the offline recursion fixture
+      ansible.builtin.systemd:
+        name: "{{ micolab_dns_fixture_service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply a fixture unit change before validating it
+      ansible.builtin.meta: flush_handlers
+
+    - name: Confirm the fixture service is active
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - "{{ micolab_dns_fixture_service_name }}"
+      register: micolab_dns_fixture_service_active
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require the fixture service to be active
+      ansible.builtin.assert:
+        that:
+          - micolab_dns_fixture_service_active.rc == 0
+          - micolab_dns_fixture_service_active.stdout | trim == 'active'
+        fail_msg: >-
+          The local recursion fixture service {{ micolab_dns_fixture_service_name }}
+          is not active. A cold deployment cannot prove allowed recursion
+          without it. Inspect journalctl -u {{ micolab_dns_fixture_service_name }}
+          or set micolab_dns_fixture_manage_service=false and stage an
+          equivalent local upstream at {{ micolab_dns_fixture_upstream }}.
+        quiet: true
+
+- name: Query the local fixture upstream directly for the known answer
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - "@{{ micolab_dns_fixture_upstream_host }}"
+      - -p
+      - "{{ micolab_dns_fixture_upstream_port }}"
+      - "{{ micolab_dns_fixture_name }}"
+      - A
+  register: micolab_dns_fixture_direct
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_fixture_direct.rc == 0
+    and (micolab_dns_fixture_direct.stdout | micolab_dns_status) == 'NOERROR'
+    and not (micolab_dns_fixture_direct.stdout | micolab_dns_has_aa)
+    and micolab_dns_fixture_expected_ip in (micolab_dns_fixture_direct.stdout | micolab_dns_answer_values)
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+
+- name: Require the local fixture to return the known non-authoritative answer
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_direct.rc == 0
+      - (micolab_dns_fixture_direct.stdout | micolab_dns_status) == 'NOERROR'
+      - not (micolab_dns_fixture_direct.stdout | micolab_dns_has_aa)
+      - micolab_dns_fixture_expected_ip in (micolab_dns_fixture_direct.stdout | micolab_dns_answer_values)
+    fail_msg: >-
+      The local recursion fixture at {{ micolab_dns_fixture_upstream }} did not
+      return NOERROR, AA clear, and {{ micolab_dns_fixture_expected_ip }} for
+      {{ micolab_dns_fixture_name }}. No Technitium setting, zone, record, or
+      resolver change has been made. Start the local upstream (the managed
+      service or an externally staged equivalent) and rerun. Last output:
+      {{ micolab_dns_fixture_direct.stdout | default('') }}
+    quiet: true
+
+- name: Record that the local fixture upstream was validated
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_upstream_verified: true

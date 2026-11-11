@@ -1,0 +1,155 @@
+---
+- name: Flush pending CA configuration and service handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start step-ca
+  ansible.builtin.systemd_service:
+    name: "{{ microlab_step_ca_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for the loopback CA API listener
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ microlab_step_ca_health_port | int }}"
+    delay: 1
+    timeout: 60
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Verify direct TLS and health through the loopback IP SAN
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ microlab_step_ca_root_cert_dest }}"
+      - "{{ microlab_step_ca_ca_url }}/health"
+  register: microlab_step_ca_health_ip
+  until: microlab_step_ca_health_ip.rc == 0
+  retries: "{{ microlab_step_ca_healthcheck_retries | int }}"
+  delay: "{{ microlab_step_ca_healthcheck_delay | int }}"
+  changed_when: false
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Require the loopback-IP health gate to report healthy
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_health_ip.rc == 0
+    fail_msg: >-
+      step-ca did not answer /health with the pinned root over
+      {{ microlab_step_ca_ca_url }}.
+    quiet: true
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Verify direct TLS and health through the ca.microlab.hnh DNS SAN
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ microlab_step_ca_root_cert_dest }}"
+      - --resolve
+      - "{{ microlab_step_ca_health_host }}:{{ microlab_step_ca_health_port }}:127.0.0.1"
+      - "https://{{ microlab_step_ca_health_host }}:{{ microlab_step_ca_health_port }}/health"
+  register: microlab_step_ca_health_dns
+  until: microlab_step_ca_health_dns.rc == 0
+  retries: "{{ microlab_step_ca_healthcheck_retries | int }}"
+  delay: "{{ microlab_step_ca_healthcheck_delay | int }}"
+  changed_when: false
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Require the DNS SAN health gate to report healthy
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_health_dns.rc == 0
+    fail_msg: >-
+      step-ca did not present a certificate valid for
+      {{ microlab_step_ca_health_host }} from the pinned root.
+    quiet: true
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Verify the Caddy ACME directory gate
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ microlab_step_ca_root_cert_dest }}"
+      - --resolve
+      - "{{ microlab_step_ca_health_host }}:{{ microlab_step_ca_health_port }}:127.0.0.1"
+      - "https://{{ microlab_step_ca_health_host }}:{{ microlab_step_ca_health_port }}/acme/{{ microlab_step_ca_caddy_provisioner_name }}/directory"
+  register: microlab_step_ca_acme_directory
+  until: microlab_step_ca_acme_directory.rc == 0
+  retries: "{{ microlab_step_ca_healthcheck_retries | int }}"
+  delay: "{{ microlab_step_ca_healthcheck_delay | int }}"
+  changed_when: false
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Require a live ACME directory with nonce and order endpoints
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_acme_directory.rc == 0
+      - (microlab_step_ca_acme_directory.stdout | from_json).newNonce is defined
+      - (microlab_step_ca_acme_directory.stdout | from_json).newAccount is defined
+      - (microlab_step_ca_acme_directory.stdout | from_json).newOrder is defined
+    fail_msg: >-
+      The ACME directory for {{ microlab_step_ca_caddy_provisioner_name }} was
+      not served with the expected newNonce/newAccount/newOrder fields.
+    quiet: true
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Read one bounded page of the live provisioner list
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ microlab_step_ca_root_cert_dest }}"
+      # smallstep returns {"provisioners": [...], "nextCursor": "..."} and
+      # caps the page size at 100. Requesting the cap and requiring an empty
+      # nextCursor proves this response is the complete set before comparing.
+      - "{{ microlab_step_ca_ca_url }}/provisioners?limit=100"
+  register: microlab_step_ca_provisioners
+  changed_when: false
+  when: microlab_step_ca_healthcheck_enabled | bool
+
+- name: Parse the live provisioner page
+  ansible.builtin.set_fact:
+    microlab_step_ca_live_provisioners: >-
+      {{ (((microlab_step_ca_provisioners.stdout | from_json) | default({})).get('provisioners', [])) }}
+    microlab_step_ca_live_provisioners_next: >-
+      {{ (((microlab_step_ca_provisioners.stdout | from_json) | default({})).get('nextCursor', '')) }}
+  when:
+    - microlab_step_ca_healthcheck_enabled | bool
+    - microlab_step_ca_provisioners.rc | default(1) == 0
+
+- name: Require the single config authority to expose exactly the managed provisioners
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_provisioners.rc == 0
+      - (microlab_step_ca_live_provisioners | default([])) is sequence
+      - (microlab_step_ca_live_provisioners | default([])) is not string
+      - (microlab_step_ca_live_provisioners_next | default('')) | length == 0
+      - >-
+        (microlab_step_ca_live_provisioners | default([])
+         | map(attribute='name')
+         | list
+         | sort)
+        == ([microlab_step_ca_caddy_provisioner_name,
+             microlab_step_ca_technitium_provisioner_name] | sort)
+    fail_msg: >-
+      The live provisioner set does not match ca.json, or the bounded
+      /provisioners page was incomplete (a non-empty nextCursor means more than
+      100 provisioners were hidden). Do not use `step ca provisioner` to
+      mutate this CA; restore the role-managed configuration instead.
+    quiet: true
+  when: microlab_step_ca_healthcheck_enabled | bool

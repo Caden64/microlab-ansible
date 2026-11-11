@@ -1,0 +1,127 @@
+---
+# Read-only validation of the offline CA material on the Ansible controller.
+#
+# deploy_material.yml uses `ansible.builtin.copy: src=...`, which always reads
+# the controller, never the target. Validating these paths on the target would
+# therefore check a different file (or no file at all): a controller-only source
+# could appear missing, and a same-named target file could be validated instead
+# of the bytes copy will eventually deploy.
+#
+# Every observation in this file runs on the controller with become disabled.
+# It is included by main.yml before install.yml, so an unusable source artifact
+# fails before any target package, binary, or CA state is touched. The target
+# preflight does not repeat these checks; it uses the fact recorded below as a
+# gate, and the integration harness includes this file first.
+#
+# Source paths must be absolute. `copy` resolves a relative `src` against the
+# role's files/ directory (or the playbook directory), while a delegated `stat`
+# would resolve it against the controller process working directory. Requiring
+# an absolute path makes the validated path and the copied path identical.
+
+- name: Require absolute controller source paths for an explicit first deployment
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_root_cert_src is string
+      - microlab_step_ca_root_cert_src.startswith('/')
+      - microlab_step_ca_intermediate_cert_src is string
+      - microlab_step_ca_intermediate_cert_src.startswith('/')
+      - microlab_step_ca_intermediate_key_src is string
+      - microlab_step_ca_intermediate_key_src.startswith('/')
+    fail_msg: >-
+      First deployment requires absolute controller paths for the root
+      certificate, intermediate certificate, and encrypted intermediate key.
+      Relative paths are rejected because Ansible resolves a relative copy src
+      against the role/playbook directory while controller-side validation
+      resolves it against the process working directory. Supply reviewed
+      absolute paths; no target state was written.
+    quiet: true
+  when: microlab_step_ca_initial_deploy | bool
+
+- name: Require OpenSSL on the Ansible controller
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - version
+  delegate_to: localhost
+  become: false
+  register: microlab_step_ca_controller_openssl
+  changed_when: false
+  failed_when: false
+  when: microlab_step_ca_initial_deploy | bool
+
+- name: Fail with a clear message when controller-side OpenSSL is unavailable
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_controller_openssl.rc | default(1) == 0
+    fail_msg: >-
+      Controller-side source validation needs the openssl CLI on the Ansible
+      controller. Install it there; the target's OpenSSL is not used for this
+      check.
+    quiet: true
+  when: microlab_step_ca_initial_deploy | bool
+
+# `follow: true` matches `copy`, which follows a symlinked controller source and
+# deploys the referent's bytes. No run_once is used: each host in a play may
+# carry different source variables and must validate its own configured paths.
+- name: Inspect controller-side offline CA material
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - "{{ microlab_step_ca_root_cert_src }}"
+    - "{{ microlab_step_ca_intermediate_cert_src }}"
+    - "{{ microlab_step_ca_intermediate_key_src }}"
+  register: microlab_step_ca_source_stat
+  delegate_to: localhost
+  become: false
+  when: microlab_step_ca_initial_deploy | bool
+
+- name: Require complete regular non-empty controller source material
+  ansible.builtin.assert:
+    that:
+      - (microlab_step_ca_source_stat.results | default([])) | length == 3
+      - microlab_step_ca_source_stat.results[0].stat.exists | default(false) | bool
+      - microlab_step_ca_source_stat.results[0].stat.isreg | default(false) | bool
+      - (microlab_step_ca_source_stat.results[0].stat.size | default(0) | int) > 0
+      - microlab_step_ca_source_stat.results[1].stat.exists | default(false) | bool
+      - microlab_step_ca_source_stat.results[1].stat.isreg | default(false) | bool
+      - (microlab_step_ca_source_stat.results[1].stat.size | default(0) | int) > 0
+      - microlab_step_ca_source_stat.results[2].stat.exists | default(false) | bool
+      - microlab_step_ca_source_stat.results[2].stat.isreg | default(false) | bool
+      - (microlab_step_ca_source_stat.results[2].stat.size | default(0) | int) > 0
+    fail_msg: >-
+      First deployment requires a complete, regular, non-empty root
+      certificate, intermediate certificate, and encrypted intermediate key on
+      the controller. Repair the offline artifact sources; no target state was
+      written.
+    quiet: true
+  when: microlab_step_ca_initial_deploy | bool
+
+# `apply` puts both delegation keywords on every task in the included file;
+# include_tasks itself does not run commands. The password is passed on stdin
+# and remains no_log inside verify_material.yml.
+- name: Validate controller-side source material before any target change
+  ansible.builtin.include_tasks:
+    file: verify_material.yml
+    apply:
+      delegate_to: localhost
+      become: false
+  vars:
+    microlab_step_ca_verify_root: "{{ microlab_step_ca_root_cert_src }}"
+    microlab_step_ca_verify_crt: "{{ microlab_step_ca_intermediate_cert_src }}"
+    microlab_step_ca_verify_key: "{{ microlab_step_ca_intermediate_key_src }}"
+    microlab_step_ca_verify_password_arg: stdin
+    microlab_step_ca_verify_password_stdin: "{{ microlab_step_ca_intermediate_key_password }}"
+    microlab_step_ca_verify_label: controller source
+  when: microlab_step_ca_initial_deploy | bool
+
+# The fact is set on the play host, not on the delegated controller. Recording
+# the exact paths (not just a boolean) means a later preflight cannot reuse a
+# stale pass after the source variables have changed.
+- name: Record the validated controller-side source paths
+  ansible.builtin.set_fact:
+    microlab_step_ca_sources_preflighted:
+      - "{{ microlab_step_ca_root_cert_src }}"
+      - "{{ microlab_step_ca_intermediate_cert_src }}"
+      - "{{ microlab_step_ca_intermediate_key_src }}"
+  when: microlab_step_ca_initial_deploy | bool

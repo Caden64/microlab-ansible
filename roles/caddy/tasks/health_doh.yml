@@ -1,0 +1,46 @@
+---
+# Real DoH acceptance. This file is included by main.yml only when
+# micolab_caddy_verify_doh is true, and by the site playbook as an explicit
+# post-encrypted-DNS readiness phase. It must never run before the Technitium
+# 8053 listener exists.
+
+- name: Wait for the DoH loopback listener after encrypted DNS is enabled
+  ansible.builtin.wait_for:
+    host: "{{ micolab_caddy_dns_upstream_host }}"
+    port: "{{ micolab_caddy_dns_upstream_port }}"
+    timeout: "{{ micolab_caddy_backend_wait_timeout }}"
+  when: micolab_caddy_enable_dns | bool
+
+- name: Health-gate the exact DoH path and preserved URI query
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl --fail --silent --show-error --max-time 15 \
+      --cacert "{{ micolab_caddy_acme_trusted_roots }}" \
+      --resolve "{{ micolab_caddy_dns_host }}:{{ micolab_caddy_https_port }}:127.0.0.1" \
+      -H 'accept: application/dns-json' \
+      "https://{{ micolab_caddy_dns_host }}:{{ micolab_caddy_https_port }}/dns-query?name={{ micolab_caddy_dns_probe_name }}&type=A"
+  args:
+    executable: /bin/bash
+  register: micolab_caddy_doh_gate
+  until: micolab_caddy_doh_gate.rc == 0
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  failed_when: micolab_caddy_doh_gate.rc != 0
+  check_mode: false
+  when:
+    - micolab_caddy_enable_dns | bool
+    - not ansible_check_mode
+
+- name: Require a valid DNS JSON answer from the DoH health gate
+  ansible.builtin.assert:
+    that:
+      - (micolab_caddy_doh_gate.stdout | from_json).Status | default(1) == 0
+      - (micolab_caddy_doh_gate.stdout | from_json).Answer is defined
+    fail_msg: >-
+      DoH at the exact /dns-query path did not return a successful DNS JSON
+      answer through Caddy. This catches a missing 8053 backend, query-string
+      stripping, or a wrong reverse proxy.
+  when:
+    - micolab_caddy_enable_dns | bool
+    - not ansible_check_mode

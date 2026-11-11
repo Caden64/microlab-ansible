@@ -1,0 +1,170 @@
+---
+- name: Try the managed administrator password over loopback
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/user/login"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      user: "{{ micolab_technitium_admin_user }}"
+      pass: "{{ micolab_technitium_admin_password }}"
+      includeInfo: "true"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_login_managed
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Record whether the managed password authenticated
+  ansible.builtin.set_fact:
+    micolab_dns_managed_login_ok: >-
+      {{ micolab_dns_login_managed.status | default(0) == 200
+         and (micolab_dns_login_managed.json | default({})).status | default('') == 'ok' }}
+  no_log: true
+
+- name: Try the one-time upstream bootstrap password only if needed
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/user/login"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      user: "{{ micolab_technitium_admin_user }}"
+      pass: "{{ micolab_technitium_bootstrap_password }}"
+      includeInfo: "true"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_login_bootstrap
+  when: not micolab_dns_managed_login_ok | bool
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Record whether the bootstrap password authenticated
+  ansible.builtin.set_fact:
+    micolab_dns_bootstrap_login_ok: >-
+      {{ (micolab_dns_login_bootstrap.status | default(0) == 200
+          and (micolab_dns_login_bootstrap.json | default({})).status | default('') == 'ok')
+         if not micolab_dns_managed_login_ok | bool else false }}
+  no_log: true
+
+- name: Fail closed when neither credential is accepted
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_managed_login_ok | bool or micolab_dns_bootstrap_login_ok | bool
+    fail_msg: >-
+      Technitium rejected both the vaulted administrator password and the
+      one-time bootstrap password. Refusing to guess, reset, or expose the
+      credential. Restore the correct vault value or the pre-deployment backup.
+    quiet: true
+  no_log: false
+
+- name: Rotate the upstream bootstrap password over loopback
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/user/changePassword"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      pass: "{{ micolab_technitium_bootstrap_password }}"
+      newPass: "{{ micolab_technitium_admin_password }}"
+    headers:
+      Authorization: "Bearer {{ micolab_dns_login_bootstrap.json.token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_password_rotation
+  when: not micolab_dns_managed_login_ok | bool
+  failed_when: false
+  changed_when: >-
+    micolab_dns_password_rotation.status | default(0) == 200
+    and (micolab_dns_password_rotation.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+
+- name: Require successful bootstrap password rotation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_password_rotation.status | default(0) == 200
+      - (micolab_dns_password_rotation.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      The bootstrap password could not be rotated. Technitium's API returned
+      an error; no plaintext credential is printed.
+    quiet: true
+  when: not micolab_dns_managed_login_ok | bool
+  no_log: false
+
+- name: Re-authenticate with the vaulted administrator password
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/user/login"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      user: "{{ micolab_technitium_admin_user }}"
+      pass: "{{ micolab_technitium_admin_password }}"
+      includeInfo: "true"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_login_final
+  when: not micolab_dns_managed_login_ok | bool
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require a session after rotation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_login_final.status | default(0) == 200
+      - (micolab_dns_login_final.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      The vaulted administrator password did not authenticate after rotation.
+      The vault value and the rotation target may differ.
+    quiet: true
+  when: not micolab_dns_managed_login_ok | bool
+  no_log: true
+
+- name: Hold the bearer session and login metadata
+  ansible.builtin.set_fact:
+    micolab_technitium_token: >-
+      {{ (micolab_dns_login_managed.json.token
+          if micolab_dns_managed_login_ok | bool
+          else micolab_dns_login_final.json.token) }}
+    micolab_technitium_login_metadata: >-
+      {{ (micolab_dns_login_managed.json
+          if micolab_dns_managed_login_ok | bool
+          else micolab_dns_login_final.json) }}
+  no_log: true
+
+- name: Require the running Technitium version to match the pin
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_login_metadata.info.version | default('') == micolab_technitium_version
+    fail_msg: >-
+      Running Technitium version
+      {{ micolab_technitium_login_metadata.info.version | default('unknown') }}
+      does not match the pinned version {{ micolab_technitium_version }}.
+    quiet: true
+  no_log: true
+
+- name: Confirm default credentials are disabled
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/status"
+    method: GET
+    return_content: true
+    status_code: 200
+    timeout: 15
+  register: micolab_dns_auth_status
+  changed_when: false
+
+- name: Gate on disabled default credentials
+  ansible.builtin.assert:
+    that:
+      - (micolab_dns_auth_status.json | default({})).hasDefaultCredentials | default(true) is false
+    fail_msg: >-
+      Technitium still reports default credentials. The admin API must not
+      proceed with the upstream admin/admin password active.
+    quiet: true

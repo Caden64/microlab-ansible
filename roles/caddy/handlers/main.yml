@@ -1,0 +1,29 @@
+---
+- name: Validate Caddyfile before reload
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_caddy_binary_path }}"
+      - validate
+      - --config
+      - "{{ micolab_caddy_config_file }}"
+      - --adapter
+      - caddyfile
+  become: true
+  become_user: "{{ micolab_caddy_user }}"
+  environment:
+    HOME: "{{ micolab_caddy_home }}"
+    XDG_DATA_HOME: "{{ micolab_caddy_storage_dir }}"
+    XDG_CONFIG_HOME: "{{ micolab_caddy_home }}/.config"
+  changed_when: false
+
+- name: Reload Caddy
+  ansible.builtin.systemd:
+    name: "{{ micolab_caddy_service_name }}"
+    state: reloaded
+    daemon_reload: true
+
+- name: Restart Caddy
+  ansible.builtin.systemd:
+    name: "{{ micolab_caddy_service_name }}"
+    state: restarted
+    daemon_reload: true

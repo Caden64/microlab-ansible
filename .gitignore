@@ -1,0 +1,83 @@
+# Site inventories are private; publish only the sanitized example tree.
+/inventory/
+/inventory
+/inventory.*
+/hosts
+/hosts.ini
+/hosts.yml
+/hosts.yaml
+/inventories/*
+!/inventories/example/
+!/inventories/vault.yml.example
+/inventories/example/**/host_vars/
+/host_vars/
+/group_vars/*
+!/group_vars/all.yml
+
+# Vaults remain excluded even within the example inventory.
+*.vault
+vault*.yml
+vault*.yaml
+!vault.example.yml
+!vault.example.yaml
+secrets/
+*.secret
+.vault-pass*
+.vault_password*
+vault-pass*
+vault_password*
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Loose operator key material at the root; retain role templates and fixtures.
+/*.key
+/*.pem
+/*.p12
+/*.pfx
+/id_rsa
+/id_ed25519
+/.ssh/
+/.aws/
+/.kube/
+
+# Pre-staged offline artifacts (pinned versions live in variables)
+artifacts/
+/*.tar.gz
+/*.tar
+/*.tar.*
+/*.tgz
+/*.zip
+
+# Backup output and restore quarantine
+backups/
+microlab-backup-*.tar.gz
+microlab-backup-*.tar.gz.sha256
+restore-quarantine/
+
+# Ansible and editor scratch
+*.retry
+.ansible/
+*.swp
+*~
+.DS_Store
+/.venv/
+/venv/
+/.direnv/
+/*.log
+
+# Generated verification reports (synthetic test sources remain visible).
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+/htmlcov/
+/coverage.xml
+/junit.xml
+/test-results/
+
+# Python bytecode from local verification helpers
+__pycache__/
+*.pyc

@@ -1,0 +1,80 @@
+---
+# Resolved Technitium TLS interface for the backup and restore playbooks.
+#
+# This file mirrors roles/technitium_tls/defaults/main.yml *exactly*.  Do not
+# "improve" the precedence here: the renewal helper and the systemd units use
+# the role's evaluated values, and a backup/restore that holds a different lock
+# or archives different material is unsafe.
+#
+# In particular, the role's actual precedence is:
+#   * an explicitly set canonical microlab_technitium_* value wins;
+#   * otherwise the supported shared micolab_technitium_* alias is consumed by
+#     the role default (tls_cert_path, tls_key_path, tls_cert_password,
+#     config_dir);
+#   * otherwise the role derives the path below cert_dir.
+#
+# cert_dir is derived from the shared PFX alias only when cert_dir itself is not
+# explicitly set.  The shared key/PFX aliases still win over key/PFX derived
+# from a canonical cert_dir, so a site can legitimately end up with the PEM in
+# one directory and the key/PFX in another.  The playbooks preserve that exact
+# mixed result rather than inventing a single-directory override.
+#
+# Canonical names that the role never consumes are rejected by both playbooks
+# before any state is touched.
+
+micolab_technitium_interface_cert_dir: >-
+  {{ microlab_technitium_cert_dir
+     | default((micolab_technitium_tls_cert_path
+                | default('/etc/dns/tls/dns.pfx')) | dirname) }}
+micolab_technitium_interface_cert_path: >-
+  {{ microlab_technitium_cert_path
+     | default(micolab_technitium_interface_cert_dir ~ '/dns.crt') }}
+micolab_technitium_interface_key_path: >-
+  {{ microlab_technitium_key_path
+     | default(micolab_technitium_tls_key_path
+               | default(micolab_technitium_interface_cert_dir ~ '/dns.key')) }}
+micolab_technitium_interface_pfx_path: >-
+  {{ microlab_technitium_pfx_path
+     | default(micolab_technitium_tls_cert_path
+               | default(micolab_technitium_interface_cert_dir ~ '/dns.pfx')) }}
+micolab_technitium_interface_pfx_password_file: >-
+  {{ microlab_technitium_pfx_password_file
+     | default(micolab_technitium_interface_cert_dir ~ '/pfx.pass') }}
+micolab_technitium_interface_pfx_password: >-
+  {{ microlab_technitium_pfx_password
+     | default(micolab_technitium_tls_cert_password | default('')) }}
+# Report a digest rather than the secret in the opt-in interface report.
+micolab_technitium_interface_pfx_password_sha256: >-
+  {{ micolab_technitium_interface_pfx_password | hash('sha256') }}
+micolab_technitium_interface_config_dir: >-
+  {{ microlab_technitium_config_dir
+     | default(micolab_technitium_config_dir | default('/etc/dns')) }}
+micolab_technitium_interface_ca_root_cert: >-
+  {{ microlab_technitium_ca_root_cert
+     | default('/etc/step-ca/certs/root_ca.crt') }}
+micolab_technitium_interface_ca_chain_cert: >-
+  {{ microlab_technitium_ca_chain_cert
+     | default('/etc/step-ca/certs/intermediate_ca.crt') }}
+micolab_technitium_interface_state_directory_name: >-
+  {{ microlab_technitium_state_directory_name | default('technitium-tls') }}
+micolab_technitium_interface_state_dir: >-
+  {{ microlab_technitium_state_dir
+     | default('/var/lib/'
+               ~ micolab_technitium_interface_state_directory_name) }}
+micolab_technitium_interface_lock_file: >-
+  {{ microlab_technitium_lock_file
+     | default(micolab_technitium_interface_state_dir ~ '/renew.lock') }}
+micolab_technitium_interface_status_file: >-
+  {{ microlab_technitium_status_file
+     | default(micolab_technitium_interface_state_dir ~ '/status.json') }}
+micolab_technitium_interface_renewal_env_file: >-
+  {{ microlab_technitium_renewal_env_file
+     | default('/etc/technitium-tls/renewal.env') }}
+micolab_technitium_interface_helper_path: >-
+  {{ microlab_technitium_helper_path
+     | default('/usr/local/sbin/technitium-tls-renew') }}
+micolab_technitium_interface_service_unit: >-
+  {{ microlab_technitium_service_unit
+     | default('technitium-tls-renew.service') }}
+micolab_technitium_interface_timer_unit: >-
+  {{ microlab_technitium_timer_unit | default('technitium-tls-renew.timer') }}

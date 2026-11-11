@@ -1,0 +1,250 @@
+---
+- name: Require remote acceptance probes or an explicit unverified acknowledgment
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_remote_probes | length > 0
+    fail_msg: >-
+      No remote-client acceptance probes are configured. Queries from
+      127.0.0.1 can prove authoritative answers and the local controlled
+      fixture path, but they cannot prove that the host firewall admits the
+      intended client networks or that Technitium denies recursion to a
+      reachable network. Add probes
+      for recursion-allowed, recursion-denied, and firewall-denied classes, or
+      set micolab_dns_accept_unverified_external_acl=true to record the run as
+      local-only and explicitly unverified.
+    quiet: true
+  when:
+    - micolab_dns_require_remote_probes | bool
+    - not micolab_dns_accept_unverified_external_acl | bool
+
+- name: Default the external acceptance result to unverified
+  ansible.builtin.set_fact:
+    micolab_dns_external_acl_verified: false
+    micolab_dns_external_gates: []
+    micolab_dns_unexecuted_gates:
+      - external-authoritative-aa
+      - external-recursion-allowed
+      - external-recursion-denied
+      - external-firewall-denied
+
+- name: Warn that external ACLs are unverified
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: no remote probes ran. Local DNS answers and the controlled
+      local fixture path passed, but no remote client proved the
+      firewall/recursion ACL. The
+      acceptance file records external_acl_verified=false and lists every
+      unexecuted external gate.
+  when: micolab_dns_remote_probes | length == 0
+
+- name: Define the firewall-admitted and recursion-admitted network sets
+  ansible.builtin.set_fact:
+    micolab_dns_firewall_dns_cidrs: >-
+      {{ (micolab_admin_cidrs
+          + micolab_client_cidrs
+          + micolab_dns_authoritative_only_cidrs
+          + (micolab_admin_cidrs_v6
+             + micolab_client_cidrs_v6
+             + micolab_dns_authoritative_only_cidrs_v6
+             if micolab_dns_ipv6_enabled | bool else [])) | micolab_acl_normalize }}
+    micolab_dns_recursion_allowed_cidrs: >-
+      {{ (micolab_admin_cidrs
+          + micolab_client_cidrs
+          + (micolab_admin_cidrs_v6 + micolab_client_cidrs_v6
+             if micolab_dns_ipv6_enabled | bool else [])
+          + micolab_dns_recursion_allow_cidrs) | micolab_acl_normalize }}
+
+- name: Require complete and correctly classified remote probes
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_remote_probes | selectattr('access', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | selectattr('host', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | selectattr('dns_server', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | selectattr('source_address', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | selectattr('fqdn', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | selectattr('expect_ip', 'defined') | list | length == micolab_dns_remote_probes | length
+      - micolab_dns_remote_probes | rejectattr('access', 'in', ['recursion-allowed', 'recursion-denied', 'firewall-denied']) | list | length == 0
+      - micolab_dns_remote_probes | selectattr('host', 'equalto', inventory_hostname) | list | length == 0
+      - micolab_dns_remote_probes | selectattr('access', 'equalto', 'recursion-allowed') | list | length > 0
+      - micolab_dns_remote_probes | selectattr('access', 'equalto', 'recursion-denied') | list | length > 0
+      - micolab_dns_remote_probes | selectattr('access', 'equalto', 'firewall-denied') | list | length > 0
+      - micolab_dns_remote_probes
+        | micolab_probe_classification_errors(
+            micolab_dns_recursion_allowed_cidrs,
+            micolab_dns_authoritative_only_cidrs,
+            micolab_dns_firewall_dns_cidrs)
+        | length == 0
+    fail_msg: >-
+      Remote probes must include one recursion-allowed, one reachable
+      recursion-denied, and one firewall-denied client; every probe must
+      declare host, dns_server, source_address, fqdn, expect_ip, and access.
+      recursion-allowed sources must be in the recursion ACL,
+      recursion-denied sources must be in micolab_dns_authoritative_only_cidrs
+      (firewall-admitted but not recursion-admitted), and firewall-denied
+      sources must be outside every firewall-admitted DNS network. Probes must
+      not run on the management host itself.
+    quiet: true
+  when: micolab_dns_remote_probes | length > 0
+
+- name: Query an authoritative record from every firewall-admitted probe
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=5
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - -b
+      - "{{ item.source_address }}"
+      - "@{{ item.dns_server }}"
+      - "{{ item.fqdn }}"
+      - A
+  delegate_to: "{{ item.host }}"
+  become: false
+  register: micolab_dns_remote_authoritative
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_remote_authoritative.rc == 0
+    and (micolab_dns_remote_authoritative.stdout | micolab_dns_status) == 'NOERROR'
+    and (micolab_dns_remote_authoritative.stdout | micolab_dns_has_aa)
+    and (item.expect_ip in (micolab_dns_remote_authoritative.stdout | micolab_dns_answer_values))
+  retries: 3
+  delay: 3
+  loop: >-
+    {{ micolab_dns_remote_probes
+       | rejectattr('access', 'equalto', 'firewall-denied') | list }}
+  loop_control:
+    label: "{{ item.host }} -> {{ item.fqdn }}"
+
+- name: Gate on remote authoritative answers and the AA flag
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - (item.stdout | micolab_dns_status) == 'NOERROR'
+      - item.stdout | micolab_dns_has_aa
+      - item.item.expect_ip in (item.stdout | micolab_dns_answer_values)
+    fail_msg: >-
+      Remote client {{ item.item.host }} could not obtain an authoritative (AA)
+      answer for {{ item.item.expect_ip }} {{ item.item.fqdn }} from
+      {{ item.item.dns_server }}. Output: {{ item.stdout | default('') }}
+    quiet: true
+  loop: "{{ micolab_dns_remote_authoritative.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.host }}"
+
+- name: Prove firewall-denied networks receive no DNS reply
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=5
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - -b
+      - "{{ item.source_address }}"
+      - "@{{ item.dns_server }}"
+      - "{{ item.fqdn }}"
+      - A
+  delegate_to: "{{ item.host }}"
+  become: false
+  register: micolab_dns_remote_firewall_denied
+  changed_when: false
+  failed_when: false
+  until: >-
+    (micolab_dns_remote_firewall_denied.rc | micolab_dns_no_reply(
+       micolab_dns_remote_firewall_denied.stdout))
+    and ((micolab_dns_remote_firewall_denied.stdout | micolab_dns_answer_values) | length == 0)
+  retries: 2
+  delay: 2
+  loop: >-
+    {{ micolab_dns_remote_probes
+       | selectattr('access', 'equalto', 'firewall-denied') | list }}
+  loop_control:
+    label: "{{ item.host }} firewall drop"
+
+- name: Gate on firewall-denied probes receiving no reply
+  ansible.builtin.assert:
+    that:
+      - item.rc | micolab_dns_no_reply(item.stdout)
+      - (item.stdout | micolab_dns_answer_values) | length == 0
+    fail_msg: >-
+      Firewall-denied probe {{ item.item.host }} received a DNS response from
+      {{ item.item.dns_server }}. That means the nftables ingress policy or the
+      probe source is wrong; a firewall-denied client must see no reply.
+      Output: {{ item.stdout | default('') }}
+    quiet: true
+  loop: "{{ micolab_dns_remote_firewall_denied.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.host }}"
+
+- name: Probe recursion policy from every firewall-admitted remote client
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=5
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - -b
+      - "{{ item.source_address }}"
+      - "@{{ item.dns_server }}"
+      - "{{ micolab_dns_fixture_name }}"
+      - A
+  delegate_to: "{{ item.host }}"
+  become: false
+  register: micolab_dns_remote_recursion
+  changed_when: false
+  failed_when: false
+  until: >-
+    (item.access == 'recursion-allowed'
+     and (micolab_dns_remote_recursion.stdout | micolab_dns_status) == 'NOERROR'
+     and not (micolab_dns_remote_recursion.stdout | micolab_dns_has_aa)
+     and micolab_dns_fixture_expected_ip in (micolab_dns_remote_recursion.stdout | micolab_dns_answer_values))
+    or
+    (item.access == 'recursion-denied'
+     and (micolab_dns_remote_recursion.stdout | micolab_dns_status) == 'REFUSED')
+  retries: 3
+  delay: 3
+  loop: >-
+    {{ micolab_dns_remote_probes
+       | rejectattr('access', 'equalto', 'firewall-denied') | list }}
+  loop_control:
+    label: "{{ item.host }} recursion"
+
+- name: Gate on remote recursion allow and deny behavior
+  ansible.builtin.assert:
+    that:
+      - >-
+        (item.item.access == 'recursion-allowed'
+         and (item.stdout | micolab_dns_status) == 'NOERROR'
+         and not (item.stdout | micolab_dns_has_aa)
+         and micolab_dns_fixture_expected_ip in (item.stdout | micolab_dns_answer_values))
+        or
+        (item.item.access == 'recursion-denied'
+         and (item.stdout | micolab_dns_status) == 'REFUSED')
+    fail_msg: >-
+      Recursion probe for {{ item.item.host }} ({{ item.item.access }}) got the
+      wrong policy result for the local fixture {{ micolab_dns_fixture_name }}.
+      recursion-allowed must resolve {{ micolab_dns_fixture_expected_ip }} with
+      NOERROR and AA clear; recursion-denied must get REFUSED. SERVFAIL is not
+      accepted as success.
+      Output: {{ item.stdout | default('') }}
+    quiet: true
+  loop: "{{ micolab_dns_remote_recursion.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.host }}"
+
+- name: Mark external ACL acceptance as verified
+  ansible.builtin.set_fact:
+    micolab_dns_external_acl_verified: true
+    micolab_dns_external_gates:
+      - external-authoritative-aa
+      - external-recursion-allowed
+      - external-recursion-denied
+      - external-firewall-denied
+    micolab_dns_unexecuted_gates: []
+  when: micolab_dns_remote_probes | length > 0

@@ -1,0 +1,212 @@
+---
+# Read-only cryptographic validation of one CA material set.
+#
+# Required variables:
+#   microlab_step_ca_verify_root         root certificate path
+#   microlab_step_ca_verify_crt          intermediate certificate path
+#   microlab_step_ca_verify_key          encrypted intermediate key path
+#   microlab_step_ca_verify_password_arg openssl -passin value; either
+#                                       "file:<path>" or "stdin"
+#   microlab_step_ca_verify_label        human-readable material label
+# Optional:
+#   microlab_step_ca_verify_password_stdin  password when arg is stdin
+#
+# This file never writes files and never prints secret values.
+
+- name: "Read the {{ microlab_step_ca_verify_label }} root fingerprint"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ microlab_step_ca_verify_root }}"
+      - -noout
+      - -fingerprint
+      - -sha256
+  register: microlab_step_ca_verify_root_fingerprint
+  changed_when: false
+  failed_when: false
+
+- name: "Require the {{ microlab_step_ca_verify_label }} root to match the pinned fingerprint"
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_verify_root_fingerprint.rc | default(1) == 0
+      - >-
+        (microlab_step_ca_verify_root_fingerprint.stdout | default('')
+         | regex_replace('^.*=', '')
+         | regex_replace(':', '')
+         | upper) == microlab_step_ca_root_fingerprint_normalized
+    fail_msg: >-
+      The {{ microlab_step_ca_verify_label }} root certificate does not match
+      the pinned SHA-256 fingerprint. Refusing to continue. Restore the root
+      that matches the pin, or perform an explicit security review before
+      changing the pin.
+    quiet: true
+
+- name: "Verify the {{ microlab_step_ca_verify_label }} root is an unexpired CA"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ microlab_step_ca_verify_root }}"
+      - -noout
+      - -ext
+      - basicConstraints
+      - -checkend
+      - "0"
+  register: microlab_step_ca_verify_root_constraints
+  changed_when: false
+  failed_when: false
+
+- name: "Require the {{ microlab_step_ca_verify_label }} root to be an unexpired CA"
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_verify_root_constraints.rc | default(1) == 0
+      - "'CA:TRUE' in (microlab_step_ca_verify_root_constraints.stdout | default(''))"
+    fail_msg: >-
+      The {{ microlab_step_ca_verify_label }} root certificate is expired or is
+      not a CA certificate.
+    quiet: true
+
+- name: "Verify the {{ microlab_step_ca_verify_label }} intermediate chains to the root"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - verify
+      - -CAfile
+      - "{{ microlab_step_ca_verify_root }}"
+      - "{{ microlab_step_ca_verify_crt }}"
+  register: microlab_step_ca_verify_chain
+  changed_when: false
+  failed_when: false
+
+- name: "Verify the {{ microlab_step_ca_verify_label }} intermediate is an unexpired CA"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ microlab_step_ca_verify_crt }}"
+      - -noout
+      - -ext
+      - basicConstraints
+      - -checkend
+      - "0"
+  register: microlab_step_ca_verify_constraints
+  changed_when: false
+  failed_when: false
+
+- name: "Require a valid {{ microlab_step_ca_verify_label }} intermediate chain"
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_verify_chain.rc | default(1) == 0
+      - "'OK' in (microlab_step_ca_verify_chain.stdout | default(''))"
+      - microlab_step_ca_verify_constraints.rc | default(1) == 0
+      - "'CA:TRUE' in (microlab_step_ca_verify_constraints.stdout | default(''))"
+    fail_msg: >-
+      The {{ microlab_step_ca_verify_label }} intermediate certificate is
+      expired, is not a CA, or does not chain to the pinned root. Restore the
+      matching offline-issued intermediate.
+    quiet: true
+
+- name: "Verify the {{ microlab_step_ca_verify_label }} password decrypts the intermediate key"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkey
+      - -in
+      - "{{ microlab_step_ca_verify_key }}"
+      - -passin
+      - "{{ microlab_step_ca_verify_password_arg }}"
+      - -noout
+  register: microlab_step_ca_verify_key_decrypt
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: microlab_step_ca_verify_password_arg != 'stdin'
+
+- name: "Verify the {{ microlab_step_ca_verify_label }} password decrypts the intermediate key from stdin"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkey
+      - -in
+      - "{{ microlab_step_ca_verify_key }}"
+      - -passin
+      - stdin
+      - -noout
+    stdin: "{{ microlab_step_ca_verify_password_stdin }}\n"
+  register: microlab_step_ca_verify_key_decrypt_stdin
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: microlab_step_ca_verify_password_arg == 'stdin'
+
+- name: "Read the {{ microlab_step_ca_verify_label }} intermediate certificate public key"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ microlab_step_ca_verify_crt }}"
+      - -noout
+      - -pubkey
+  register: microlab_step_ca_verify_cert_public_key
+  changed_when: false
+  failed_when: false
+
+- name: "Read the {{ microlab_step_ca_verify_label }} intermediate private key public key"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkey
+      - -in
+      - "{{ microlab_step_ca_verify_key }}"
+      - -passin
+      - "{{ microlab_step_ca_verify_password_arg }}"
+      - -pubout
+  register: microlab_step_ca_verify_key_public_key
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: microlab_step_ca_verify_password_arg != 'stdin'
+
+- name: "Read the {{ microlab_step_ca_verify_label }} intermediate private key public key from stdin"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkey
+      - -in
+      - "{{ microlab_step_ca_verify_key }}"
+      - -passin
+      - stdin
+      - -pubout
+    stdin: "{{ microlab_step_ca_verify_password_stdin }}\n"
+  register: microlab_step_ca_verify_key_public_key_stdin
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: microlab_step_ca_verify_password_arg == 'stdin'
+
+- name: "Require the {{ microlab_step_ca_verify_label }} key and password to match the certificate"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (microlab_step_ca_verify_key_decrypt.rc | default(1)) == 0
+        or (microlab_step_ca_verify_key_decrypt_stdin.rc | default(1)) == 0
+      - microlab_step_ca_verify_cert_public_key.rc | default(1) == 0
+      - >-
+        (microlab_step_ca_verify_key_public_key.rc | default(1)) == 0
+        or (microlab_step_ca_verify_key_public_key_stdin.rc | default(1)) == 0
+      - >-
+        (microlab_step_ca_verify_cert_public_key.stdout | default(''))
+        ==
+        (microlab_step_ca_verify_key_public_key.stdout
+         | default(microlab_step_ca_verify_key_public_key_stdin.stdout | default('')))
+    fail_msg: >-
+      The {{ microlab_step_ca_verify_label }} intermediate private key does not
+      match the intermediate certificate, or the supplied password cannot
+      decrypt it.
+    quiet: true
+  no_log: true

@@ -1,0 +1,12 @@
+{{ micolab_technitium_log_dir }}/*.log {
+    daily
+    rotate {{ micolab_dns_log_retention_days }}
+    maxage {{ micolab_dns_log_retention_days }}
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su {{ micolab_technitium_user }} {{ micolab_technitium_group }}
+}

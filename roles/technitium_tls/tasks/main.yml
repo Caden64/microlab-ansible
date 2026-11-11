@@ -1,0 +1,77 @@
+---
+- name: Validate Technitium TLS inputs
+  ansible.builtin.import_tasks: validate.yml
+
+- name: Install the independent renewal helper and systemd units
+  ansible.builtin.import_tasks: install_helper.yml
+
+- name: Enroll or validate the Technitium certificate
+  ansible.builtin.import_tasks: enroll.yml
+
+- name: Flush unit and helper handlers before certificate gates
+  ansible.builtin.meta: flush_handlers
+
+- name: Validate the enrolled certificate and detect expired renewal state
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_technitium_helper_path }}"
+      - --config
+      - "{{ microlab_technitium_renewal_env_file }}"
+      - --check-only
+  register: microlab_technitium_cert_check
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to enable renewal for an expired or invalid certificate
+  when: microlab_technitium_cert_check.rc != 0
+  block:
+    - name: Disable any existing renewal timer while the certificate is invalid
+      ansible.builtin.systemd_service:
+        name: "{{ microlab_technitium_timer_unit }}"
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Report that protected re-enrollment is required
+      ansible.builtin.fail:
+        msg: >-
+          Technitium certificate validation failed:
+          {{ microlab_technitium_cert_check.stderr | default('') }}
+          Renewal after expiry is disabled. Perform the protected re-enrollment
+          procedure in docs/certificate-renewal.md: mint a single-use token on
+          the CA host with /usr/local/sbin/step-ca-technitium-token,
+          remove the old certificate/key, and rerun this role with
+          microlab_technitium_enrollment_token set.
+
+- name: Publish and verify the PKCS#12 used by native DoT
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_technitium_helper_path }}"
+      - --config
+      - "{{ microlab_technitium_renewal_env_file }}"
+      - --publish-only
+  register: microlab_technitium_publish
+  changed_when: false
+
+- name: Reconcile DoH/DoT through the Technitium API
+  ansible.builtin.import_tasks: configure_api.yml
+
+- name: Verify the live DoT certificate after API reconciliation
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_technitium_helper_path }}"
+      - --config
+      - "{{ microlab_technitium_renewal_env_file }}"
+      - --verify-only
+  register: microlab_technitium_post_api_verify
+  changed_when: false
+
+- name: Run DoH/DoT health gates
+  ansible.builtin.import_tasks: health.yml
+
+- name: Enable and start the serialized renewal timer
+  ansible.builtin.systemd_service:
+    name: "{{ microlab_technitium_timer_unit }}"
+    enabled: true
+    state: started
+    daemon_reload: true

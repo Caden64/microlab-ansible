@@ -1,0 +1,83 @@
+---
+- name: Detect whether the renewal timer is already active
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - --quiet
+      - "{{ microlab_technitium_timer_unit }}"
+  register: microlab_technitium_timer_state
+  changed_when: false
+  failed_when: false
+
+- name: Record timer activity for conditional handler safety
+  ansible.builtin.set_fact:
+    microlab_technitium_timer_active: "{{ microlab_technitium_timer_state.rc == 0 }}"
+
+- name: Create the restricted Technitium TLS directory
+  ansible.builtin.file:
+    path: "{{ microlab_technitium_cert_dir }}"
+    state: directory
+    owner: root
+    group: "{{ microlab_technitium_service_group }}"
+    mode: "0750"
+
+- name: Install the independent renewal helper
+  ansible.builtin.copy:
+    src: technitium-tls-renew
+    dest: "{{ microlab_technitium_helper_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart Technitium TLS renewal timer
+
+- name: Create the protected Technitium TLS configuration directory
+  ansible.builtin.file:
+    path: "{{ microlab_technitium_renewal_env_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Write the root-only PFX password file
+  ansible.builtin.copy:
+    content: "{{ microlab_technitium_pfx_password }}\n"
+    dest: "{{ microlab_technitium_pfx_password_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false
+
+- name: Write the protected renewal environment
+  ansible.builtin.template:
+    src: renewal.env.j2
+    dest: "{{ microlab_technitium_renewal_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false
+  notify: Restart Technitium TLS renewal timer
+
+- name: Install the serialized renewal service
+  ansible.builtin.template:
+    src: technitium-tls-renew.service.j2
+    dest: "/etc/systemd/system/{{ microlab_technitium_service_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd units
+    - Restart Technitium TLS renewal timer
+
+- name: Install the renewal timer
+  ansible.builtin.template:
+    src: technitium-tls-renew.timer.j2
+    dest: "/etc/systemd/system/{{ microlab_technitium_timer_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd units
+    - Restart Technitium TLS renewal timer

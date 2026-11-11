@@ -1,0 +1,154 @@
+---
+- name: Inspect the enrolled certificate and private key
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ microlab_technitium_cert_path }}"
+    - "{{ microlab_technitium_key_path }}"
+  register: microlab_technitium_cert_state
+
+- name: Refuse a partial certificate/key pair
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_cert_state.results[0].stat.exists == microlab_technitium_cert_state.results[1].stat.exists
+    fail_msg: >-
+      Only one of the Technitium certificate and private key exists. Do not
+      generate a new key implicitly. Restore the matching pair or perform the
+      protected re-enrollment procedure in docs/certificate-renewal.md.
+    quiet: true
+
+- name: Require a protected single-use enrollment token for first enrollment
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_enrollment_token is string
+      - microlab_technitium_enrollment_token | length > 0
+    fail_msg: >-
+      A protected single-use token is required. On the CA host run
+      /usr/local/sbin/step-ca-technitium-token {{ microlab_technitium_cert_name }}
+      and pass the output as microlab_technitium_enrollment_token through
+      encrypted inventory. The helper/timer never creates certificates.
+    quiet: true
+  no_log: true
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Remove stale staging material before enrollment
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ microlab_technitium_key_path }}.new"
+    - "{{ microlab_technitium_cert_path }}.new.csr"
+    - "{{ microlab_technitium_cert_path }}.new"
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Generate the service private key for the signing request
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - genpkey
+      - -algorithm
+      - EC
+      - -pkeyopt
+      - ec_paramgen_curve:P-256
+      - -out
+      - "{{ microlab_technitium_key_path }}.new"
+  args:
+    creates: "{{ microlab_technitium_key_path }}.new"
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Restrict the staged private key until it is published
+  ansible.builtin.file:
+    path: "{{ microlab_technitium_key_path }}.new"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Build the certificate signing request with the restricted SAN
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -new
+      - -key
+      - "{{ microlab_technitium_key_path }}.new"
+      - -subj
+      - "/CN={{ microlab_technitium_cert_name }}"
+      - -addext
+      - "subjectAltName=DNS:{{ microlab_technitium_cert_name }}"
+      - -out
+      - "{{ microlab_technitium_cert_path }}.new.csr"
+  args:
+    creates: "{{ microlab_technitium_cert_path }}.new.csr"
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Sign the CSR directly at the restricted CA using the one-time token
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_technitium_step_bin }}"
+      - ca
+      - sign
+      - "{{ microlab_technitium_cert_path }}.new.csr"
+      - "{{ microlab_technitium_cert_path }}.new"
+      - --token
+      - "{{ microlab_technitium_enrollment_token }}"
+      - --ca-url
+      - "{{ microlab_technitium_ca_url }}"
+      - --root
+      - "{{ microlab_technitium_ca_root_cert }}"
+      - --not-after
+      - "168h"
+  no_log: true
+  changed_when: true
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Publish the newly signed key pair
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ microlab_technitium_cert_path }}.new", dest: "{{ microlab_technitium_cert_path }}", mode: "0644" }
+    - { src: "{{ microlab_technitium_key_path }}.new", dest: "{{ microlab_technitium_key_path }}", mode: "0600" }
+  no_log: true
+  diff: false
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Remove enrollment staging material
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ microlab_technitium_key_path }}.new"
+    - "{{ microlab_technitium_cert_path }}.new.csr"
+    - "{{ microlab_technitium_cert_path }}.new"
+  when:
+    - not microlab_technitium_cert_state.results[0].stat.exists
+    - not microlab_technitium_cert_state.results[1].stat.exists
+
+- name: Restrict the enrolled private key and certificate modes
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ microlab_technitium_cert_path }}", mode: "0644" }
+    - { path: "{{ microlab_technitium_key_path }}", mode: "0600" }

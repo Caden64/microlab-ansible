@@ -1,0 +1,22 @@
+---
+- name: Validate offline CA inputs
+  ansible.builtin.import_tasks: validate.yml
+
+# Controller-only and read-only: this fails before install.yml changes the
+# target. Target state/material validation still runs in configure.yml after
+# install.yml, because it needs the target's OpenSSL and pinned binaries.
+- name: Validate controller-side offline CA sources before any target change
+  ansible.builtin.import_tasks: source_preflight.yml
+
+- name: Install pinned step-ca and step CLI artifacts
+  ansible.builtin.import_tasks: install.yml
+
+- name: Deploy offline-issued CA material and the single configuration authority
+  ansible.builtin.import_tasks: configure.yml
+
+- name: Enroll the public root in managed trust
+  ansible.builtin.import_tasks: trust.yml
+  when: microlab_step_ca_install_public_trust | bool
+
+- name: Install, start and gate the CA service
+  ansible.builtin.import_tasks: service.yml

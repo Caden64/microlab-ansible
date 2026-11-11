@@ -1,0 +1,28 @@
+#!/bin/sh
+# MicroLab restricted Technitium enrollment token helper.
+#
+# Run this on the CA host as an administrator. The step CLI prompts for the
+# encrypted JWK provisioner password; no provisioner password is stored here.
+# The token is single-use and short-lived. Only names listed in the allowlist
+# can be minted, and the token carries that exact SAN and no wildcard/IP SANs.
+set -eu
+
+allowed_file="{{ microlab_step_ca_home }}/technitium-allowed-names"
+name="${1:-}"
+
+if [ -z "$name" ]; then
+    echo "usage: $0 <name>" >&2
+    exit 64
+fi
+
+if ! grep -Fxq -- "$name" "$allowed_file"; then
+    echo "refusing to mint a Technitium token for a name outside $allowed_file" >&2
+    exit 65
+fi
+
+exec "{{ microlab_step_cli_bin }}" ca token "$name" \
+    --san "$name" \
+    --provisioner "{{ microlab_step_ca_technitium_provisioner_name }}" \
+    --ca-url "{{ microlab_step_ca_ca_url }}" \
+    --root "{{ microlab_step_ca_root_cert_dest }}" \
+    --not-after 10m

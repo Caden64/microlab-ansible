@@ -1,0 +1,153 @@
+---
+- name: Read current Technitium settings before reconciliation
+  ansible.builtin.uri:
+    url: "{{ microlab_technitium_api_url }}/api/settings/get"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ microlab_technitium_api_token }}"
+    return_content: true
+  register: microlab_technitium_current_settings
+  until: >-
+    (microlab_technitium_current_settings.status | default(0)) == 200 and
+    ((microlab_technitium_current_settings.json | default({})).status | default('')) == 'ok'
+  retries: "{{ microlab_technitium_healthcheck_retries | int }}"
+  delay: "{{ microlab_technitium_healthcheck_delay | int }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Record the current Technitium settings response
+  ansible.builtin.set_fact:
+    microlab_technitium_current_settings_response: >-
+      {{ (microlab_technitium_current_settings.json | default({})).response | default({}) }}
+  no_log: true
+
+- name: Resolve the Technitium-normalized PFX path
+  ansible.builtin.set_fact:
+    microlab_technitium_pfx_api_path: >-
+      {{ microlab_technitium_pfx_path
+         | technitium_api_path(microlab_technitium_config_dir) }}
+
+- name: Normalize the current Technitium certificate path before comparison
+  ansible.builtin.set_fact:
+    microlab_technitium_current_settings_normalized: >-
+      {{ microlab_technitium_current_settings_response | combine({
+           'dnsTlsCertificatePath':
+             (microlab_technitium_current_settings_response.get('dnsTlsCertificatePath', '')
+              | technitium_api_path(microlab_technitium_config_dir))
+         }) }}
+  no_log: true
+
+- name: Define the desired Technitium DoH/DoT settings
+  ansible.builtin.set_fact:
+    microlab_technitium_desired_settings:
+      enableDnsOverHttp: true
+      dnsOverHttpPort: "{{ microlab_technitium_doh_port | int }}"
+      dnsOverHttpRealIpHeader: "{{ microlab_technitium_doh_real_ip_header }}"
+      dnsReverseProxyNetworkACL: "{{ microlab_technitium_doh_reverse_proxy_acl }}"
+      enableDnsOverHttps: false
+      enableDnsOverTls: true
+      dnsOverTlsPort: "{{ microlab_technitium_dot_port | int }}"
+      # Technitium stores in-config-folder PFX paths relative ("tls/dns.pfx")
+      # and returns that form from settings/get. Compare and post the same
+      # canonical form so a correct PFX never shows perpetual drift.
+      dnsTlsCertificatePath: "{{ microlab_technitium_pfx_api_path }}"
+
+- name: Assume Technitium settings already match
+  ansible.builtin.set_fact:
+    microlab_technitium_settings_changed: false
+
+- name: Detect Technitium settings drift
+  ansible.builtin.set_fact:
+    microlab_technitium_settings_changed: true
+  loop: "{{ microlab_technitium_desired_settings | dict2items }}"
+  when: >-
+    ((microlab_technitium_current_settings_normalized.get(item.key, None) | string | lower)
+    != ((item.value) | string | lower))
+  no_log: true
+
+- name: Reconcile Technitium DoH/DoT settings through the local API
+  ansible.builtin.uri:
+    url: "{{ microlab_technitium_api_url }}/api/settings/set"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ microlab_technitium_api_token }}"
+    body_format: form-urlencoded
+    body:
+      enableDnsOverHttp: "true"
+      dnsOverHttpPort: "{{ microlab_technitium_doh_port | int | string }}"
+      dnsOverHttpRealIpHeader: "{{ microlab_technitium_doh_real_ip_header }}"
+      dnsReverseProxyNetworkACL: "{{ microlab_technitium_doh_reverse_proxy_acl | join(',') }}"
+      enableDnsOverHttps: "false"
+      enableDnsOverTls: "true"
+      dnsOverTlsPort: "{{ microlab_technitium_dot_port | int | string }}"
+      dnsTlsCertificatePath: "{{ microlab_technitium_pfx_api_path }}"
+      dnsTlsCertificatePassword: "{{ microlab_technitium_pfx_password }}"
+    return_content: true
+  register: microlab_technitium_settings_update
+  when: microlab_technitium_settings_changed | bool
+  changed_when: true
+  diff: false
+  no_log: true
+
+- name: Read back Technitium settings after reconciliation
+  ansible.builtin.uri:
+    url: "{{ microlab_technitium_api_url }}/api/settings/get"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ microlab_technitium_api_token }}"
+    return_content: true
+  register: microlab_technitium_verified_settings
+  until: >-
+    (microlab_technitium_verified_settings.status | default(0)) == 200 and
+    ((microlab_technitium_verified_settings.json | default({})).status | default('')) == 'ok'
+  retries: "{{ microlab_technitium_healthcheck_retries | int }}"
+  delay: "{{ microlab_technitium_healthcheck_delay | int }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Record the verified Technitium settings response
+  ansible.builtin.set_fact:
+    microlab_technitium_verified_settings_response: >-
+      {{ (microlab_technitium_verified_settings.json | default({})).response | default({}) }}
+  no_log: true
+
+- name: Normalize the verified Technitium certificate path before comparison
+  ansible.builtin.set_fact:
+    microlab_technitium_verified_settings_normalized: >-
+      {{ microlab_technitium_verified_settings_response | combine({
+           'dnsTlsCertificatePath':
+             (microlab_technitium_verified_settings_response.get('dnsTlsCertificatePath', '')
+              | technitium_api_path(microlab_technitium_config_dir))
+         }) }}
+  no_log: true
+
+- name: Require a successful settings API response
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_settings_changed is defined
+      - (microlab_technitium_verified_settings.status | default(0)) == 200
+      - ((microlab_technitium_verified_settings.json | default({})).status | default('')) == 'ok'
+      - (not (microlab_technitium_settings_changed | bool)) or ((microlab_technitium_settings_update.json | default({})).status | default('')) == 'ok'
+    fail_msg: >-
+      Technitium's settings API did not confirm the DoH/DoT reconciliation.
+      No TLS settings were guessed or written directly to disk.
+    quiet: true
+  no_log: true
+
+- name: Require the reconciled DoH/DoT values to be live
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((microlab_technitium_verified_settings_normalized.get(item.key, None) | string | lower)
+        == ((item.value) | string | lower))
+    fail_msg: >-
+      Technitium did not retain the required setting {{ item.key }}. DoH must be
+      local 8053 behind 127.0.0.1 only, with X-Real-IP, and native DoT must use
+      853 with the enrolled PFX.
+    quiet: true
+  loop: "{{ microlab_technitium_desired_settings | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true

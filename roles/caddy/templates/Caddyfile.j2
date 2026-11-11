@@ -1,0 +1,108 @@
+# Managed by Ansible. Do not edit on the host.
+# Stock Caddy binary; native systemd; persistent state under /var/lib/caddy.
+{
+	admin {{ micolab_caddy_admin_host }}:{{ micolab_caddy_admin_port }}
+	persist_config off
+	storage file_system {{ micolab_caddy_storage_dir }}
+	http_port {{ micolab_caddy_http_port }}
+	https_port {{ micolab_caddy_https_port }}
+}
+
+# Step-ca ACME issuer.
+# - HTTPS to the ACME directory is verified against the public step-ca root.
+# - HTTP-01 is the only enabled challenge; TLS-ALPN is explicitly disabled.
+# - The step-ca certificate must contain an IP SAN for 127.0.0.1.
+(tls_step_ca) {
+	tls {
+		issuer acme {
+			dir {{ micolab_caddy_acme_directory_effective }}
+			trusted_roots {{ micolab_caddy_acme_trusted_roots }}
+			disable_tlsalpn_challenge
+		}
+	}
+}
+
+{% if micolab_caddy_enable_ca | bool %}
+# CA frontend. Remote access is restricted to the management CIDRs.
+# Loopback is always permitted for local health gates.
+{{ micolab_caddy_ca_host }} {
+	import tls_step_ca
+
+	@management remote_ip 127.0.0.1/32 ::1/128 {{ micolab_caddy_management_cidrs | join(' ') }}
+	handle @management {
+		reverse_proxy https://{{ micolab_caddy_ca_upstream_host }}:{{ micolab_caddy_ca_upstream_port }} {
+			transport http {
+				{{ micolab_caddy_upstream_trust_directive }} {{ micolab_caddy_acme_trusted_roots }}
+				tls_server_name {{ micolab_caddy_ca_upstream_host }}
+			}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+	respond 403
+}
+{% endif %}
+
+{% if micolab_caddy_enable_dns | bool %}
+# DNS frontend. Two separate policies share this hostname:
+# - The exact /dns-query path is DNS-over-HTTPS and goes to Technitium's
+#   loopback DoH listener. The URI, including the query string, is preserved.
+#   Remote access is restricted to DNS client CIDRs.
+# - Every other path is the Technitium admin web console. It goes to the
+#   loopback admin listener and is restricted to the admin CIDRs only; DNS
+#   client CIDRs do not grant admin access.
+# X-Real-IP and X-Forwarded-For are overwritten with the direct peer address.
+# Caddy has no trusted_proxies here, so client-supplied forwarding headers
+# cannot spoof the source address seen by either backend.
+{{ micolab_caddy_dns_host }} {
+	import tls_step_ca
+
+	@doh path /dns-query
+	handle @doh {
+		@doh_denied not remote_ip 127.0.0.1/32 ::1/128 {{ micolab_caddy_dns_client_cidrs | join(' ') }}
+		respond @doh_denied 403
+		reverse_proxy http://{{ micolab_caddy_dns_upstream_host }}:{{ micolab_caddy_dns_upstream_port }} {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	handle {
+		@admin_denied not remote_ip 127.0.0.1/32 ::1/128 {{ micolab_caddy_admin_cidrs | join(' ') }}
+		respond @admin_denied 403
+		reverse_proxy http://{{ micolab_caddy_admin_upstream_host }}:{{ micolab_caddy_admin_upstream_port }} {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+}
+{% endif %}
+
+{% if micolab_caddy_enable_git | bool %}
+# Forgejo frontend. Rendered only when micolab_caddy_enable_git is true and
+# the role's pre-render Forgejo health gate has passed. Admin UI/API routes use
+# a separate admin CIDR policy.
+{{ micolab_caddy_git_host }} {
+	import tls_step_ca
+
+	@admin path /-/admin* /api/v1/admin*
+	@admin_allowed {
+		path /-/admin* /api/v1/admin*
+		remote_ip 127.0.0.1/32 ::1/128 {{ micolab_caddy_admin_cidrs | join(' ') }}
+	}
+	handle @admin_allowed {
+		reverse_proxy http://{{ micolab_caddy_forgejo_upstream_host }}:{{ micolab_caddy_forgejo_upstream_port }} {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+	respond @admin 403
+
+	reverse_proxy http://{{ micolab_caddy_forgejo_upstream_host }}:{{ micolab_caddy_forgejo_upstream_port }} {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+{% endif %}

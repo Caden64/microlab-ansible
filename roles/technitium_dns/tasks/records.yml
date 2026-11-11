@@ -1,0 +1,183 @@
+---
+- name: Start the desired record set with the apex NS target
+  ansible.builtin.set_fact:
+    micolab_dns_desired_records:
+      - name: "{{ micolab_dns_zone | lower }}"
+        type: NS
+        value: "{{ micolab_dns_primary_ns | lower }}"
+        ttl: "{{ micolab_dns_ns_ttl }}"
+        rdata_key: nameServer
+        key: "{{ micolab_dns_zone | lower }}|NS|{{ micolab_dns_primary_ns | lower }}"
+
+- name: Add managed A records for every loopback service
+  ansible.builtin.set_fact:
+    micolab_dns_desired_records: >-
+      {{ micolab_dns_desired_records + [{
+           'name': (item.key ~ '.' ~ micolab_domain) | lower,
+           'type': 'A',
+           'value': item.value | micolab_canonical_ip,
+           'ttl': micolab_dns_record_ttl,
+           'rdata_key': 'ipAddress',
+           'key': ((item.key ~ '.' ~ micolab_domain) | lower) ~ '|A|' ~ (item.value | micolab_canonical_ip)
+         }] }}
+  loop: "{{ micolab_dns_addresses | dict2items }}"
+
+- name: Add managed AAAA records only when IPv6 is explicitly enabled
+  ansible.builtin.set_fact:
+    micolab_dns_desired_records: >-
+      {{ micolab_dns_desired_records + [{
+           'name': (item.key ~ '.' ~ micolab_domain) | lower,
+           'type': 'AAAA',
+           'value': item.value | micolab_canonical_ip,
+           'ttl': micolab_dns_record_ttl,
+           'rdata_key': 'ipAddress',
+           'key': ((item.key ~ '.' ~ micolab_domain) | lower) ~ '|AAAA|' ~ (item.value | micolab_canonical_ip)
+         }] }}
+  loop: "{{ micolab_dns_ipv6_addresses | dict2items }}"
+  when: micolab_dns_ipv6_enabled | bool
+
+- name: Add explicitly declared extra records
+  ansible.builtin.set_fact:
+    micolab_dns_desired_records: >-
+      {{ micolab_dns_desired_records + [{
+           'name': item.name | lower | regex_replace('[.]$', ''),
+           'type': item.type | upper,
+           'value': item.value | micolab_canonical_ip,
+           'ttl': item.ttl | default(micolab_dns_record_ttl),
+           'rdata_key': 'ipAddress',
+           'key': (item.name | lower | regex_replace('[.]$', '')) ~ '|' ~ (item.type | upper) ~ '|' ~ (item.value | micolab_canonical_ip)
+         }] }}
+  loop: "{{ micolab_dns_extra_records }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.type | upper in ['A', 'AAAA']
+
+- name: Require a unique desired record set
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_desired_records | map(attribute='key') | list | unique | length
+        == micolab_dns_desired_records | length
+    fail_msg: Duplicate desired records were supplied; refusing ambiguous ownership.
+    quiet: true
+
+- name: Read all records in the hnh zone
+  ansible.builtin.uri:
+    url: >-
+      {{ micolab_dns_api_base }}/api/zones/records/get?zone={{ micolab_dns_zone | urlencode }}&domain={{ micolab_dns_zone | urlencode }}&listZone=true
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_records_current
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require record read access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_records_current.status | default(0) == 200
+      - (micolab_dns_records_current.json | default({})).status | default('') == 'ok'
+    fail_msg: Unable to read zone records; no record was changed.
+    quiet: true
+
+- name: Normalize the existing zone records to canonical identities
+  ansible.builtin.set_fact:
+    micolab_dns_zone_records: >-
+      {{ (micolab_dns_records_current.json.response.records | default([]))
+         | map('micolab_record_identity', micolab_dns_managed_comment) | list }}
+
+- name: Refuse owned AAAA records while IPv6 is disabled
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_zone_records
+        | selectattr('micolab_owned', 'equalto', true)
+        | selectattr('micolab_type', 'equalto', 'AAAA')
+        | list | length == 0
+    fail_msg: >-
+      AAAA records owned by this role exist while IPv6 is disabled. Enable
+      IPv6 deliberately or remove those records manually; they are not deleted
+      implicitly.
+    quiet: true
+  when: not micolab_dns_ipv6_enabled | bool
+
+- name: Plan reconciliation against the complete desired identity set
+  ansible.builtin.set_fact:
+    micolab_dns_record_plan: >-
+      {{ micolab_dns_desired_records
+         | micolab_record_plan(micolab_dns_zone_records, micolab_dns_managed_comment) }}
+
+- name: Add only missing desired identities
+  ansible.builtin.include_tasks: record_add.yml
+  loop: "{{ micolab_dns_record_plan['add'] }}"
+  loop_control:
+    loop_var: rec
+    label: "{{ rec.key }}"
+
+- name: Update owned exact records whose TTL or marker drifted
+  ansible.builtin.include_tasks: record_update.yml
+  loop: "{{ micolab_dns_record_plan['update'] }}"
+  loop_control:
+    loop_var: record_change
+    label: "{{ record_change.desired.key }}"
+  vars:
+    rec: "{{ record_change.desired }}"
+    dns_record: "{{ record_change.current }}"
+
+- name: Delete only owned records whose complete identity is no longer desired
+  ansible.builtin.include_tasks: record_delete.yml
+  loop: "{{ micolab_dns_record_plan['delete'] }}"
+  loop_control:
+    loop_var: dns_record
+    label: "{{ dns_record.micolab_key }}"
+
+- name: Re-read records after convergence
+  ansible.builtin.uri:
+    url: >-
+      {{ micolab_dns_api_base }}/api/zones/records/get?zone={{ micolab_dns_zone | urlencode }}&domain={{ micolab_dns_zone | urlencode }}&listZone=true
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_records_after
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require post-convergence record read access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_records_after.status | default(0) == 200
+      - (micolab_dns_records_after.json | default({})).status | default('') == 'ok'
+    fail_msg: Unable to verify records after convergence.
+    quiet: true
+
+- name: Normalize the post-convergence records
+  ansible.builtin.set_fact:
+    micolab_dns_records_after_normalized: >-
+      {{ (micolab_dns_records_after.json.response.records | default([]))
+         | map('micolab_record_identity', micolab_dns_managed_comment) | list }}
+
+- name: Plan reconciliation against the post-convergence snapshot
+  ansible.builtin.set_fact:
+    micolab_dns_record_plan_after: >-
+      {{ micolab_dns_desired_records
+         | micolab_record_plan(micolab_dns_records_after_normalized, micolab_dns_managed_comment) }}
+
+- name: Verify that the complete desired set converged without touching unknown records
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_record_plan_after.pending | int == 0
+    fail_msg: >-
+      Record convergence is incomplete: {{ micolab_dns_record_plan_after.pending }}
+      change(s) remain. Add={{ micolab_dns_record_plan_after['add'] | map(attribute='key') | list }},
+      update={{ micolab_dns_record_plan_after['update'] | length }},
+      delete={{ micolab_dns_record_plan_after['delete'] | map(attribute='micolab_key') | list }}.
+      No blind overwrite was used.
+    quiet: true

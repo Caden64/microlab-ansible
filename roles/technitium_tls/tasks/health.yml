@@ -1,0 +1,57 @@
+---
+- name: Require the Technitium DNS service to be active
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - --quiet
+      - "{{ microlab_technitium_service_name }}.service"
+  register: microlab_technitium_service_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail closed when the Technitium service is not running
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_service_check.rc == 0
+    fail_msg: >-
+      Technitium service {{ microlab_technitium_service_name }} is not active.
+      This role configures TLS only and does not install or restart the DNS
+      application.
+    quiet: true
+
+- name: Wait for the local DNS-over-HTTP listener on 8053
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ microlab_technitium_doh_port | int }}"
+    delay: 1
+    timeout: 60
+
+- name: Wait for the native DNS-over-TLS listener on 853
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ microlab_technitium_dot_port | int }}"
+    delay: 1
+    timeout: 60
+
+- name: Verify the live 853 certificate fingerprint, SANs, EKU, and chain
+  ansible.builtin.command:
+    argv:
+      - "{{ microlab_technitium_helper_path }}"
+      - --config
+      - "{{ microlab_technitium_renewal_env_file }}"
+      - --verify-only
+  register: microlab_technitium_live_verify
+  changed_when: false
+  failed_when: false
+
+- name: Require the live DoT endpoint to serve the enrolled certificate
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_live_verify.rc == 0
+    fail_msg: >-
+      Live DoT verification failed. The server did not serve the enrolled
+      certificate with a valid chain and hostname. Inspect:
+      journalctl -u {{ microlab_technitium_service_unit }} and
+      journalctl -u {{ microlab_technitium_service_name }} --since -15m.
+    quiet: true

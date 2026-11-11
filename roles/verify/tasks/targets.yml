@@ -1,0 +1,120 @@
+---
+# Resolve the management host and validate every name the role will query.
+# Service names (ns1/ca/dns/git) live in micolab_verify_service_domain
+# (micolab_domain, e.g. microlab.hnh). The NS query targets the authoritative
+# zone apex micolab_verify_zone (micolab_dns_zone, e.g. hnh). The two are never
+# derived from each other or from the legacy micolab_dns_zone_fqdn.
+
+- name: Resolve the management host from inventory
+  ansible.builtin.set_fact:
+    micolab_verify_mgmt_host: >-
+      {{ micolab_verify_management_host
+         if (micolab_verify_management_host | length > 0)
+         else ((groups[micolab_verify_management_group][0])
+               if ((micolab_verify_management_group in groups)
+                   and (groups[micolab_verify_management_group] | length > 0))
+               else '') }}
+
+- name: Fail closed when the management host cannot be resolved
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_mgmt_host | length > 0
+      - micolab_verify_mgmt_host in hostvars
+      - hostvars[micolab_verify_mgmt_host].ansible_host is defined
+    fail_msg: >-
+      Set an inventory host in {{ micolab_verify_management_group }} with
+      ansible_host set to the SSH IPv4 address, or set
+      micolab_verify_management_host explicitly. A records are derived from
+      that inventory SSH IP; no address is invented.
+
+- name: Resolve the inventory SSH IP used for A records
+  ansible.builtin.set_fact:
+    micolab_verify_mgmt_ip: "{{ hostvars[micolab_verify_mgmt_host].ansible_host }}"
+
+- name: Require an IPv4 inventory SSH address for A records
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_mgmt_ip is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+      - (micolab_verify_mgmt_ip.split('.') | map('int') | select('gt', 255) | list | length) == 0
+    fail_msg: >-
+      ansible_host for {{ micolab_verify_mgmt_host }} must be an IPv4 address
+      for the A records. If the SSH address is IPv6, provide explicit
+      micolab_verify_expected_a_records and do not fabricate AAAA records.
+
+- name: Require a well-formed service domain and authoritative zone
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_service_domain is string
+      - micolab_verify_zone is string
+      - micolab_verify_service_domain is match(label_re)
+      - micolab_verify_zone is match(label_re)
+      - micolab_verify_service_domain is not search('REPLACE')
+      - micolab_verify_zone is not search('REPLACE')
+      - >-
+        micolab_verify_service_domain == micolab_verify_zone
+        or micolab_verify_service_domain.endswith('.' ~ micolab_verify_zone)
+    fail_msg: >-
+      micolab_verify_service_domain ({{ micolab_verify_service_domain }}, from
+      micolab_domain) must be a lowercase DNS name without a trailing dot inside
+      the authoritative zone micolab_verify_zone ({{ micolab_verify_zone }},
+      from micolab_dns_zone). No fallback name is invented.
+  vars:
+    label_re: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+
+- name: Refuse a conflicting legacy micolab_dns_zone_fqdn
+  ansible.builtin.assert:
+    that:
+      - >-
+        (micolab_dns_zone_fqdn | string | lower | regex_replace('\.$', ''))
+        == micolab_verify_service_domain
+    fail_msg: >-
+      micolab_dns_zone_fqdn={{ micolab_dns_zone_fqdn }} conflicts with the
+      service domain {{ micolab_verify_service_domain }} (micolab_domain). The
+      verify role no longer builds names from micolab_dns_zone_fqdn; service
+      names come from micolab_domain and the NS query uses micolab_dns_zone
+      ({{ micolab_verify_zone }}). Fix or remove micolab_dns_zone_fqdn rather
+      than letting two different domains coexist.
+  when: micolab_dns_zone_fqdn is defined
+
+- name: Refuse a primary NS that disagrees with the service domain
+  ansible.builtin.assert:
+    that:
+      - >-
+        (micolab_dns_primary_ns | string | lower | regex_replace('\.$', ''))
+        == ('ns1.' ~ micolab_verify_service_domain)
+    fail_msg: >-
+      micolab_dns_primary_ns={{ micolab_dns_primary_ns }} must be
+      ns1.{{ micolab_verify_service_domain }}; the verify role checks that NS.
+  when: micolab_dns_primary_ns is defined
+
+- name: Require every verified name to sit inside its declared domain
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_ns_name is match('^.+\.$')
+      - (micolab_verify_ns_name | lower) == (micolab_verify_ns_name)
+      - >-
+        (micolab_verify_ns_name | regex_replace('\.$', '')).endswith('.' ~ micolab_verify_zone)
+      - bad_hosts | length == 0
+    fail_msg: >-
+      micolab_verify_ns_name must be an absolute lowercase name inside zone
+      {{ micolab_verify_zone }}, and every service hostname must be inside
+      {{ micolab_verify_service_domain }}. Out-of-domain names: {{ bad_hosts }}
+  vars:
+    checked_hosts: >-
+      {{ micolab_verify_public_sites
+         + [micolab_verify_ca_host, micolab_verify_doh_host,
+            micolab_verify_dot_host, micolab_verify_git_host,
+            micolab_verify_dns_probe_name] }}
+    bad_hosts: >-
+      {{ checked_hosts
+         | reject('match', '^[a-z0-9-]+(\.[a-z0-9-]+)*\.'
+                           ~ (micolab_verify_service_domain | regex_escape) ~ '$')
+         | list }}
+
+- name: Record the resolved verification names
+  ansible.builtin.set_fact:
+    micolab_verify_service_fqdns: >-
+      {{ micolab_verify_service_names
+         | map('regex_replace', '$', '.' ~ micolab_verify_service_domain)
+         | list }}
+    micolab_verify_probe_fqdn: "{{ 'git.' ~ micolab_verify_service_domain }}"

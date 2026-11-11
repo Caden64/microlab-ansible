@@ -1,0 +1,89 @@
+---
+# All state inspection and fail-closed classification happens before this file
+# creates a user, a directory, material, or ca.json.
+- name: Preflight the CA state and the controller-side material
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Create the unprivileged step-ca service group
+  ansible.builtin.group:
+    name: "{{ microlab_step_ca_group }}"
+    system: true
+    state: present
+
+- name: Create the unprivileged step-ca service user
+  ansible.builtin.user:
+    name: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    system: true
+    create_home: false
+    home: "{{ microlab_step_ca_home }}"
+    shell: /usr/sbin/nologin
+    state: present
+
+- name: Create the CA home and configuration directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ microlab_step_ca_home }}", mode: "0750" }
+    - { path: "{{ microlab_step_ca_config_dir }}", mode: "0750" }
+
+# Configuration-only recovery must not touch durable directories: a chmod or
+# ownership repair on certs/secrets/db counts as modifying durable state. Those
+# paths already exist in a valid recover-config state.
+- name: Create durable CA directories with least-privilege ownership
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ microlab_step_ca_certs_dir }}", mode: "0755" }
+    - { path: "{{ microlab_step_ca_secrets_dir }}", mode: "0700" }
+    - { path: "{{ microlab_step_ca_db_dir }}", mode: "0700" }
+  when: microlab_step_ca_state.action != 'recover-config'
+
+- name: Deploy offline-issued CA material only for an explicit first deployment
+  ansible.builtin.include_tasks: deploy_material.yml
+  when: microlab_step_ca_state.action == 'initial-deploy'
+
+- name: Write the restricted Technitium enrollment name allowlist
+  ansible.builtin.copy:
+    content: "{{ microlab_step_ca_technitium_cert_names | join('\n') }}\n"
+    dest: "{{ microlab_step_ca_home }}/technitium-allowed-names"
+    owner: root
+    group: "{{ microlab_step_ca_group }}"
+    mode: "0644"
+
+- name: Install the restricted Technitium token helper
+  ansible.builtin.template:
+    src: technitium-token.j2
+    dest: /usr/local/sbin/step-ca-technitium-token
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the single authoritative step-ca configuration
+  ansible.builtin.template:
+    src: ca.json.j2
+    dest: "{{ microlab_step_ca_config_file }}"
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "0640"
+    backup: true
+  no_log: true
+  diff: false
+  notify: Restart step-ca
+
+- name: Install the step-ca systemd unit before any handler flush
+  ansible.builtin.template:
+    src: step-ca.service.j2
+    dest: /etc/systemd/system/{{ microlab_step_ca_service_name }}.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart step-ca

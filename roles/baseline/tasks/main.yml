@@ -1,0 +1,260 @@
+---
+- name: Require a dedicated management host
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname in groups[micolab_management_group]
+      - inventory_hostname not in (groups[micolab_challenge_group] | default([]))
+    fail_msg: >-
+      {{ inventory_hostname }} must be in {{ micolab_management_group }} and
+      must not be in {{ micolab_challenge_group }}. Management services must
+      never share a host with challenge workloads.
+    quiet: true
+
+- name: Collect installed packages
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Check clock synchronization
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timedatectl
+      - show
+      - -p
+      - NTPSynchronized
+      - --value
+  register: micolab_baseline_ntp
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require an NTP-synchronized clock before issuing certificates or DNS
+  ansible.builtin.assert:
+    that:
+      - micolab_baseline_ntp.rc == 0
+      - micolab_baseline_ntp.stdout | trim == 'yes'
+    fail_msg: >-
+      The host clock is not NTP-synchronized (timedatectl
+      NTPSynchronized={{ micolab_baseline_ntp.stdout | default('unavailable') }}).
+      Certificate validity, DNS TTLs, and record serials are unsafe until time
+      synchronization is working.
+    quiet: true
+
+- name: Inspect listening sockets before changing the resolver
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_baseline_ss_command }}"
+      - -H
+      - -lntup
+  register: micolab_baseline_sockets
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require socket inspection to succeed
+  ansible.builtin.assert:
+    that:
+      - micolab_baseline_sockets.rc == 0
+    fail_msg: >-
+      Unable to inspect listening sockets with {{ micolab_baseline_ss_command }}.
+      Install iproute2 and re-run; port ownership must be known before Technitium
+      or the host resolver is installed.
+    quiet: true
+
+- name: Create validation directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ micolab_baseline_state_dir }}"
+    - "{{ micolab_baseline_helper_dir }}"
+    - "{{ micolab_baseline_firewall_dir }}"
+
+- name: Install the input validator
+  ansible.builtin.copy:
+    src: microlab_validate.py
+    dest: "{{ micolab_baseline_helper_dir }}/validate_inputs.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Assemble validation input
+  ansible.builtin.set_fact:
+    micolab_baseline_inputs:
+      inventory_hostname: "{{ inventory_hostname }}"
+      groups: "{{ group_names | sort }}"
+      management_group: "{{ micolab_management_group }}"
+      challenge_group: "{{ micolab_challenge_group }}"
+      ansible_host: "{{ ansible_host | default('') }}"
+      ansible_architecture: "{{ ansible_architecture }}"
+      os_family: "{{ ansible_distribution }}"
+      os_major: "{{ ansible_distribution_major_version }}"
+      expected_os: "{{ micolab_expected_os }}"
+      supported_majors: "{{ micolab_supported_debian_majors }}"
+      expected_architecture: "{{ micolab_expected_architecture }}"
+      paths:
+        install: "{{ micolab_technitium_install_dir }}"
+        config: "{{ micolab_technitium_config_dir }}"
+        logs: "{{ micolab_technitium_log_dir }}"
+        dotnet: "{{ micolab_dotnet_install_dir }}"
+      min_free_bytes: "{{ micolab_min_free_bytes }}"
+      storage_path: "{{ micolab_required_storage_path }}"
+      mounts: "{{ ansible_mounts }}"
+      admin_cidrs: "{{ micolab_admin_cidrs }}"
+      client_cidrs: "{{ micolab_client_cidrs }}"
+      admin_cidrs_v6: "{{ micolab_admin_cidrs_v6 }}"
+      client_cidrs_v6: "{{ micolab_client_cidrs_v6 }}"
+      recursion_allow_cidrs: "{{ micolab_dns_recursion_allow_cidrs }}"
+      authoritative_only_cidrs: "{{ micolab_dns_authoritative_only_cidrs }}"
+      authoritative_only_cidrs_v6: "{{ micolab_dns_authoritative_only_cidrs_v6 }}"
+      domain: "{{ micolab_domain }}"
+      dns_zone: "{{ micolab_dns_zone }}"
+      primary_ns: "{{ micolab_dns_primary_ns }}"
+      admin_email: "{{ micolab_dns_admin_email }}"
+      dns_fixture_upstream: "{{ micolab_dns_fixture_upstream | default('') }}"
+      dns_fixture_zone: "{{ micolab_dns_fixture_zone | default('') }}"
+      dns_fixture_name: "{{ micolab_dns_fixture_name | default('') }}"
+      dns_fixture_expected_ip: "{{ micolab_dns_fixture_expected_ip | default('') }}"
+      dns_fixture_manage_service: "{{ micolab_dns_fixture_manage_service | default(true) }}"
+      dns_fixture_listen_endpoint: >-
+        {{ (micolab_dns_fixture_listen_address | default('127.0.0.1'))
+           ~ ':' ~ (micolab_dns_fixture_port | default(5353) | string) }}
+      dns_addresses: "{{ micolab_dns_addresses }}"
+      dns_ipv6_enabled: "{{ micolab_dns_ipv6_enabled }}"
+      dns_ipv6_addresses: "{{ micolab_dns_ipv6_addresses }}"
+      extra_records: "{{ micolab_dns_extra_records }}"
+      forwarders: "{{ micolab_dns_forwarders }}"
+      allow_online_forwarders: "{{ micolab_dns_allow_online_forwarders }}"
+      ssh_port: "{{ micolab_ssh_port }}"
+      dns_port: "{{ micolab_technitium_dns_port }}"
+      admin_port: "{{ micolab_technitium_admin_port }}"
+      dot_port: "{{ micolab_dns_dot_port }}"
+      doh_port: "{{ micolab_dns_doh_port }}"
+      doq_port: "{{ micolab_dns_doq_port }}"
+      trust_targets: "{{ micolab_trust_targets }}"
+      max_powered_off_interval_seconds: "{{ micolab_max_powered_off_interval_seconds }}"
+      log_retention_days: "{{ micolab_dns_log_retention_days }}"
+      stats_retention_days: "{{ micolab_dns_stats_retention_days }}"
+      log_queries: "{{ micolab_dns_log_queries }}"
+      verify_git_repo: "{{ micolab_verify_git_repo | default('') }}"
+      required_packages: "{{ micolab_required_packages }}"
+      required_package_prefixes: "{{ micolab_required_package_prefixes }}"
+      installed_packages: "{{ ansible_facts.packages.keys() | list | sort }}"
+      staged_artifacts: "{{ micolab_staged_artifacts }}"
+      technitium_version: "{{ micolab_technitium_version }}"
+      runtime_major: "{{ micolab_technitium_runtime_major }}"
+      ss_output: "{{ micolab_baseline_sockets.stdout }}"
+  no_log: false
+
+- name: Validate inventory, pins, storage, packages, and ports
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - "{{ micolab_baseline_helper_dir }}/validate_inputs.py"
+      - "-"
+    stdin: "{{ micolab_baseline_inputs | to_nice_json }}\n"
+  register: micolab_baseline_validation
+  changed_when: false
+  check_mode: false
+
+- name: Verify pinned artifacts on the controller
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  loop: "{{ micolab_staged_artifacts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: micolab_baseline_artifact_stats
+
+- name: Reject missing or modified artifacts before touching the host
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | bool
+      - item.stat.isreg | bool
+      - item.stat.checksum | lower == item.item.sha256 | lower
+    fail_msg: >-
+      Staged artifact {{ item.item.name }} at {{ item.item.path }} is missing,
+      is not a regular file, or does not match the pinned SHA256. Nothing has
+      been installed.
+    quiet: true
+  loop: "{{ micolab_baseline_artifact_stats.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Validate the administrator secret shape without revealing it
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_admin_password is string
+      - micolab_technitium_admin_password | length >= 12
+      - micolab_technitium_admin_password != micolab_technitium_bootstrap_password
+      - micolab_technitium_admin_password is not search('REPLACE', ignorecase=True)
+    fail_msg: >-
+      micolab_technitium_admin_password must come from the encrypted vault, be
+      at least 12 characters, and must not be the upstream bootstrap password.
+    quiet: true
+  no_log: true
+
+- name: Install the MicroLab firewall service definition
+  ansible.builtin.template:
+    src: micolab-firewall.service.j2
+    dest: /etc/systemd/system/micolab-firewall.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd units
+    - Apply MicroLab firewall
+  when: micolab_firewall_enable | bool
+
+- name: Install the firewall apply helper
+  ansible.builtin.template:
+    src: micolab-firewall.sh.j2
+    dest: /usr/local/sbin/microlab-firewall
+    owner: root
+    group: root
+    mode: "0755"
+  when: micolab_firewall_enable | bool
+
+- name: Render the nftables ingress policy
+  ansible.builtin.template:
+    src: microlab-firewall.nft.j2
+    dest: "{{ micolab_baseline_firewall_dir }}/firewall.nft"
+    owner: root
+    group: root
+    mode: "0640"
+  notify:
+    - Apply MicroLab firewall
+  when: micolab_firewall_enable | bool
+
+- name: Check the nftables ruleset syntax
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_nft_binary }}"
+      - -c
+      - -f
+      - "{{ micolab_baseline_firewall_dir }}/firewall.nft"
+  changed_when: false
+  check_mode: false
+  when: micolab_firewall_enable | bool
+
+- name: Enable and start the MicroLab firewall
+  ansible.builtin.systemd:
+    name: micolab-firewall
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - micolab_firewall_enable | bool
+    - not ansible_check_mode
+
+- name: Warn when the firewall is deliberately disabled
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: micolab_firewall_enable is false. DNS and HTTPS are not
+      restricted to the inventory's admin and client CIDRs.
+  when: not micolab_firewall_enable | bool

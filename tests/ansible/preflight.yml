@@ -1,0 +1,32 @@
+---
+# Localhost-only integration harness for the step_ca preflight.
+# It never touches /etc, systemd, trust stores, or a real CA service. All paths
+# and throwaway material are supplied by tests/test_step_ca_preflight.py.
+#
+# This harness runs both halves in role order: the controller-side source
+# preflight first (which delegates its observations to localhost), then the
+# target state preflight. On a single localhost these two filesystems are the
+# same, so it exercises crypto/state handling but cannot catch controller vs
+# target confusion. tests/ansible/cross_host_preflight.yml does that.
+- name: Exercise the step_ca preflight against throwaway CA material
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  handlers:
+    - name: Restart step-ca
+      ansible.builtin.debug:
+        msg: No-op handler for the localhost preflight harness
+  tasks:
+    - name: Run the controller-side source preflight
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/source_preflight.yml"
+
+    - name: Run the step_ca target preflight
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/preflight.yml"
+
+    - name: Report the classified state
+      ansible.builtin.debug:
+        var: microlab_step_ca_state
+
+    - name: Deploy material only for the explicit first deployment
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/deploy_material.yml"
+      when: microlab_step_ca_state.action == 'initial-deploy'

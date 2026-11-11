@@ -1,0 +1,422 @@
+---
+# Real external-vantage ACL acceptance. Each probe runs on an inventory host
+# that is not the management host, and the role requires both an allowed and a
+# denied result for every ACL class:
+#   dns_admin      -> Technitium admin console on dns.<zone>
+#   ca_management  -> step-ca management frontend on ca.<zone>
+#   doh            -> /dns-query client ACL
+#   dot            -> 853/tcp client ACL
+# The probes are actual commands on the delegated hosts, not a debug report.
+# No missing probe is treated as a pass.
+#
+# A denied DoT result requires a positive DNS RCODE=REFUSED answer from the
+# target. A refused connection, connect timeout, unreachable route, TLS error,
+# malformed response, or wrong answer is inconclusive and fails acceptance; it
+# does not prove that an ACL dropped the client. A denied DoH result requires
+# the Caddy ACL's explicit HTTP 403. A curl transport failure (curl code 000)
+# is never treated as a denial.
+#
+# DoT evidence is labelled by what it actually proves:
+#   allowed  RD=1 query for the DNS role's conditional-forwarder fixture
+#            (micolab_dns_fixture_name) must return
+#            micolab_dns_fixture_expected_ip. Only the local fixture is used,
+#            so no WAN is needed.
+#   denied   (1) fixture zone query ACL: the same fixture name must be
+#            REFUSED. Technitium serves FWD records through the authoritative
+#            zone path, so this REFUSED comes from the fixture zone's query
+#            ACL, not from the global recursion setting.
+#            (2) global recursion ACL: an RD=1 query for
+#            micolab_verify_dns_recursion_denied_name, a name outside the
+#            service domain, the hnh zone and the fixture zone, must be
+#            REFUSED. A recursion-denied source is refused before any upstream
+#            lookup, so this is offline. If the source were recursion-allowed,
+#            the server would attempt recursion and return SERVFAIL, NXDOMAIN
+#            or time out, which fails acceptance.
+# Neither query is ns1.<service domain>: the hnh zone is authoritative and
+# answers every firewall-admitted client. The TLS server name remains
+# micolab_verify_dot_host, so certificate/hostname validation is independent of
+# the query name. The configured recursionNetworkACL itself is read back by the
+# technitium_dns role (tasks/settings.yml), not by this role.
+#
+# Every DoT probe must declare source_address and access. The allowed source
+# must be in the recursion-allowed networks and the denied source in
+# micolab_dns_authoritative_only_cidrs; both must be admitted by the DNS
+# firewall nets for 853/tcp. A source outside those networks is classified as
+# firewall-denied, where no-reply is inconclusive rather than denial evidence.
+# The probe binds the socket to source_address before connecting and fails
+# unless the connected socket's local address equals it; an invalid,
+# unavailable, or wrong-family source is a failure, never a denial.
+
+- name: Set the external ACL acceptance state
+  ansible.builtin.set_fact:
+    micolab_verify_external_acl_state: >-
+      {{ 'overridden-unexecuted'
+         if (micolab_verify_accept_unverified_external_acl | bool)
+         else 'pending' }}
+
+- name: Validate external ACL probe shape and coverage
+  when: not (micolab_verify_accept_unverified_external_acl | bool)
+  block:
+    - name: Require at least one external probe host and complete probe fields
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_external_acl_probes | length > 0
+          - micolab_verify_external_acl_probes | selectattr('host', 'defined') | selectattr('check', 'defined') | selectattr('expect', 'defined') | list | length == (micolab_verify_external_acl_probes | length)
+        fail_msg: >-
+          Each external probe needs host, check, and expect. Supply real
+          external-vantage inventory hosts.
+
+    - name: Require only supported external probe checks and expectations
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_external_acl_probes | map(attribute='check') | unique | difference(['dns_admin', 'ca_management', 'doh', 'dot']) | list | length == 0
+          - micolab_verify_external_acl_probes | map(attribute='expect') | unique | difference(['allowed', 'denied']) | list | length == 0
+        fail_msg: >-
+          check must be one of dns_admin, ca_management, doh, or dot; expect
+          must be allowed or denied.
+
+    - name: Require every probe host to be a real non-management inventory host
+      ansible.builtin.assert:
+        that:
+          - item.host in hostvars
+          - item.host != micolab_verify_mgmt_host
+          - item.host not in (groups[micolab_verify_management_group] | default([]))
+        fail_msg: >-
+          External probe host '{{ item.host }}' is missing or is the management
+          host. ACL acceptance requires an off-host vantage point.
+      loop: "{{ micolab_verify_external_acl_probes }}"
+      loop_control:
+        label: "{{ item.name | default(item.check ~ '-' ~ item.expect) }}"
+
+    - name: Require allowed and denied probes for every external ACL class
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_external_acl_probes | selectattr('check', 'equalto', item) | selectattr('expect', 'equalto', 'allowed') | list | length > 0
+          - micolab_verify_external_acl_probes | selectattr('check', 'equalto', item) | selectattr('expect', 'equalto', 'denied') | list | length > 0
+        fail_msg: >-
+          ACL class '{{ item }}' needs both an allowed and a denied probe.
+          One-sided evidence is not acceptance.
+      loop:
+        - dns_admin
+        - ca_management
+        - doh
+        - dot
+
+    - name: Require the recursion fixture and classified sources for DoT probes
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_dns_fixture_name | length > 0
+          - micolab_verify_dns_fixture_expected_ip is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+          - micolab_verify_dns_authoritative_only_cidrs | length > 0
+          - micolab_verify_dns_recursion_allowed_cidrs | length > 0
+          - dot_classification_errors | length == 0
+        fail_msg: >-
+          DoT acceptance needs the DNS role's recursion fixture and explicitly
+          classified probe sources. Set micolab_dns_fixture_name and
+          micolab_dns_fixture_expected_ip to the conditional-forwarder fixture,
+          and give every DoT probe source_address plus access. The allowed
+          source must be recursion-allowed; the denied source must be in
+          micolab_dns_authoritative_only_cidrs (firewall-admitted for 853/tcp
+          but excluded from recursion). Classification errors:
+          {{ dot_classification_errors }}
+      vars:
+        dot_classification_errors: >-
+          {{ micolab_verify_external_acl_probes
+             | micolab_verify_probe_classification_errors(
+                 micolab_verify_dns_firewall_admitted_cidrs,
+                 micolab_verify_dns_recursion_allowed_cidrs,
+                 micolab_verify_dns_authoritative_only_cidrs) }}
+      when: micolab_verify_external_acl_probes | selectattr('check', 'equalto', 'dot') | list | length > 0
+
+    - name: Require a global-recursion probe name outside every local zone
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_dns_fixture_zone | length > 0
+          - denied_name is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+          - not (denied_name == service_domain or denied_name.endswith('.' ~ service_domain))
+          - not (denied_name == zone or denied_name.endswith('.' ~ zone))
+          - not (denied_name == fixture_zone or denied_name.endswith('.' ~ fixture_zone))
+        fail_msg: >-
+          micolab_verify_dns_recursion_denied_name ({{ denied_name }}) must be
+          a lowercase name outside the service domain {{ service_domain }},
+          the authoritative zone {{ zone }}, and the fixture forwarder zone
+          {{ fixture_zone | default('') }} (micolab_dns_fixture_zone, which
+          must be set). Only then is a REFUSED answer evidence of the global
+          recursion ACL rather than a zone query ACL.
+      vars:
+        denied_name: "{{ micolab_verify_dns_recursion_denied_name | lower | regex_replace('\\.$', '') }}"
+        service_domain: "{{ micolab_verify_service_domain | lower }}"
+        zone: "{{ micolab_verify_zone | lower }}"
+        fixture_zone: "{{ micolab_verify_dns_fixture_zone | lower | regex_replace('\\.$', '') }}"
+      when: micolab_verify_external_acl_probes | selectattr('check', 'equalto', 'dot') | list | length > 0
+
+    - name: Require every DoT source_address to match the target address family
+      ansible.builtin.assert:
+        that:
+          - >-
+            item.source_address | default('') | string
+            | micolab_verify_ip_in_networks(['0.0.0.0/0'])
+        fail_msg: >-
+          DoT probe '{{ item.name | default(item.host) }}' source_address
+          {{ item.source_address | default('missing') }} must be an IPv4
+          literal: the DoT target is the management IPv4
+          {{ micolab_verify_mgmt_ip }} and the socket is bound to the source
+          before connect.
+      loop: "{{ micolab_verify_external_acl_probes | selectattr('check', 'equalto', 'dot') | list }}"
+      loop_control:
+        label: "{{ item.name | default(item.host) }}"
+
+    - name: Check probe-host tooling
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - "command -v -- curl && command -v -- python3"
+      loop: "{{ micolab_verify_external_acl_probes | map(attribute='host') | unique | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: micolab_verify_probe_tools
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: false
+      delegate_to: "{{ item }}"
+
+    - name: Fail when a probe host lacks curl or python3
+      ansible.builtin.assert:
+        that:
+          - micolab_verify_probe_tools.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+        fail_msg: >-
+          Every external probe host needs curl and python3. Install the
+          documented probe tooling; do not skip the ACL check.
+
+    - name: Stage the strict DoT probe on every external probe host
+      ansible.builtin.copy:
+        src: dot_probe.py
+        dest: "{{ micolab_verify_dot_probe_stage_path }}"
+        mode: "0700"
+      loop: "{{ micolab_verify_external_acl_probes | map(attribute='host') | unique | list }}"
+      loop_control:
+        label: "{{ item }}"
+      become: false
+      delegate_to: "{{ item }}"
+
+    - name: Run every external ACL probe on its delegated inventory host
+      ansible.builtin.shell: |
+        set -euo pipefail
+        check="$CHECK"
+        expect="$EXPECT"
+        ca="$CA_FILE"
+        timeout="$TIMEOUT"
+        test -r "$ca"
+        case "$check" in
+          dns_admin|ca_management)
+            code=$(curl --silent --show-error --max-time "$timeout" \
+              --cacert "$ca" \
+              --resolve "$TARGET_HOST:$HTTPS_PORT:$MGMT_IP" \
+              -o /dev/null -w '%{http_code}' \
+              "https://$TARGET_HOST:$HTTPS_PORT/") || code=000
+            if [ "$expect" = "allowed" ]; then
+              if [ "$check" = "dns_admin" ]; then
+                # Admin console: HTML 200 or a redirect to its login page.
+                [ "$code" -ge 200 ] && [ "$code" -lt 400 ]
+              else
+                # CA frontend: any non-403 response proves management reach.
+                [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && [ "$code" != "403" ]
+              fi
+            else
+              [ "$code" = "403" ]
+            fi
+            echo "$check $expect observed_http=$code"
+            ;;
+          doh)
+            body=$(mktemp)
+            trap 'rm -f "$body"' EXIT
+            code=$(curl --silent --show-error --max-time "$timeout" \
+              --cacert "$ca" \
+              --resolve "$DOH_HOST:$HTTPS_PORT:$MGMT_IP" \
+              -H 'accept: application/dns-json' \
+              -o "$body" -w '%{http_code}' \
+              "https://$DOH_HOST:$HTTPS_PORT$DOH_PATH?name=$PROBE_NAME&type=A") || code=000
+            if [ "$expect" = "allowed" ]; then
+              if [ "$code" != "200" ]; then
+                echo "doh allowed failed: observed_http=$code, expected 200 with a validated A answer" >&2
+                exit 1
+              fi
+              if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); a=[x.get("data") for x in d.get("Answer", []) if x.get("type") == 1]; sys.exit(0 if d.get("Status") == 0 and sys.argv[2] in a else 1)' "$body" "$PROBE_IP"; then
+                echo "doh allowed failed: response did not contain the expected A $PROBE_IP" >&2
+                exit 1
+              fi
+              echo "doh allowed observed_http=$code expected_a=$PROBE_IP"
+            else
+              if [ "$code" != "403" ]; then
+                echo "doh denied inconclusive: observed_http=$code; only the Caddy ACL's explicit 403 is denial evidence, not a transport failure or another status" >&2
+                exit 1
+              fi
+              echo "doh denied observed_http=403"
+            fi
+            ;;
+          dot)
+            # The DoT socket is bound to the declared source_address; the
+            # probe reads back the local address of the connected socket and the
+            # shell re-checks it, so the class validated before the run is the
+            # class the server actually sees.
+            if [ -z "${SOURCE_ADDRESS:-}" ]; then
+              echo "dot $expect failed: no source_address; the default route is never an implicit source" >&2
+              exit 1
+            fi
+            dot_tmp=$(mktemp -d)
+            trap 'rm -rf "$dot_tmp"' EXIT
+            # run_dot <label> <query-name> <expected-ip-or-empty>
+            run_dot() {
+              local status_file="$dot_tmp/$1.json"
+              set +e
+              python3 "$DOT_PROBE" \
+                --connect-host "$MGMT_IP" \
+                --port "$DOT_PORT" \
+                --server-name "$DOT_HOST" \
+                --ca-file "$ca" \
+                --source-address "$SOURCE_ADDRESS" \
+                --name "$2" \
+                --expect "$3" \
+                --timeout "$timeout" \
+                --status-file "$status_file"
+              probe_rc=$?
+              set -e
+              category=""
+              detail=""
+              observed_source=""
+              if [ -s "$status_file" ]; then
+                read_field() {
+                  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""))' "$status_file" "$1" 2>/dev/null || printf '%s' ''
+                }
+                category=$(read_field category)
+                detail=$(read_field detail)
+                observed_source=$(read_field observed_source)
+              fi
+              case "$category" in
+                source_*)
+                  echo "dot $expect failed [$1]: category=$category; the declared source_address $SOURCE_ADDRESS could not be used, so no ACL class was tested. detail=$detail" >&2
+                  exit 1
+                  ;;
+              esac
+              # A category that only exists after connect must carry the
+              # observed local address, and it must be the declared source.
+              case "$category" in
+                ""|tcp_refused|tcp_connect_timeout|tcp_unreachable|ca_error) ;;
+                *)
+                  if [ -z "$observed_source" ] || ! python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]) == ipaddress.ip_address(sys.argv[2]) else 1)' "$observed_source" "$SOURCE_ADDRESS"; then
+                    echo "dot $expect failed [$1]: observed source ${observed_source:-missing} is not the declared $SOURCE_ADDRESS" >&2
+                    exit 1
+                  fi
+                  ;;
+              esac
+            }
+            denied_category_check() {
+              # $1 label; accepts only a positive DNS REFUSED.
+              case "$category" in
+                dns_refused) ;;
+                tcp_refused|tcp_connect_timeout|tcp_unreachable|tls_timeout|response_timeout)
+                  echo "dot denied inconclusive [$1]: category=$category is a transport failure, not a positive DNS REFUSED. No listener, routing failure, or timeout cannot prove an ACL. rc=$probe_rc detail=$detail" >&2
+                  exit 1
+                  ;;
+                tls_certificate|tls_handshake)
+                  echo "dot denied failed [$1]: category=$category is a TLS error, not an ACL denial. rc=$probe_rc detail=$detail" >&2
+                  exit 1
+                  ;;
+                *)
+                  echo "dot denied inconclusive [$1]: category=${category:-missing} is not a positive DNS REFUSED. rc=$probe_rc detail=${detail:-none}" >&2
+                  exit 1
+                  ;;
+              esac
+            }
+            case "$expect" in
+              allowed)
+                # Only the local fixture is queried: no WAN recursion needed.
+                run_dot fixture "$DOT_QUERY_NAME" "$DOT_EXPECT_IP"
+                if [ "$category" != "ok" ]; then
+                  echo "dot allowed failed: rc=$probe_rc category=${category:-missing} detail=${detail:-none}" >&2
+                  exit 1
+                fi
+                echo "dot allowed validated source=$observed_source fixture_answer=$DOT_EXPECT_IP rc=$probe_rc"
+                ;;
+              denied)
+                # Evidence 1: fixture zone query ACL (authoritative FWD path).
+                run_dot fixture "$DOT_QUERY_NAME" "$DOT_EXPECT_IP"
+                denied_category_check fixture-zone-query-acl
+                fixture_source=$observed_source
+                # Evidence 2: global recursion ACL. RD=1 query for a name
+                # outside every authoritative and forwarder zone; only the
+                # recursion policy can answer it, and a denied source is
+                # refused before any upstream lookup (no WAN).
+                run_dot global-recursion "$DOT_RECURSION_DENIED_NAME" ""
+                denied_category_check global-recursion-acl
+                echo "dot denied source=$fixture_source fixture_zone_query_acl=dns_refused global_recursion_acl=dns_refused"
+                ;;
+              *)
+                echo "unexpected dot expectation: $expect" >&2
+                exit 2
+                ;;
+            esac
+            ;;
+          *)
+            echo "unknown external ACL check: $check" >&2
+            exit 2
+            ;;
+        esac
+      args:
+        executable: /bin/bash
+      environment:
+        CHECK: "{{ item.check }}"
+        EXPECT: "{{ item.expect }}"
+        CA_FILE: "{{ item.ca_file | default(micolab_verify_tls_root) }}"
+        TIMEOUT: "{{ micolab_verify_external_probe_timeout | string }}"
+        TARGET_HOST: "{{ micolab_verify_ca_host if item.check == 'ca_management' else micolab_verify_doh_host }}"
+        MGMT_IP: "{{ micolab_verify_mgmt_ip }}"
+        HTTPS_PORT: "{{ micolab_verify_https_port | string }}"
+        DOH_HOST: "{{ micolab_verify_doh_host }}"
+        DOH_PATH: "{{ micolab_verify_doh_path }}"
+        PROBE_NAME: "{{ micolab_verify_dns_probe_name }}"
+        PROBE_IP: "{{ micolab_verify_expected_a_records[micolab_verify_dns_probe_name] | default(micolab_verify_mgmt_ip) }}"
+        DOT_PROBE: "{{ micolab_verify_dot_probe_stage_path }}"
+        DOT_HOST: "{{ micolab_verify_dot_host }}"
+        DOT_PORT: "{{ micolab_verify_dot_port | string }}"
+        DOT_QUERY_NAME: "{{ micolab_verify_dns_fixture_name }}"
+        DOT_EXPECT_IP: "{{ micolab_verify_dns_fixture_expected_ip }}"
+        DOT_RECURSION_DENIED_NAME: "{{ micolab_verify_dns_recursion_denied_name }}"
+        SOURCE_ADDRESS: "{{ item.source_address | default('') if item.check == 'dot' else '' }}"
+      loop: "{{ micolab_verify_external_acl_probes }}"
+      loop_control:
+        label: "{{ item.name | default(item.check ~ '-' ~ item.expect) }}"
+      register: micolab_verify_external_acl_results
+      changed_when: false
+      become: false
+      delegate_to: "{{ item.host }}"
+
+    - name: Require every external ACL probe to match its expectation
+      ansible.builtin.assert:
+        that:
+          - item.rc | default(1) == 0
+        fail_msg: >-
+          External ACL probe '{{ item.item.name | default(item.item.check ~ '-' ~ item.item.expect) }}'
+          on {{ item.item.host }} did not match the expected
+          {{ item.item.expect }} outcome. stderr: {{ item.stderr | default('') }}
+      loop: "{{ micolab_verify_external_acl_results.results }}"
+      loop_control:
+        label: "{{ item.item.name | default(item.item.check ~ '-' ~ item.item.expect) }}"
+
+    - name: Record successful external ACL acceptance
+      ansible.builtin.set_fact:
+        micolab_verify_external_acl_state: "executed"
+
+  always:
+    - name: Remove the staged DoT probe from external probe hosts
+      ansible.builtin.file:
+        path: "{{ micolab_verify_dot_probe_stage_path }}"
+        state: absent
+      loop: "{{ micolab_verify_external_acl_probes | map(attribute='host') | unique | list }}"
+      loop_control:
+        label: "{{ item }}"
+      become: false
+      delegate_to: "{{ item }}"
+      when: not (micolab_verify_accept_unverified_external_acl | bool)

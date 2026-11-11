@@ -1,0 +1,483 @@
+---
+- name: Map Debian architecture to Forgejo release architecture
+  ansible.builtin.set_fact:
+    micolab_forgejo_arch: >-
+      {{ 'amd64' if ansible_architecture == 'x86_64'
+         else ('arm64' if ansible_architecture == 'aarch64' else '') }}
+
+- name: Resolve Forgejo metadata from the shared staged artifact list
+  ansible.builtin.set_fact:
+    micolab_forgejo_staged: >-
+      {{ ((micolab_staged_artifacts | default([]))
+          | selectattr('name', 'equalto', micolab_forgejo_staged_artifact_name)
+          | list | first) | default({}) }}
+    micolab_forgejo_use_staged: >-
+      {{ (micolab_forgejo_version | length == 0)
+         and (((micolab_staged_artifacts | default([]))
+               | selectattr('name', 'equalto', micolab_forgejo_staged_artifact_name)
+               | list | length) > 0) }}
+
+- name: Adopt pinned Forgejo metadata from the shared staged artifact entry
+  ansible.builtin.set_fact:
+    micolab_forgejo_version: "{{ micolab_forgejo_staged.version | default('') }}"
+    micolab_forgejo_checksums: "{{ {(micolab_forgejo_arch): (micolab_forgejo_staged.sha256 | default(''))} }}"
+    micolab_forgejo_artifact_src_amd64: "{{ micolab_forgejo_staged.path | default('') if micolab_forgejo_arch == 'amd64' else '' }}"
+    micolab_forgejo_artifact_src_arm64: "{{ micolab_forgejo_staged.path | default('') if micolab_forgejo_arch == 'arm64' else '' }}"
+  when: micolab_forgejo_use_staged | bool
+
+- name: Fail closed on missing Forgejo pins, secrets, and service contract
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_arch in ['amd64', 'arm64']
+      - micolab_forgejo_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - ((micolab_forgejo_checksums | default({})).get(micolab_forgejo_arch, '')) is match('^[0-9a-fA-F]{64}$')
+      - (micolab_forgejo_artifact_src_amd64 | length > 0) or (micolab_forgejo_artifact_src_arm64 | length > 0) or (micolab_forgejo_allow_online_download | bool)
+      - micolab_forgejo_secret_key is match('^[A-Za-z0-9+/=_-]{32,}$')
+      - micolab_forgejo_internal_token is match('^[A-Za-z0-9+/=_-]{32,}$')
+      - micolab_forgejo_jwt_secret is match('^[A-Za-z0-9+/=_-]{32,}$')
+      - micolab_forgejo_lfs_jwt_secret is match('^[A-Za-z0-9+/=_-]{32,}$')
+      - micolab_forgejo_admin_username is match('^[A-Za-z0-9_.-]+$')
+      - micolab_forgejo_admin_email is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
+      - micolab_forgejo_admin_password | length >= (micolab_forgejo_admin_password_min_length | int)
+      - micolab_forgejo_admin_password != micolab_forgejo_admin_username
+      - micolab_forgejo_admin_password is not search('\n')
+      - micolab_forgejo_http_addr in ['127.0.0.1', '::1']
+      - micolab_forgejo_root_url is match('^https://[^/]+/$')
+      - micolab_forgejo_domain in micolab_forgejo_root_url
+      - micolab_forgejo_ssh_domain == micolab_forgejo_domain
+      - micolab_forgejo_ssh_port | int == 22
+      - micolab_forgejo_install_lock | bool
+      - micolab_forgejo_disable_registration | bool
+      - not (micolab_forgejo_actions_enabled | bool)
+      - micolab_forgejo_lfs_enabled | bool
+    fail_msg: >-
+      Forgejo requires a pinned version/checksum/offline artifact, four durable
+      base64-style secrets, a usable admin password, loopback HTTP, HTTPS
+      ROOT_URL, system OpenSSH on port 22, install lock, registration disabled,
+      and Actions disabled. The role never generates or defaults secrets.
+
+- name: Select Forgejo artifact for this architecture
+  ansible.builtin.set_fact:
+    micolab_forgejo_artifact_src: >-
+      {{ micolab_forgejo_artifact_src_amd64 if micolab_forgejo_arch == 'amd64'
+         else micolab_forgejo_artifact_src_arm64 }}
+
+- name: Require a Forgejo artifact for this architecture
+  ansible.builtin.assert:
+    that:
+      - (micolab_forgejo_artifact_src | length > 0) or (micolab_forgejo_allow_online_download | bool)
+    fail_msg: >-
+      No Forgejo artifact was supplied for { micolab_forgejo_arch } and online download
+      is disabled.
+
+- name: Check required local commands
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - "command -v -- {{ item }}"
+  loop:
+    - git
+    - git-lfs
+    - systemctl
+    - findmnt
+    - sshd
+    - awk
+    - grep
+  register: micolab_forgejo_command_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail when a required local command is absent
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_command_check.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      Missing a required dependency (git, git-lfs, systemd, util-linux, OpenSSH,
+      awk, grep). Install the documented dependency bundle before deploying.
+
+- name: Confirm system OpenSSH listens on port 22
+  ansible.builtin.command:
+    argv:
+      - sshd
+      - -T
+  register: micolab_forgejo_sshd_effective
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail closed when system OpenSSH is not on port 22
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_sshd_effective.rc == 0
+      - "'port 22' in micolab_forgejo_sshd_effective.stdout"
+    fail_msg: >-
+      The system OpenSSH server must be present and listening on port 22.
+      Forgejo uses system OpenSSH, not its built-in SSH server.
+
+- name: Create the git system group
+  ansible.builtin.group:
+    name: "{{ micolab_forgejo_group }}"
+    system: true
+    state: present
+
+- name: Create the git system user with a usable shell
+  ansible.builtin.user:
+    name: "{{ micolab_forgejo_user }}"
+    group: "{{ micolab_forgejo_group }}"
+    home: "{{ micolab_forgejo_home }}"
+    create_home: true
+    shell: /bin/bash
+    comment: "Git Version Control"
+    system: true
+    password_lock: true
+    state: present
+
+- name: Create Forgejo base directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ micolab_forgejo_install_root }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_forgejo_cache_dir }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_forgejo_config_dir }}", owner: root, group: "{{ micolab_forgejo_group }}", mode: "0750" }
+    - { path: "{{ micolab_forgejo_data_dir }}", owner: "{{ micolab_forgejo_user }}", group: "{{ micolab_forgejo_group }}", mode: "0750" }
+    - { path: "{{ micolab_forgejo_app_data_path }}", owner: "{{ micolab_forgejo_user }}", group: "{{ micolab_forgejo_group }}", mode: "0750" }
+    - { path: "{{ micolab_forgejo_repo_root }}", owner: "{{ micolab_forgejo_user }}", group: "{{ micolab_forgejo_group }}", mode: "0750" }
+    - { path: "{{ micolab_forgejo_home }}/.ssh", owner: "{{ micolab_forgejo_user }}", group: "{{ micolab_forgejo_group }}", mode: "0700" }
+
+- name: Create Forgejo local storage directories
+  ansible.builtin.file:
+    path: "{{ micolab_forgejo_app_data_path }}/{{ item }}"
+    state: directory
+    owner: "{{ micolab_forgejo_user }}"
+    group: "{{ micolab_forgejo_group }}"
+    mode: "0750"
+  loop:
+    - lfs
+    - attachments
+    - avatars
+    - repo-avatars
+    - repo-archive
+    - packages
+    - actions_log
+    - actions_artifacts
+    - queues
+    - indexers
+    - sessions
+    - tmp
+    - tmp/uploads
+
+- name: Inspect the filesystem backing Forgejo state
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - -n
+      - -o
+      - FSTYPE,SOURCE
+      - -T
+      - "{{ micolab_forgejo_data_dir }}"
+  register: micolab_forgejo_filesystem
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Derive the Forgejo filesystem type and source
+  ansible.builtin.set_fact:
+    micolab_forgejo_fs_type: "{{ (micolab_forgejo_filesystem.stdout | default('')) | regex_replace('\\s.*$', '') }}"
+    micolab_forgejo_fs_source: "{{ (micolab_forgejo_filesystem.stdout | default('')) | regex_replace('^\\S+\\s*', '') }}"
+
+- name: Require Forgejo state to live on a local SSD-backed filesystem
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_filesystem.rc == 0
+      - micolab_forgejo_fs_type in micolab_forgejo_required_local_filesystems
+      - micolab_forgejo_fs_source is not match('^//')
+    fail_msg: >-
+      {{ micolab_forgejo_data_dir }} is on '{{ micolab_forgejo_fs_type }}'
+      ({{ micolab_forgejo_fs_source }}); the plan requires local SSD storage
+      for Forgejo state. Override micolab_forgejo_required_local_filesystems
+      only with a documented, intentional exception.
+  when: micolab_forgejo_require_local_filesystem | bool
+
+- name: Stage the pinned Forgejo artifact from the offline bundle
+  ansible.builtin.copy:
+    src: "{{ micolab_forgejo_artifact_src }}"
+    dest: "{{ micolab_forgejo_cache_dir }}/forgejo-{{ micolab_forgejo_version }}-linux-{{ micolab_forgejo_arch }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: micolab_forgejo_artifact_src | length > 0
+
+- name: Optionally fetch the pinned Forgejo artifact when explicitly enabled
+  ansible.builtin.get_url:
+    url: "{{ micolab_forgejo_download_base_url }}/v{{ micolab_forgejo_version }}/forgejo-{{ micolab_forgejo_version }}-linux-{{ micolab_forgejo_arch }}"
+    dest: "{{ micolab_forgejo_cache_dir }}/forgejo-{{ micolab_forgejo_version }}-linux-{{ micolab_forgejo_arch }}"
+    checksum: "sha256:{{ micolab_forgejo_checksums[micolab_forgejo_arch] }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - micolab_forgejo_artifact_src | length == 0
+    - micolab_forgejo_allow_online_download | bool
+
+- name: Hash the staged Forgejo artifact
+  ansible.builtin.stat:
+    path: "{{ micolab_forgejo_cache_dir }}/forgejo-{{ micolab_forgejo_version }}-linux-{{ micolab_forgejo_arch }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: micolab_forgejo_artifact_stat
+
+- name: Fail closed on a Forgejo artifact checksum mismatch
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_artifact_stat.stat.exists
+      - micolab_forgejo_artifact_stat.stat.checksum == (micolab_forgejo_checksums[micolab_forgejo_arch] | lower)
+    fail_msg: >-
+      The staged Forgejo artifact does not match
+      micolab_forgejo_checksums for {{ micolab_forgejo_arch }}. Refusing to
+      install an unpinned binary.
+
+- name: Install the official Forgejo binary
+  ansible.builtin.copy:
+    src: "{{ micolab_forgejo_cache_dir }}/forgejo-{{ micolab_forgejo_version }}-linux-{{ micolab_forgejo_arch }}"
+    dest: "{{ micolab_forgejo_binary_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart forgejo
+
+- name: Confirm the installed Forgejo version
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_forgejo_binary_path }}"
+      - --version
+  register: micolab_forgejo_version_check
+  changed_when: false
+  check_mode: false
+
+- name: Fail closed on a Forgejo binary version mismatch
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_version in micolab_forgejo_version_check.stdout
+    fail_msg: >-
+      The installed Forgejo binary does not report the pinned version
+      {{ micolab_forgejo_version }}.
+
+- name: Render the full Forgejo app.ini
+  ansible.builtin.template:
+    src: app.ini.j2
+    dest: "{{ micolab_forgejo_config_file }}"
+    owner: root
+    group: "{{ micolab_forgejo_group }}"
+    mode: "0640"
+  notify: Restart forgejo
+  no_log: true
+  diff: false
+
+- name: Render the Forgejo systemd unit
+  ansible.builtin.template:
+    src: forgejo.service.j2
+    dest: "/etc/systemd/system/{{ micolab_forgejo_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart forgejo
+
+- name: Render the OpenSSH drop-in for the git user
+  ansible.builtin.template:
+    src: sshd-forgejo.conf.j2
+    dest: "{{ micolab_forgejo_sshd_dropin }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate sshd configuration
+    - Reload ssh
+  when: micolab_forgejo_manage_sshd | bool
+
+- name: Apply deferred Forgejo and sshd handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure Forgejo is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ micolab_forgejo_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for Forgejo health before any git frontend is enabled
+  ansible.builtin.uri:
+    url: "{{ micolab_forgejo_health_url }}"
+    status_code: 200
+    return_content: true
+    use_proxy: false
+  register: micolab_forgejo_health
+  until: micolab_forgejo_health.status == 200
+  retries: "{{ micolab_forgejo_health_retries }}"
+  delay: "{{ micolab_forgejo_health_delay }}"
+  changed_when: false
+  check_mode: false
+
+- name: Bootstrap the admin account exactly once
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    if "$BIN" --config "$CFG" --work-path "$WORK" admin user list --admin \
+      | awk -v u="$ADMIN_USER" '$2 == u { found = 1 } END { exit !found }'; then
+      :
+    else
+      "$BIN" --config "$CFG" --work-path "$WORK" admin user create \
+        --username "$ADMIN_USER" \
+        --password "$ADMIN_PASSWORD" \
+        --email "$ADMIN_EMAIL" \
+        --admin \
+        --must-change-password=false
+    fi
+    "$BIN" --config "$CFG" --work-path "$WORK" admin user must-change-password \
+      --unset --username "$ADMIN_USER"
+    touch "$MARKER"
+  args:
+    executable: /bin/bash
+    creates: "{{ micolab_forgejo_bootstrap_marker }}"
+  environment:
+    BIN: "{{ micolab_forgejo_binary_path }}"
+    CFG: "{{ micolab_forgejo_config_file }}"
+    WORK: "{{ micolab_forgejo_data_dir }}"
+    ADMIN_USER: "{{ micolab_forgejo_admin_username }}"
+    ADMIN_EMAIL: "{{ micolab_forgejo_admin_email }}"
+    ADMIN_PASSWORD: "{{ micolab_forgejo_admin_password }}"
+    MARKER: "{{ micolab_forgejo_bootstrap_marker }}"
+    HOME: "{{ micolab_forgejo_home }}"
+    USER: "{{ micolab_forgejo_user }}"
+  become: true
+  become_user: "{{ micolab_forgejo_user }}"
+  no_log: true
+
+- name: Ensure the admin account is not blocked by a forced password change
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_forgejo_binary_path }}"
+      - --config
+      - "{{ micolab_forgejo_config_file }}"
+      - --work-path
+      - "{{ micolab_forgejo_data_dir }}"
+      - admin
+      - user
+      - must-change-password
+      - --unset
+      - --username
+      - "{{ micolab_forgejo_admin_username }}"
+  become: true
+  become_user: "{{ micolab_forgejo_user }}"
+  environment:
+    HOME: "{{ micolab_forgejo_home }}"
+    USER: "{{ micolab_forgejo_user }}"
+  changed_when: false
+  no_log: true
+
+- name: Verify the admin account is usable with basic authentication
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ micolab_forgejo_http_port }}/api/v1/user"
+    user: "{{ micolab_forgejo_admin_username }}"
+    password: "{{ micolab_forgejo_admin_password }}"
+    force_basic_auth: true
+    status_code: [200, 401, 403]
+    return_content: true
+    use_proxy: false
+  register: micolab_forgejo_admin_auth
+  until: micolab_forgejo_admin_auth.status == 200
+  retries: "{{ micolab_forgejo_health_retries }}"
+  delay: "{{ micolab_forgejo_health_delay }}"
+  changed_when: false
+  no_log: true
+  check_mode: false
+
+- name: Fail closed when the admin account is not actually usable
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_admin_auth.status == 200
+      - (micolab_forgejo_admin_auth.content | from_json).login == micolab_forgejo_admin_username
+    fail_msg: >-
+      The guarded Forgejo admin bootstrap did not produce a usable admin
+      account. If the marker exists but the account was removed, remove
+      {{ micolab_forgejo_bootstrap_marker }} and rerun deliberately.
+  no_log: true
+
+- name: Regenerate Forgejo-managed SSH authorized_keys
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_forgejo_binary_path }}"
+      - --config
+      - "{{ micolab_forgejo_config_file }}"
+      - --work-path
+      - "{{ micolab_forgejo_data_dir }}"
+      - admin
+      - regenerate
+      - keys
+  become: true
+  become_user: "{{ micolab_forgejo_user }}"
+  environment:
+    HOME: "{{ micolab_forgejo_home }}"
+    USER: "{{ micolab_forgejo_user }}"
+  changed_when: false
+  no_log: true
+
+- name: Ensure the Forgejo-managed authorized_keys file exists
+  ansible.builtin.file:
+    path: "{{ micolab_forgejo_home }}/.ssh/authorized_keys"
+    state: touch
+    owner: "{{ micolab_forgejo_user }}"
+    group: "{{ micolab_forgejo_group }}"
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Inspect the Forgejo-managed authorized_keys file
+  ansible.builtin.stat:
+    path: "{{ micolab_forgejo_home }}/.ssh/authorized_keys"
+  register: micolab_forgejo_authorized_keys
+
+- name: Require a secure, Forgejo-owned authorized_keys file
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_authorized_keys.stat.exists
+      - micolab_forgejo_authorized_keys.stat.isreg
+      - micolab_forgejo_authorized_keys.stat.mode == '0600'
+      - micolab_forgejo_authorized_keys.stat.pw_name == micolab_forgejo_user
+    fail_msg: >-
+      {{ micolab_forgejo_home }}/.ssh/authorized_keys must be a git-owned
+      regular file with mode 0600. Forgejo must remain the only writer.
+
+- name: Reject any authorized_keys line without a Forgejo forced command
+  ansible.builtin.shell: |
+    set -euo pipefail
+    awk 'NF && $0 !~ /command="/ { print "unexpected authorized_keys line " NR; bad=1 } END { exit (bad ? 1 : 0) }' \
+      "{{ micolab_forgejo_home }}/.ssh/authorized_keys"
+  args:
+    executable: /bin/bash
+  changed_when: false
+  check_mode: false
+
+- name: Confirm sshd still reports port 22 after the drop-in
+  ansible.builtin.command:
+    argv:
+      - sshd
+      - -T
+  register: micolab_forgejo_sshd_after
+  changed_when: false
+  check_mode: false
+  when: micolab_forgejo_manage_sshd | bool
+
+- name: Fail closed when the sshd drop-in changed the SSH port
+  ansible.builtin.assert:
+    that:
+      - "'port 22' in micolab_forgejo_sshd_after.stdout"
+    fail_msg: >-
+      The Forgejo sshd drop-in must not change the system OpenSSH port.
+  when: micolab_forgejo_manage_sshd | bool

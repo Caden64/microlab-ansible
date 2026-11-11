@@ -1,0 +1,103 @@
+---
+# Required, environment-specific inputs for the dedicated management host.
+# Do not invent addresses. Use the real management address, the real lab/VPN
+# client networks, and artifact checksums that you verified yourself.
+
+# Debian on arm64 or amd64. Values are checked against gathered facts.
+micolab_expected_os: Debian
+micolab_expected_architecture: arm64        # arm64 | amd64
+
+# Administrative source networks. SSH and the admin web UI are restricted to
+# these. Never use 0.0.0.0/0 or ::/0 here.
+micolab_admin_cidrs:
+  - REPLACE_WITH_ADMIN_CIDR
+
+# Lab and VPN client networks that may query DNS and reach HTTPS.
+micolab_client_cidrs:
+  - REPLACE_WITH_LAB_OR_VPN_CIDR
+
+micolab_ssh_port: 22
+
+# Recursion is allowed only for admin + client networks. Additional networks
+# may be listed here; entries are merged, not replaced.
+micolab_dns_recursion_allow_cidrs: []
+
+# Networks admitted by the firewall for authoritative DNS only. They are not
+# added to the recursion ACL, so they can reach the server but get REFUSED for
+# recursion. Use them for the recursion-denied remote probe class. Do not
+# overlap admin/client/recursion-allow networks.
+micolab_dns_authoritative_only_cidrs: []
+micolab_dns_authoritative_only_cidrs_v6: []
+
+# Remote acceptance probes. Supply at least one of each access class, each with
+# a source_address that belongs to that class:
+#   recursion-allowed | recursion-denied | firewall-denied
+# See group_vars/all.yml for the full field description and examples.
+# micolab_dns_remote_probes:
+#   - host: lab-client-1
+#     dns_server: REPLACE_WITH_MANAGEMENT_IPV4
+#     source_address: REPLACE_WITH_CLIENT_IPV4
+#     access: recursion-allowed
+#     fqdn: ca.microlab.hnh
+#     expect_ip: REPLACE_WITH_MANAGEMENT_IPV4
+
+# All four services are loopback services on the same management host. The
+# addresses may be identical. ns1 is also the in-zone NS target and glue.
+micolab_dns_addresses:
+  ns1: REPLACE_WITH_MANAGEMENT_IPV4
+  ca: REPLACE_WITH_MANAGEMENT_IPV4
+  dns: REPLACE_WITH_MANAGEMENT_IPV4
+  git: REPLACE_WITH_MANAGEMENT_IPV4
+
+# Leave empty unless IPv6 is deliberately enabled everywhere.
+micolab_dns_ipv6_enabled: false
+micolab_dns_ipv6_addresses: {}
+
+# Online forwarders are opt-in. Leave both empty/false for pure recursion.
+micolab_dns_forwarders: []
+micolab_dns_allow_online_forwarders: false
+
+# REQUIRED cold-start recursion fixture. The default managed fixture service
+# listens on 127.0.0.1:5353, so set the upstream to exactly that endpoint. The
+# zone must be distinct from hnh and outside micolab_domain; the name must sit
+# inside the fixture zone. The expected answer is the known A value returned by
+# that local upstream, never a public address. See docs/dns.md.
+micolab_dns_fixture_upstream: "127.0.0.1:5353"
+micolab_dns_fixture_zone: REPLACE_WITH_FIXTURE_ZONE
+micolab_dns_fixture_name: REPLACE_WITH_FIXTURE_NAME
+micolab_dns_fixture_expected_ip: REPLACE_WITH_FIXTURE_ANSWER_IPV4
+micolab_dns_fixture_manage_service: true
+micolab_dns_fixture_listen_address: "127.0.0.1"
+micolab_dns_fixture_port: 5353
+
+# Offline artifacts. Absolute controller paths; no role downloads anything.
+# Add step-ca, Caddy, Forgejo, and other stage artifacts here so baseline can
+# verify them too. The technitium_install role consumes the first two names.
+micolab_staged_artifacts:
+  - name: technitium
+    version: REPLACE_WITH_TECHNITIUM_VERSION
+    path: REPLACE_WITH_ABSOLUTE_CONTROLLER_PATH/DnsServerPortable.tar.gz
+    sha256: REPLACE_WITH_64_HEX_SHA256
+  - name: dotnet-aspnetcore-runtime
+    version: REPLACE_WITH_DOTNET_ASPNETCORE_RUNTIME_VERSION
+    path: REPLACE_WITH_ABSOLUTE_CONTROLLER_PATH/aspnetcore-runtime.tar.gz
+    sha256: REPLACE_WITH_64_HEX_SHA256
+
+micolab_technitium_version: REPLACE_WITH_TECHNITIUM_VERSION
+
+# Trust targets consumed by step_ca and verify. Names must resolve inside the
+# hnh zone. The TLS material paths are shared with technitium_tls.
+micolab_trust_targets:
+  - name: ca.microlab.hnh
+    role: step_ca
+  - name: git.microlab.hnh
+    role: forgejo
+
+micolab_max_powered_off_interval_seconds: REPLACE_WITH_POSITIVE_INTEGER
+
+# Required by the verify phase: a real repository that exists after Forgejo is
+# bootstrapped. Verification performs an actual git ls-remote; it is not skipped.
+micolab_verify_git_repo: REPLACE_WITH_OWNER/REPO
+
+# Required only when technitium_tls enables DoT/DoH/DoQ.
+micolab_technitium_tls_cert_password: ""

@@ -1,0 +1,551 @@
+---
+- name: Map Debian architecture to Caddy release architecture
+  ansible.builtin.set_fact:
+    micolab_caddy_arch: >-
+      {{ 'amd64' if ansible_architecture == 'x86_64'
+         else ('arm64' if ansible_architecture == 'aarch64' else '') }}
+
+- name: Resolve Caddy metadata from the shared staged artifact list
+  ansible.builtin.set_fact:
+    micolab_caddy_staged: >-
+      {{ ((micolab_staged_artifacts | default([]))
+          | selectattr('name', 'equalto', micolab_caddy_staged_artifact_name)
+          | list | first) | default({}) }}
+    micolab_caddy_use_staged: >-
+      {{ (micolab_caddy_version | length == 0)
+         and (((micolab_staged_artifacts | default([]))
+               | selectattr('name', 'equalto', micolab_caddy_staged_artifact_name)
+               | list | length) > 0) }}
+
+- name: Adopt pinned Caddy metadata from the shared staged artifact entry
+  ansible.builtin.set_fact:
+    micolab_caddy_version: "{{ micolab_caddy_staged.version | default('') }}"
+    micolab_caddy_checksums: "{{ {(micolab_caddy_arch): (micolab_caddy_staged.sha256 | default(''))} }}"
+    micolab_caddy_artifact_src_amd64: "{{ micolab_caddy_staged.path | default('') if micolab_caddy_arch == 'amd64' else '' }}"
+    micolab_caddy_artifact_src_arm64: "{{ micolab_caddy_staged.path | default('') if micolab_caddy_arch == 'arm64' else '' }}"
+  when: micolab_caddy_use_staged | bool
+
+- name: Fail closed on missing Caddy version, checksum, or architecture
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_arch in ['amd64', 'arm64']
+      - micolab_caddy_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - ((micolab_caddy_checksums | default({})).get(micolab_caddy_arch, '')) is match('^[0-9a-fA-F]{64}$')
+      - (micolab_caddy_artifact_src_amd64 | length > 0) or (micolab_caddy_artifact_src_arm64 | length > 0) or (micolab_caddy_allow_online_download | bool)
+      - micolab_caddy_acme_trusted_roots | length > 0
+    fail_msg: >-
+      Caddy requires a pinned version, a 64-hex-character SHA-256 for the
+      target architecture, and an offline artifact (or explicit
+      micolab_caddy_allow_online_download=true). The step-ca root trust file
+      path is also required.
+
+- name: Select Caddy artifact for this architecture
+  ansible.builtin.set_fact:
+    micolab_caddy_artifact_src: >-
+      {{ micolab_caddy_artifact_src_amd64 if micolab_caddy_arch == 'amd64'
+         else micolab_caddy_artifact_src_arm64 }}
+
+- name: Require a Caddy artifact for this architecture
+  ansible.builtin.assert:
+    that:
+      - (micolab_caddy_artifact_src | length > 0) or (micolab_caddy_allow_online_download | bool)
+    fail_msg: >-
+      No Caddy artifact was supplied for { micolab_caddy_arch } and online download
+      is disabled.
+
+- name: Require a non-empty CIDR policy for every enabled frontend
+  ansible.builtin.assert:
+    that:
+      - not (micolab_caddy_enable_ca | bool) or (micolab_caddy_management_cidrs | length > 0)
+      - not (micolab_caddy_enable_dns | bool) or (micolab_caddy_dns_client_cidrs | length > 0)
+      # The dns hostname also proxies Technitium's admin console on every
+      # non-/dns-query path, so it needs a separate admin policy too.
+      - not (micolab_caddy_enable_dns | bool) or (micolab_caddy_admin_cidrs | length > 0)
+      - not (micolab_caddy_enable_git | bool) or (micolab_caddy_admin_cidrs | length > 0)
+    fail_msg: >-
+      Set micolab_caddy_management_cidrs, micolab_caddy_dns_client_cidrs,
+      and micolab_caddy_admin_cidrs. They are deliberately separate; loopback
+      is added only for local health checks. The DNS admin proxy must use the
+      admin CIDRs, not the DNS client CIDRs.
+
+- name: Require loopback-only Caddy upstreams
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_ca_upstream_host == '127.0.0.1'
+      - micolab_caddy_dns_upstream_host == '127.0.0.1'
+      - micolab_caddy_admin_upstream_host == '127.0.0.1'
+      - micolab_caddy_forgejo_upstream_host == '127.0.0.1'
+      - micolab_caddy_admin_host == '127.0.0.1'
+    fail_msg: >-
+      All MicroLab loopback services must share the management host. Caddy
+      upstreams and its admin endpoint must be IPv4 loopback (127.0.0.1).
+
+- name: Check required local commands
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - "command -v -- {{ item }}"
+  loop:
+    - openssl
+    - curl
+    - ss
+    - systemctl
+    - tar
+  register: micolab_caddy_command_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail when a required local command is absent
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_command_check.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      Missing a required local verification/install command. Install the
+      documented dependency bundle; this role does not fetch OS packages.
+
+- name: Validate the ACME trusted root is a readable public certificate
+  ansible.builtin.stat:
+    path: "{{ micolab_caddy_acme_trusted_roots }}"
+    follow: true
+  register: micolab_caddy_trusted_root_stat
+
+- name: Fail closed when the ACME trusted root is missing or not a file
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_trusted_root_stat.stat.exists
+      - micolab_caddy_trusted_root_stat.stat.isreg
+    fail_msg: >-
+      micolab_caddy_acme_trusted_roots must point at the public step-ca root
+      certificate PEM file on the target. This role never skips TLS
+      verification and never accepts a private key here.
+
+- name: Parse the ACME trusted root certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ micolab_caddy_acme_trusted_roots }}"
+      - -noout
+      - -subject
+  changed_when: false
+  check_mode: false
+
+- name: Create the Caddy system group
+  ansible.builtin.group:
+    name: "{{ micolab_caddy_group }}"
+    system: true
+    state: present
+
+- name: Create the Caddy system user
+  ansible.builtin.user:
+    name: "{{ micolab_caddy_user }}"
+    group: "{{ micolab_caddy_group }}"
+    home: "{{ micolab_caddy_home }}"
+    create_home: true
+    shell: /usr/sbin/nologin
+    system: true
+    state: present
+
+- name: Verify the Caddy account can read the public root certificate
+  ansible.builtin.command:
+    argv:
+      - test
+      - -r
+      - "{{ micolab_caddy_acme_trusted_roots }}"
+  become: true
+  become_user: "{{ micolab_caddy_user }}"
+  changed_when: false
+  check_mode: false
+
+- name: Create Caddy directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ micolab_caddy_install_root }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_caddy_cache_dir }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_caddy_config_dir }}", owner: root, group: "{{ micolab_caddy_group }}", mode: "0750" }
+    - { path: "{{ micolab_caddy_state_dir }}", owner: "{{ micolab_caddy_user }}", group: "{{ micolab_caddy_group }}", mode: "0750" }
+    - { path: "{{ micolab_caddy_storage_dir }}", owner: "{{ micolab_caddy_user }}", group: "{{ micolab_caddy_group }}", mode: "0750" }
+
+- name: Stage the pinned Caddy artifact from the offline bundle
+  ansible.builtin.copy:
+    src: "{{ micolab_caddy_artifact_src }}"
+    dest: "{{ micolab_caddy_cache_dir }}/caddy-{{ micolab_caddy_version }}-{{ micolab_caddy_arch }}.tar.gz"
+    owner: root
+    group: root
+    mode: "0644"
+  when: micolab_caddy_artifact_src | length > 0
+  register: micolab_caddy_artifact_copy
+
+- name: Optionally fetch the pinned Caddy artifact when explicitly enabled
+  ansible.builtin.get_url:
+    url: "{{ micolab_caddy_download_base_url }}/v{{ micolab_caddy_version }}/caddy_{{ micolab_caddy_version }}_linux_{{ micolab_caddy_arch }}.tar.gz"
+    dest: "{{ micolab_caddy_cache_dir }}/caddy-{{ micolab_caddy_version }}-{{ micolab_caddy_arch }}.tar.gz"
+    checksum: "sha256:{{ micolab_caddy_checksums[micolab_caddy_arch] }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - micolab_caddy_artifact_src | length == 0
+    - micolab_caddy_allow_online_download | bool
+
+- name: Hash the staged Caddy artifact
+  ansible.builtin.stat:
+    path: "{{ micolab_caddy_cache_dir }}/caddy-{{ micolab_caddy_version }}-{{ micolab_caddy_arch }}.tar.gz"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: micolab_caddy_artifact_stat
+
+- name: Fail closed on a Caddy artifact checksum mismatch
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_artifact_stat.stat.exists
+      - micolab_caddy_artifact_stat.stat.checksum == (micolab_caddy_checksums[micolab_caddy_arch] | lower)
+    fail_msg: >-
+      The staged Caddy artifact does not match micolab_caddy_checksums for
+      {{ micolab_caddy_arch }}. Refusing to install an unpinned binary.
+
+- name: Create the pinned Caddy release directory
+  ansible.builtin.file:
+    path: "{{ micolab_caddy_install_root }}/{{ micolab_caddy_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Extract the pinned Caddy release
+  ansible.builtin.unarchive:
+    src: "{{ micolab_caddy_cache_dir }}/caddy-{{ micolab_caddy_version }}-{{ micolab_caddy_arch }}.tar.gz"
+    dest: "{{ micolab_caddy_install_root }}/{{ micolab_caddy_version }}"
+    remote_src: true
+    creates: "{{ micolab_caddy_install_root }}/{{ micolab_caddy_version }}/caddy"
+
+- name: Install the stock Caddy binary
+  ansible.builtin.copy:
+    src: "{{ micolab_caddy_install_root }}/{{ micolab_caddy_version }}/caddy"
+    dest: "{{ micolab_caddy_binary_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart Caddy
+
+- name: Confirm the installed Caddy version
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_caddy_binary_path }}"
+      - version
+  register: micolab_caddy_version_check
+  changed_when: false
+  check_mode: false
+
+- name: Fail closed on a Caddy binary version mismatch
+  ansible.builtin.assert:
+    that:
+      - ("v" ~ micolab_caddy_version) in micolab_caddy_version_check.stdout
+    fail_msg: >-
+      The installed Caddy binary does not report the pinned version
+      {{ micolab_caddy_version }}.
+
+- name: Choose the upstream trust directive supported by the pinned Caddy
+  ansible.builtin.set_fact:
+    micolab_caddy_upstream_trust_directive: >-
+      {{ 'tls_trust_pool file'
+         if ((micolab_caddy_version.split('.')[0] | int) > 2
+             or (((micolab_caddy_version.split('.')[0] | int) == 2)
+                 and ((micolab_caddy_version.split('.')[1] | int) >= 11)))
+         else 'tls_trusted_ca_certs' }}
+
+- name: Wait for the step-ca loopback listener before issuing certificates
+  ansible.builtin.wait_for:
+    host: "{{ micolab_caddy_ca_upstream_host }}"
+    port: "{{ micolab_caddy_ca_upstream_port }}"
+    timeout: "{{ micolab_caddy_backend_wait_timeout }}"
+  when: micolab_caddy_enable_ca | bool
+
+- name: Wait for the Technitium admin listener before enabling the DNS admin proxy
+  ansible.builtin.wait_for:
+    host: "{{ micolab_caddy_admin_upstream_host }}"
+    port: "{{ micolab_caddy_admin_upstream_port }}"
+    timeout: "{{ micolab_caddy_backend_wait_timeout }}"
+  when: micolab_caddy_enable_dns | bool
+
+- name: Gate the git site on real Forgejo health
+  ansible.builtin.uri:
+    url: "{{ micolab_caddy_forgejo_health_url }}"
+    status_code: 200
+    return_content: true
+    use_proxy: false
+  register: micolab_caddy_forgejo_health
+  until: micolab_caddy_forgejo_health.status == 200
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when: micolab_caddy_enable_git | bool
+
+- name: Require the exact step-ca ACME provisioner and directory
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_acme_provisioner == 'acme'
+      - micolab_caddy_acme_directory_required == 'https://127.0.0.1:4443/acme/acme/directory'
+      - micolab_caddy_acme_directory == 'https://127.0.0.1:4443/acme/acme/directory'
+    fail_msg: >-
+      Caddy must use the exact step-ca ACME endpoint
+      https://127.0.0.1:4443/acme/acme/directory with provisioner 'acme'.
+      Got provisioner '{{ micolab_caddy_acme_provisioner }}' and directory
+      '{{ micolab_caddy_acme_directory }}'. The role never adopts an
+      alternative live provisioner.
+
+- name: Set the exact effective ACME provisioner and directory
+  ansible.builtin.set_fact:
+    micolab_caddy_acme_provisioner_effective: "acme"
+    micolab_caddy_acme_directory_effective: "https://127.0.0.1:4443/acme/acme/directory"
+
+- name: Read the live step-ca provisioner list
+  ansible.builtin.uri:
+    url: "https://{{ micolab_caddy_ca_upstream_host }}:{{ micolab_caddy_ca_upstream_port }}/provisioners?limit=100"
+    ca_path: "{{ micolab_caddy_acme_trusted_roots }}"
+    status_code: 200
+    return_content: true
+    use_proxy: false
+    validate_certs: true
+  register: micolab_caddy_provisioners
+  until: micolab_caddy_provisioners.status == 200
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when: (micolab_caddy_enable_ca | bool) or (micolab_caddy_enable_dns | bool) or (micolab_caddy_enable_git | bool)
+
+- name: Identify the live ACME provisioners
+  ansible.builtin.set_fact:
+    micolab_caddy_acme_names: >-
+      {{ (((micolab_caddy_provisioners.json | default({})).get('provisioners', []))
+          | selectattr('type', 'equalto', 'ACME')
+          | map(attribute='name') | list) }}
+    micolab_caddy_provisioners_next: >-
+      {{ (micolab_caddy_provisioners.json | default({})).get('nextCursor', '') }}
+  when: (micolab_caddy_enable_ca | bool) or (micolab_caddy_enable_dns | bool) or (micolab_caddy_enable_git | bool)
+
+- name: Fail closed when the provisioner list is paginated
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_provisioners_next | length == 0
+    fail_msg: >-
+      step-ca returned more provisioners than fit in one page. Caddy requires
+      the exact 'acme' provisioner and never guesses among alternatives.
+  when: (micolab_caddy_enable_ca | bool) or (micolab_caddy_enable_dns | bool) or (micolab_caddy_enable_git | bool)
+
+- name: Require the live step-ca to publish the exact acme provisioner
+  ansible.builtin.assert:
+    that:
+      - "'acme' in micolab_caddy_acme_names"
+    fail_msg: >-
+      The live step-ca does not expose the required 'acme' ACME provisioner.
+      Caddy will not adopt a different live provisioner. Publish 'acme' from
+      roles/step_ca or fix the CA configuration.
+  when: (micolab_caddy_enable_ca | bool) or (micolab_caddy_enable_dns | bool) or (micolab_caddy_enable_git | bool)
+
+- name: Render the Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ micolab_caddy_config_file }}"
+    owner: root
+    group: "{{ micolab_caddy_group }}"
+    mode: "0640"
+  notify: Reload Caddy
+
+- name: Render the Caddy systemd unit
+  ansible.builtin.template:
+    src: caddy.service.j2
+    dest: "/etc/systemd/system/{{ micolab_caddy_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart Caddy
+
+- name: Start Caddy before the first validated reload
+  ansible.builtin.systemd:
+    name: "{{ micolab_caddy_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Apply deferred Caddy handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure Caddy is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ micolab_caddy_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for the Caddy service to become active
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ micolab_caddy_service_name }}"
+  register: micolab_caddy_active
+  until: micolab_caddy_active.stdout == 'active'
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Build the list of public sites whose certificates must be real
+  ansible.builtin.set_fact:
+    micolab_caddy_sites_effective: >-
+      {{ ([micolab_caddy_ca_host] if (micolab_caddy_enable_ca | bool) else [])
+         + ([micolab_caddy_dns_host] if (micolab_caddy_enable_dns | bool) else [])
+         + ([micolab_caddy_git_host] if (micolab_caddy_enable_git | bool) else []) }}
+
+- name: Health-gate each public site on a real step-ca certificate
+  ansible.builtin.shell: |
+    set -euo pipefail
+    echo | openssl s_client \
+      -connect 127.0.0.1:{{ micolab_caddy_https_port }} \
+      -servername {{ item }} \
+      -CAfile {{ micolab_caddy_acme_trusted_roots }} \
+      -verify_return_error \
+      -verify_hostname {{ item }} 2>/dev/null \
+    | openssl x509 -noout -checkend 0 -checkhost {{ item }} -issuer -subject
+  args:
+    executable: /bin/bash
+  loop: "{{ micolab_caddy_sites_effective }}"
+  register: micolab_caddy_certificate_gate
+  until: micolab_caddy_certificate_gate.rc == 0
+  retries: "{{ micolab_caddy_certificate_retries }}"
+  delay: "{{ micolab_caddy_certificate_delay }}"
+  changed_when: false
+  failed_when: >-
+    micolab_caddy_certificate_gate.rc != 0
+    or ('Caddy Local Authority' in micolab_caddy_certificate_gate.stdout)
+    or (micolab_caddy_expected_issuer_contains | length > 0
+        and micolab_caddy_expected_issuer_contains not in micolab_caddy_certificate_gate.stdout)
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Verify the step-ca HTTPS endpoint with root trust and IP SAN
+  ansible.builtin.shell: |
+    set -euo pipefail
+    code=$(curl --silent --show-error --max-time 10 \
+      --cacert "{{ micolab_caddy_acme_trusted_roots }}" \
+      -o /dev/null -w '%{http_code}' \
+      "https://{{ micolab_caddy_ca_upstream_host }}:{{ micolab_caddy_ca_upstream_port }}/")
+    test "$code" -ge 200 -a "$code" -lt 500
+  args:
+    executable: /bin/bash
+  register: micolab_caddy_ca_trust_gate
+  until: micolab_caddy_ca_trust_gate.rc == 0
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when:
+    - micolab_caddy_enable_ca | bool
+    - not ansible_check_mode
+
+- name: Health-gate the CA frontend through Caddy
+  ansible.builtin.shell: |
+    set -euo pipefail
+    code=$(curl --silent --show-error --max-time 10 \
+      --cacert "{{ micolab_caddy_acme_trusted_roots }}" \
+      --resolve "{{ micolab_caddy_ca_host }}:{{ micolab_caddy_https_port }}:127.0.0.1" \
+      -o /dev/null -w '%{http_code}' \
+      "https://{{ micolab_caddy_ca_host }}:{{ micolab_caddy_https_port }}{{ micolab_caddy_ca_probe_path }}")
+    test "$code" -ge 200 -a "$code" -lt 500
+  args:
+    executable: /bin/bash
+  register: micolab_caddy_ca_frontend_gate
+  until: micolab_caddy_ca_frontend_gate.rc == 0
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when:
+    - micolab_caddy_enable_ca | bool
+    - not ansible_check_mode
+
+- name: Health-gate the DNS admin proxy through Caddy
+  ansible.builtin.shell: |
+    set -euo pipefail
+    code=$(curl --silent --show-error --max-time 10 \
+      --cacert "{{ micolab_caddy_acme_trusted_roots }}" \
+      --resolve "{{ micolab_caddy_dns_host }}:{{ micolab_caddy_https_port }}:127.0.0.1" \
+      -o /dev/null -w '%{http_code}' \
+      "https://{{ micolab_caddy_dns_host }}:{{ micolab_caddy_https_port }}/")
+    # The Technitium admin console answers 200 or redirects to its login page.
+    # A 404 here means the routing fell back to something other than the admin
+    # proxy, so it is not acceptance.
+    test "$code" -ge 200 -a "$code" -lt 400
+  args:
+    executable: /bin/bash
+  register: micolab_caddy_dns_admin_gate
+  until: micolab_caddy_dns_admin_gate.rc == 0
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  check_mode: false
+  when:
+    - micolab_caddy_enable_dns | bool
+    - not ansible_check_mode
+
+# The DoH upstream on 8053 does not exist until technitium_tls runs after this
+# first Caddy pass. Verify the DNS certificate and admin route here, but defer
+# the real DoH probe until the encrypted-DNS readiness phase sets
+# micolab_caddy_verify_doh=true.
+- name: Verify DoH only when the encrypted DNS backend is ready
+  ansible.builtin.include_tasks: health_doh.yml
+  when:
+    - micolab_caddy_enable_dns | bool
+    - micolab_caddy_verify_doh | bool
+
+- name: Health-gate the git frontend through Caddy
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl --fail --silent --show-error --max-time 15 \
+      --cacert "{{ micolab_caddy_acme_trusted_roots }}" \
+      --resolve "{{ micolab_caddy_git_host }}:{{ micolab_caddy_https_port }}:127.0.0.1" \
+      "https://{{ micolab_caddy_git_host }}:{{ micolab_caddy_https_port }}/api/healthz"
+  args:
+    executable: /bin/bash
+  register: micolab_caddy_git_gate
+  until: micolab_caddy_git_gate.rc == 0
+  retries: "{{ micolab_caddy_health_retries }}"
+  delay: "{{ micolab_caddy_health_delay }}"
+  changed_when: false
+  failed_when: micolab_caddy_git_gate.rc != 0
+  check_mode: false
+  when:
+    - micolab_caddy_enable_git | bool
+    - not ansible_check_mode
+
+- name: Inspect listening sockets for a local-only Caddy admin endpoint
+  ansible.builtin.command:
+    argv:
+      - ss
+      - -lnt
+  register: micolab_caddy_sockets
+  changed_when: false
+  check_mode: false
+
+- name: Fail closed when the Caddy admin endpoint is not loopback-only
+  ansible.builtin.assert:
+    that:
+      - micolab_caddy_sockets.stdout_lines | select('search', '(127\\.0\\.0\\.1|\\[::1\\]):' ~ micolab_caddy_admin_port) | list | length > 0
+      - micolab_caddy_sockets.stdout_lines | select('search', '(0\\.0\\.0\\.0|\\[::\\]|\\*):' ~ micolab_caddy_admin_port) | list | length == 0
+    fail_msg: >-
+      The Caddy admin endpoint must listen only on loopback
+      {{ micolab_caddy_admin_host }}:{{ micolab_caddy_admin_port }}.

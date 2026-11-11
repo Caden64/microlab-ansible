@@ -1,0 +1,102 @@
+---
+# MicroLab step-ca role - public variable interface.
+#
+# Required inputs have no invented defaults. The role fails closed until the
+# inventory/vault supplies the pinned artifact metadata and offline-issued CA
+# material. See README.md and docs/ca-recovery.md.
+
+microlab_step_ca_enabled: true
+
+# Offline, pinned artifacts. Only file:// staging is accepted by default.
+# Archive names are:
+#   step-ca_linux_<version>_<arch>.tar.gz  (contains ./step-ca)
+#   step_linux_<version>_<arch>.tar.gz     (contains step_<version>/bin/step)
+microlab_step_ca_artifact_base_url: "file:///srv/microlab/artifacts"
+microlab_step_ca_allow_remote_artifacts: false
+microlab_step_ca_version: ""
+microlab_step_ca_checksums: {}
+microlab_step_cli_version: ""
+microlab_step_cli_checksums: {}
+
+microlab_step_ca_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+microlab_step_ca_install_root: /usr/local/lib/microlab
+microlab_step_ca_bin: /usr/local/bin/step-ca
+microlab_step_cli_bin: /usr/local/bin/step
+
+microlab_step_ca_user: step
+microlab_step_ca_group: step
+# The public root is trusted system-wide, so it stays root-owned. These are
+# separate variables so localhost integration tests can use a throwaway owner
+# without weakening the production default.
+microlab_step_ca_root_cert_owner: root
+microlab_step_ca_root_cert_group: root
+microlab_step_ca_home: /etc/step-ca
+microlab_step_ca_config_dir: /etc/step-ca/config
+microlab_step_ca_certs_dir: /etc/step-ca/certs
+microlab_step_ca_secrets_dir: /etc/step-ca/secrets
+microlab_step_ca_db_dir: /etc/step-ca/db
+
+microlab_step_ca_service_name: step-ca
+microlab_step_ca_address: "127.0.0.1:4443"
+microlab_step_ca_ca_url: "https://127.0.0.1:4443"
+microlab_step_ca_health_host: ca.microlab.hnh
+microlab_step_ca_health_port: 4443
+microlab_step_ca_common_name: ca.microlab.hnh
+microlab_step_ca_dns_names:
+  - ca.microlab.hnh
+  - 127.0.0.1
+microlab_step_ca_ipv6_enabled: false
+
+# Offline-issued material. The public root certificate is the only certificate
+# that is trusted from this path; the private root key must never be staged.
+# The three *_src paths are read by `copy` on the Ansible controller and must be
+# absolute so controller-side validation resolves the same file.
+microlab_step_ca_root_cert_src: ""
+microlab_step_ca_root_fingerprint_sha256: ""
+microlab_step_ca_intermediate_cert_src: ""
+microlab_step_ca_intermediate_key_src: ""
+microlab_step_ca_intermediate_key_password: ""
+
+# Provisioner configuration is generated only from this role's template.
+# The Technitium JWK material is produced by the offline CA workflow.
+# Caddy's ACME directory is /acme/acme/directory; the provisioner name is part
+# of the public interface and must remain exactly "acme".
+microlab_step_ca_caddy_provisioner_name: acme
+microlab_step_ca_technitium_provisioner_name: microlab-technitium
+microlab_step_ca_technitium_jwk_key: {}
+microlab_step_ca_technitium_jwk_encrypted_key: ""
+microlab_step_ca_cert_lifetime: "168h"
+microlab_step_ca_technitium_cert_names:
+  - dns.microlab.hnh
+
+# Authority-wide issuance policy. Self-hosted step-ca supports policy only at
+# the authority level; the Technitium name restriction is additionally applied
+# when minting its single-use enrollment token.
+microlab_step_ca_allowed_dns_names:
+  - "*.microlab.hnh"
+  - "microlab.hnh"
+microlab_step_ca_allowed_ip_addresses:
+  - "127.0.0.1"
+microlab_step_ca_allow_wildcard_names: false
+
+microlab_step_ca_install_public_trust: true
+# Canonical name is microlab_step_ca_trust_store_path. The repository's
+# existing site play uses the micolab_-prefixed alias; consume it when present.
+microlab_step_ca_trust_store_path: "{{ micolab_step_ca_trust_store_path | default('/usr/local/share/ca-certificates/microlab-root.crt') }}"
+
+# Explicit flags guard first deployment and configuration recovery. Neither
+# path ever runs `step ca init` or creates key material.
+microlab_step_ca_initial_deploy: false
+microlab_step_ca_recover_missing_config: false
+
+microlab_step_ca_healthcheck_enabled: true
+microlab_step_ca_healthcheck_retries: 18
+microlab_step_ca_healthcheck_delay: 5
+
+microlab_step_ca_db_type: badgerv2
+microlab_step_ca_disable_issued_at_check: false
+# This must remain false. Expired-certificate renewal is intentionally not
+# enabled anywhere in the MicroLab design.
+microlab_step_ca_allow_renewal_after_expiry: false

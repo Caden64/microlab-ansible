@@ -1,0 +1,14 @@
+---
+# Copy this file outside group_vars/ (or to group_vars/microlab_management/vault.yml
+# after filling it) and encrypt with ansible-vault:
+#
+#   cp inventories/vault.yml.example inventories/example/group_vars/microlab_management/vault.yml
+#   ansible-vault encrypt inventories/example/group_vars/microlab_management/vault.yml
+#   # add this to inventories/example/group_vars/microlab_management/main.yml:
+#   #   micolab_technitium_admin_password: "{{ vault_micolab_technitium_admin_password }}"
+#
+# Or use an inline vaulted value:
+#   ansible-vault encrypt_string --name micolab_technitium_admin_password
+#
+# The password must not be the upstream bootstrap value "admin".
+vault_micolab_technitium_admin_password: REPLACE_WITH_VAULTED_ADMIN_PASSWORD

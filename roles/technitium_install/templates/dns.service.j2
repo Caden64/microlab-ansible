@@ -1,0 +1,56 @@
+[Unit]
+Description=Technitium DNS Server
+Documentation=https://technitium.com/dns/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ micolab_technitium_user }}
+Group={{ micolab_technitium_group }}
+SyslogIdentifier=technitium-dns
+WorkingDirectory={{ micolab_technitium_install_dir }}
+UMask=0077
+
+# These environment variables are read only when webservice.config is absent.
+# They close the upstream first-run window in which the admin API listens on
+# every interface. technitium_dns persists the same loopback binding through
+# the API afterwards.
+Environment="DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES={{ micolab_technitium_admin_bind_address }}"
+Environment="DNS_SERVER_WEB_SERVICE_HTTP_PORT={{ micolab_technitium_admin_port }}"
+Environment="DNS_SERVER_DOMAIN={{ micolab_dns_primary_ns }}"
+Environment="DNS_SERVER_RECURSION=UseSpecifiedNetworkACL"
+Environment="DNS_SERVER_RECURSION_NETWORK_ACL={{ (micolab_admin_cidrs + micolab_client_cidrs + micolab_dns_recursion_allow_cidrs + (micolab_admin_cidrs_v6 + micolab_client_cidrs_v6 if micolab_dns_ipv6_enabled | bool else [])) | unique | join(',') }}"
+Environment="DOTNET_CLI_TELEMETRY_OPTOUT=1"
+Environment="DOTNET_NOLOGO=1"
+
+ExecStart={{ micolab_dotnet_binary }} {{ micolab_technitium_install_dir }}/DnsServerApp.dll {{ micolab_technitium_config_dir }}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Native systemd hardening. The install tree is read-only; only the config
+# directory (zones, settings, credentials) and log directory are writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths={{ micolab_technitium_config_dir }} {{ micolab_technitium_log_dir }}
+RemoveIPC=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

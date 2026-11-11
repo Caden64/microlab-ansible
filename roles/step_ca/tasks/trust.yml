@@ -1,0 +1,35 @@
+---
+- name: Install the public root certificate into the managed trust store
+  ansible.builtin.copy:
+    src: "{{ microlab_step_ca_root_cert_dest }}"
+    dest: "{{ microlab_step_ca_trust_store_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Update CA trust
+
+- name: Flush trust handlers before verifying public trust
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the public root is trusted by the system bundle
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - verify
+      - -CAfile
+      - /etc/ssl/certs/ca-certificates.crt
+      - "{{ microlab_step_ca_root_cert_dest }}"
+  register: microlab_step_ca_public_trust
+  changed_when: false
+  failed_when: false
+
+- name: Require managed public trust enrollment to succeed
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_public_trust.rc == 0
+      - "'OK' in microlab_step_ca_public_trust.stdout"
+    fail_msg: >-
+      The public root was not enrolled in the system trust bundle. Verify
+      update-ca-certificates ran successfully.
+    quiet: true

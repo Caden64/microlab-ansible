@@ -1,0 +1,6 @@
+#!/bin/sh
+# Replace only the MicroLab table; never flush the administrator's other
+# nftables tables. nft -c has already validated this file before apply.
+set -eu
+/usr/sbin/nft delete table inet {{ micolab_firewall_table }} 2>/dev/null || true
+exec /usr/sbin/nft -f {{ micolab_baseline_firewall_dir }}/firewall.nft

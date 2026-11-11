@@ -1,0 +1,53 @@
+---
+# Deploy the offline-issued material. This file is included only for the
+# explicit initial-deploy transition. Normal redeploys and configuration-only
+# recovery never replace durable material or the database.
+
+- name: Deploy the public root certificate
+  ansible.builtin.copy:
+    src: "{{ microlab_step_ca_root_cert_src }}"
+    dest: "{{ microlab_step_ca_root_cert_dest }}"
+    owner: "{{ microlab_step_ca_root_cert_owner }}"
+    group: "{{ microlab_step_ca_root_cert_group }}"
+    mode: "0644"
+  notify: Restart step-ca
+
+- name: Deploy the intermediate certificate
+  ansible.builtin.copy:
+    src: "{{ microlab_step_ca_intermediate_cert_src }}"
+    dest: "{{ microlab_step_ca_intermediate_cert_dest }}"
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "0644"
+  notify: Restart step-ca
+
+- name: Deploy the encrypted intermediate private key
+  ansible.builtin.copy:
+    src: "{{ microlab_step_ca_intermediate_key_src }}"
+    dest: "{{ microlab_step_ca_intermediate_key_dest }}"
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "0600"
+  no_log: true
+  diff: false
+  notify: Restart step-ca
+
+- name: Deploy the intermediate key password file
+  ansible.builtin.copy:
+    content: "{{ microlab_step_ca_intermediate_key_password }}\n"
+    dest: "{{ microlab_step_ca_password_dest }}"
+    owner: "{{ microlab_step_ca_user }}"
+    group: "{{ microlab_step_ca_group }}"
+    mode: "0600"
+  no_log: true
+  diff: false
+  notify: Restart step-ca
+
+- name: Validate the material that was just deployed
+  ansible.builtin.include_tasks: verify_material.yml
+  vars:
+    microlab_step_ca_verify_root: "{{ microlab_step_ca_root_cert_dest }}"
+    microlab_step_ca_verify_crt: "{{ microlab_step_ca_intermediate_cert_dest }}"
+    microlab_step_ca_verify_key: "{{ microlab_step_ca_intermediate_key_dest }}"
+    microlab_step_ca_verify_password_arg: "file:{{ microlab_step_ca_password_dest }}"
+    microlab_step_ca_verify_label: deployed

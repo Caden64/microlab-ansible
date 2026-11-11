@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+"""MicroLab Technitium DNS TLS renewal helper.
+
+This helper is intentionally independent of the Ansible controller. A local
+systemd timer runs it, serialized by a file lock. It:
+
+  * validates the enrolled leaf certificate (names, chain, EKU, key match);
+  * refuses to renew an expired certificate (re-enrollment is a protected,
+    manual recovery operation);
+  * renews early through step-ca using the X5C token flow (`--mtls=false`);
+  * builds a temporary PKCS#12, validates it, and atomically publishes it with
+    restrictive ownership;
+  * retries publication and API reconciliation when the PEM and the PFX served
+    by Technitium differ, even after a successful renewal;
+  * verifies the live TLS 853 certificate fingerprint, SANs, and server-only
+    EKU, and reports failures/retries.
+
+Only Python's standard library and the openssl/step binaries are used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fcntl
+import json
+import logging
+import os
+import re
+import shlex
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+LOG = logging.getLogger("technitium-tls-renew")
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_CONFIG = 2
+EXIT_REENROLL = 3
+EXIT_PUBLICATION = 4
+EXIT_ALERT = 5
+EXIT_LOCKED = 75
+
+
+class RenewalError(Exception):
+    """Base error for this helper."""
+
+
+class ReEnrollmentRequired(RenewalError):
+    """The certificate is missing, expired, or otherwise cannot be renewed."""
+
+
+class PublicationError(RenewalError):
+    """The PFX or the live TLS endpoint could not be brought in sync."""
+
+
+class LockBusy(RenewalError):
+    """Another renewal helper invocation holds the lock."""
+
+
+@dataclasses.dataclass
+class Config:
+    ca_url: str
+    ca_root: str
+    cert_path: str
+    key_path: str
+    pfx_path: str
+    pfx_password_file: str
+    cert_name: str
+    api_url: str
+    api_token: str
+    ca_chain: str = ""
+    technitium_config_dir: str = "/etc/dns"
+    pfx_owner: str = "root"
+    pfx_group: str = "root"
+    pfx_mode: str = "0640"
+    renew_before: int = 72 * 3600
+    alert_before: int = 24 * 3600
+    publication_retries: int = 3
+    # Technitium's file watcher checks for a changed mtime every 60 seconds.
+    # 14 sleeps * 5 seconds = 70 seconds before the final attempt.
+    verify_retries: int = 15
+    verify_delay: float = 5.0
+    lock_file: str = "/var/lib/technitium-tls/renew.lock"
+    status_file: str = "/var/lib/technitium-tls/status.json"
+    dot_port: int = 853
+    step_bin: str = "/usr/local/bin/step"
+    openssl_bin: str = "openssl"
+    allow_ipv6: bool = False
+
+
+@dataclasses.dataclass
+class CertificateInfo:
+    fingerprint: str
+    serial: str
+    not_before: float
+    not_after: float
+    dns_sans: tuple[str, ...]
+    ip_sans: tuple[str, ...]
+    eku: tuple[str, ...]
+
+    def remaining(self, now: Optional[float] = None) -> float:
+        return self.not_after - (time.time() if now is None else now)
+
+
+def parse_duration(value: str) -> int:
+    """Parse a compact duration such as 72h, 30m, or 1h30m into seconds."""
+
+    value = str(value).strip()
+    if not value:
+        raise RenewalError("empty duration")
+    if not re.fullmatch(r"(?:\d+[smhd])+", value):
+        raise RenewalError(f"invalid duration {value!r}; use e.g. 72h or 30m")
+    total = 0
+    for match in re.finditer(r"(\d+)([smhd])", value):
+        amount = int(match.group(1))
+        unit = match.group(2)
+        total += amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return total
+
+
+def technitium_api_path(path: str, config_dir: str) -> str:
+    """Return a path in the exact form Technitium stores and returns.
+
+    ``DnsServerCore/LogManager.cs`` resolves relative paths against the config
+    folder and ``ConvertToRelativePath`` strips that folder again.  Posting an
+    absolute path for a file inside the config folder therefore never matches
+    the stored value, causing perpetual settings drift.  Normalising both sides
+    keeps the API comparison idempotent while still supporting paths outside
+    the config folder (which Technitium keeps absolute).
+    """
+
+    if not path:
+        return ""
+    config_dir = os.path.abspath(config_dir)
+    absolute = os.path.abspath(
+        path if os.path.isabs(path) else os.path.join(config_dir, path)
+    )
+    if absolute == config_dir:
+        return absolute
+    try:
+        relative = os.path.relpath(absolute, config_dir)
+    except ValueError:
+        return absolute
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return absolute
+    return relative.replace(os.sep, "/")
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    """Read a shell-style KEY=VALUE file without executing it."""
+
+    values: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise RenewalError(f"{path}:{line_number}: expected KEY=VALUE")
+            key, _, raw_value = line.partition("=")
+            key = key.strip()
+            try:
+                parsed = shlex.split(raw_value, comments=True, posix=True)
+            except ValueError as exc:
+                raise RenewalError(f"{path}:{line_number}: {exc}") from exc
+            if not key or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                raise RenewalError(f"{path}:{line_number}: invalid key {key!r}")
+            values[key] = parsed[0] if parsed else ""
+    return values
+
+
+def load_config(path: str) -> Config:
+    values = read_env_file(path)
+    required = [
+        "CA_URL",
+        "CA_ROOT",
+        "CERT_PATH",
+        "KEY_PATH",
+        "PFX_PATH",
+        "PFX_PASSWORD_FILE",
+        "CERT_NAME",
+        "API_URL",
+        "API_TOKEN",
+    ]
+    missing = [key for key in required if not values.get(key)]
+    if missing:
+        raise RenewalError(f"{path}: missing required keys: {', '.join(missing)}")
+    return Config(
+        ca_url=values["CA_URL"],
+        ca_root=values["CA_ROOT"],
+        cert_path=values["CERT_PATH"],
+        key_path=values["KEY_PATH"],
+        pfx_path=values["PFX_PATH"],
+        pfx_password_file=values["PFX_PASSWORD_FILE"],
+        cert_name=values["CERT_NAME"],
+        api_url=values["API_URL"],
+        api_token=values["API_TOKEN"],
+        ca_chain=values.get("CA_CHAIN", ""),
+        technitium_config_dir=values.get("TECHNITIUM_CONFIG_DIR", "/etc/dns"),
+        pfx_owner=values.get("PFX_OWNER", "root"),
+        pfx_group=values.get("PFX_GROUP", "root"),
+        pfx_mode=values.get("PFX_MODE", "0640"),
+        renew_before=parse_duration(values.get("RENEW_BEFORE", "72h")),
+        alert_before=parse_duration(values.get("ALERT_BEFORE", "24h")),
+        publication_retries=int(values.get("PUBLICATION_RETRIES", "3")),
+        verify_retries=int(values.get("VERIFY_RETRIES", "15")),
+        verify_delay=float(values.get("VERIFY_DELAY", "5")),
+        lock_file=values.get("LOCK_FILE", "/var/lib/technitium-tls/renew.lock"),
+        status_file=values.get("STATUS_FILE", "/var/lib/technitium-tls/status.json"),
+        dot_port=int(values.get("DOT_PORT", "853")),
+        step_bin=values.get("STEP_BIN", "/usr/local/bin/step"),
+        openssl_bin=values.get("OPENSSL_BIN", "openssl"),
+        allow_ipv6=values.get("ALLOW_IPV6", "false").lower() == "true",
+    )
+
+
+def read_password(cfg: Config) -> str:
+    try:
+        with open(cfg.pfx_password_file, "r", encoding="utf-8") as handle:
+            password = handle.readline().rstrip("\n")
+    except OSError as exc:
+        raise RenewalError(f"cannot read PFX password file: {exc}") from exc
+    if not password:
+        raise RenewalError("PFX password file is empty")
+    return password
+
+
+def run(
+    argv: Iterable[str],
+    *,
+    input_text: Optional[str] = None,
+    timeout: int = 60,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    cmd = [str(part) for part in argv]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RenewalError(f"command failed to run ({cmd[0]}): {exc}") from exc
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise RenewalError(
+            f"command failed ({cmd[0]}, rc={proc.returncode}): "
+            f"{detail[-1] if detail else 'no output'}"
+        )
+    return proc
+
+
+_EKU_ALIASES = {
+    "tls web server authentication": "serverAuth",
+    "serverauth": "serverAuth",
+    "tls web client authentication": "clientAuth",
+    "clientauth": "clientAuth",
+    "code signing": "codeSigning",
+    "codesigning": "codeSigning",
+    "e-mail protection": "emailProtection",
+    "email protection": "emailProtection",
+    "emailprotection": "emailProtection",
+    "time stamping": "timeStamping",
+    "timestamping": "timeStamping",
+    "ocsp signing": "OCSPSigning",
+    "ocspsigning": "OCSPSigning",
+    "any extended key usage": "anyExtendedKeyUsage",
+    "anyextendedkeyusage": "anyExtendedKeyUsage",
+}
+
+
+def normalize_eku(values: Iterable[str]) -> tuple[str, ...]:
+    """Normalise OpenSSL EKU names to their short certificate identifiers."""
+
+    normalized: list[str] = []
+    for raw in values:
+        token = " ".join(str(raw).split()).strip()
+        if not token:
+            continue
+        token = re.sub(r"(?i)^x509v3 extended key usage:\s*", "", token)
+        token = re.sub(r"(?i)^critical\s*", "", token).strip()
+        if not token:
+            continue
+        normalized.append(_EKU_ALIASES.get(token.lower(), token))
+    return tuple(sorted(set(normalized)))
+
+
+def parse_eku_output(text: str) -> tuple[str, ...]:
+    """Parse ``openssl x509 -ext extendedKeyUsage`` output."""
+
+    flattened = " ".join(text.split())
+    if ":" in flattened:
+        flattened = flattened.partition(":")[2]
+    flattened = re.sub(r"(?i)^critical\s*", "", flattened).strip()
+    if not flattened or "no extensions" in flattened.lower():
+        return ()
+    return normalize_eku(part for part in flattened.split(",") if part.strip())
+
+
+def require_server_only_eku(eku: Iterable[str], context: str = "certificate") -> None:
+    """Require exactly serverAuth; a Technitium leaf must not be client-capable."""
+
+    values = set(eku)
+    if "clientAuth" in values:
+        raise RenewalError(
+            f"{context} has the clientAuth EKU; the Technitium leaf must be "
+            f"server-only (exactly serverAuth), got {sorted(values)}"
+        )
+    if values != {"serverAuth"}:
+        raise RenewalError(
+            f"{context} EKU must be exactly serverAuth; got {sorted(values)}"
+        )
+
+
+def cert_info(path: str, openssl: str = "openssl") -> CertificateInfo:
+    if not Path(path).is_file():
+        raise RenewalError(f"certificate not found: {path}")
+    proc = run(
+        [
+            openssl,
+            "x509",
+            "-in",
+            path,
+            "-noout",
+            "-fingerprint",
+            "-sha256",
+            "-serial",
+            "-startdate",
+            "-enddate",
+        ]
+    )
+    fields: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+    try:
+        fingerprint_key = next(
+            key for key in fields if key.lower().endswith("fingerprint")
+        )
+        fingerprint = fields[fingerprint_key].replace(":", "").upper()
+        serial = fields["serial"].replace(":", "").upper()
+        not_before = ssl.cert_time_to_seconds(fields["notBefore"])
+        not_after = ssl.cert_time_to_seconds(fields["notAfter"])
+    except (KeyError, StopIteration, ValueError) as exc:
+        raise RenewalError(f"could not parse certificate fields from {path}") from exc
+
+    san_proc = run(
+        [openssl, "x509", "-in", path, "-noout", "-ext", "subjectAltName"],
+        check=False,
+    )
+    san_text = " ".join(san_proc.stdout.split())
+    dns_sans = tuple(re.findall(r"DNS:([^,\s]+)", san_text))
+    ip_sans = tuple(re.findall(r"IP Address:([^,\s]+)", san_text))
+
+    eku_proc = run(
+        [openssl, "x509", "-in", path, "-noout", "-ext", "extendedKeyUsage"],
+        check=False,
+    )
+    eku = parse_eku_output(eku_proc.stdout)
+
+    return CertificateInfo(
+        fingerprint=fingerprint,
+        serial=serial,
+        not_before=not_before,
+        not_after=not_after,
+        dns_sans=dns_sans,
+        ip_sans=ip_sans,
+        eku=eku,
+    )
+
+
+def validate_certificate(cfg: Config, now: Optional[float] = None) -> CertificateInfo:
+    """Validate the enrolled leaf before and after renewal."""
+
+    now = time.time() if now is None else now
+    if not Path(cfg.cert_path).is_file():
+        raise ReEnrollmentRequired(f"leaf certificate is missing: {cfg.cert_path}")
+    if not Path(cfg.key_path).is_file():
+        raise ReEnrollmentRequired(f"private key is missing: {cfg.key_path}")
+    if not Path(cfg.ca_root).is_file():
+        raise RenewalError(f"CA root is missing: {cfg.ca_root}")
+
+    info = cert_info(cfg.cert_path, cfg.openssl_bin)
+    if info.not_after <= now:
+        raise ReEnrollmentRequired(
+            f"certificate expired at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(info.not_after))}"
+        )
+    if info.not_before > now + 300:
+        raise RenewalError("certificate is not yet valid")
+
+    # Check the EKU before the generic sslserver purpose check so a
+    # client-only or mixed-EKU leaf gets the specific, actionable error.
+    require_server_only_eku(info.eku, "enrolled certificate")
+
+    verify_argv = [
+        cfg.openssl_bin,
+        "verify",
+        "-CAfile",
+        cfg.ca_root,
+    ]
+    if cfg.ca_chain and Path(cfg.ca_chain).is_file():
+        verify_argv.extend(["-untrusted", cfg.ca_chain])
+    verify_argv.extend(["-purpose", "sslserver", cfg.cert_path])
+    verify = run(verify_argv, check=False)
+    if verify.returncode != 0 or "OK" not in verify.stdout:
+        detail = (verify.stdout + verify.stderr).strip()
+        raise RenewalError(f"certificate chain/purpose verification failed: {detail}")
+
+    if cfg.cert_name not in info.dns_sans:
+        raise RenewalError(
+            f"certificate is not valid for {cfg.cert_name}; SANs={info.dns_sans}"
+        )
+    unexpected_dns = sorted(set(info.dns_sans) - {cfg.cert_name})
+    if unexpected_dns:
+        raise RenewalError(f"certificate has unexpected DNS SANs: {unexpected_dns}")
+    if info.ip_sans:
+        if not cfg.allow_ipv6 and any(":" in ip for ip in info.ip_sans):
+            raise RenewalError("certificate has an IPv6 SAN without explicit IPv6 support")
+        raise RenewalError(f"certificate has unexpected IP SANs: {info.ip_sans}")
+
+    cert_pub = run(
+        [cfg.openssl_bin, "x509", "-in", cfg.cert_path, "-noout", "-pubkey"]
+    ).stdout
+    key_pub = run(
+        [cfg.openssl_bin, "pkey", "-in", cfg.key_path, "-pubout"]
+    ).stdout
+    if cert_pub.strip() != key_pub.strip():
+        raise RenewalError("certificate and private key do not match")
+
+    return info
+
+
+def renewal_due(info: CertificateInfo, renew_before: int, now: Optional[float] = None) -> bool:
+    now = time.time() if now is None else now
+    if info.not_after <= now:
+        raise ReEnrollmentRequired("certificate is already expired")
+    return info.not_after - now <= renew_before
+
+
+def renew_if_due(
+    cfg: Config,
+    info: CertificateInfo,
+    *,
+    now: Optional[float] = None,
+    renew_fn: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Renew only before expiry. Expired certificates require manual recovery."""
+
+    now = time.time() if now is None else now
+    if info.not_after <= now:
+        raise ReEnrollmentRequired(
+            "certificate is expired; renewal after expiry is disabled by design"
+        )
+    if info.not_after - now > cfg.renew_before:
+        LOG.info(
+            "renewal not due: %.1f hours remaining (threshold %.1f hours)",
+            (info.not_after - now) / 3600,
+            cfg.renew_before / 3600,
+        )
+        return False
+    LOG.info(
+        "renewal due: %.1f hours remaining (threshold %.1f hours)",
+        (info.not_after - now) / 3600,
+        cfg.renew_before / 3600,
+    )
+    if renew_fn is not None:
+        renew_fn()
+    else:
+        run(
+            [
+                cfg.step_bin,
+                "ca",
+                "renew",
+                "--mtls=false",
+                "--force",
+                "--ca-url",
+                cfg.ca_url,
+                "--root",
+                cfg.ca_root,
+                cfg.cert_path,
+                cfg.key_path,
+            ],
+            timeout=120,
+        )
+    return True
+
+
+def served_pfx_fingerprint(cfg: Config) -> Optional[str]:
+    if not Path(cfg.pfx_path).is_file():
+        return None
+    password = read_password(cfg)
+    fd, pem_path = tempfile.mkstemp(
+        prefix=".served-", suffix=".pem", dir=str(Path(cfg.pfx_path).parent)
+    )
+    os.close(fd)
+    try:
+        run(
+            [
+                cfg.openssl_bin,
+                "pkcs12",
+                "-in",
+                cfg.pfx_path,
+                "-clcerts",
+                "-nokeys",
+                "-passin",
+                f"file:{cfg.pfx_password_file}",
+                "-out",
+                pem_path,
+            ],
+            timeout=30,
+        )
+        return cert_info(pem_path, cfg.openssl_bin).fingerprint
+    finally:
+        _unlink(pem_path)
+
+
+def publication_needed(cfg: Config, info: CertificateInfo) -> bool:
+    try:
+        served = served_pfx_fingerprint(cfg)
+    except RenewalError as exc:
+        # A corrupt PFX or a rotated password must be recovered by publishing
+        # a fresh validated PFX, not by blocking renewal forever.
+        LOG.warning("cannot read the served PFX (%s); republishing", exc)
+        return True
+    return served != info.fingerprint
+
+
+def publish_if_needed(cfg: Config, info: CertificateInfo) -> None:
+    """Avoid rewriting an already-matching PFX, while still allowing retry."""
+
+    if publication_needed(cfg, info):
+        LOG.info("PFX differs from the PEM; publishing a validated replacement")
+        publish_pfx(cfg)
+    else:
+        LOG.info("PFX already matches the PEM; not rewriting it")
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _resolve_ids(cfg: Config) -> tuple[int, int]:
+    import grp
+    import pwd
+
+    try:
+        uid = pwd.getpwnam(cfg.pfx_owner).pw_uid
+        gid = grp.getgrnam(cfg.pfx_group).gr_gid
+    except KeyError as exc:
+        raise RenewalError(f"PFX owner/group does not exist: {exc}") from exc
+    return uid, gid
+
+
+def publish_pfx(cfg: Config) -> None:
+    """Build, validate, and atomically replace the PFX.
+
+    The temporary PFX is validated before it is renamed into place. Readers
+    therefore never observe a partial file or a PKCS#12 that lacks the key,
+    certificate, or expected chain.
+    """
+
+    if not Path(cfg.cert_path).is_file() or not Path(cfg.key_path).is_file():
+        raise ReEnrollmentRequired("cannot publish PFX without certificate and key")
+    if not Path(cfg.pfx_password_file).is_file():
+        raise RenewalError(f"PFX password file is missing: {cfg.pfx_password_file}")
+    pfx_dir = Path(cfg.pfx_path).parent
+    pfx_dir.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_pfx = tempfile.mkstemp(prefix=".technitium-", suffix=".pfx", dir=pfx_dir)
+    os.close(fd)
+    fd, tmp_cert = tempfile.mkstemp(prefix=".technitium-", suffix=".crt", dir=pfx_dir)
+    os.close(fd)
+    fd, tmp_key = tempfile.mkstemp(prefix=".technitium-", suffix=".key", dir=pfx_dir)
+    os.close(fd)
+    try:
+        cmd = [
+            cfg.openssl_bin,
+            "pkcs12",
+            "-export",
+            "-out",
+            tmp_pfx,
+            "-inkey",
+            cfg.key_path,
+            "-in",
+            cfg.cert_path,
+            "-name",
+            cfg.cert_name,
+            "-passout",
+            f"file:{cfg.pfx_password_file}",
+        ]
+        if cfg.ca_chain and Path(cfg.ca_chain).is_file():
+            cmd.extend(["-certfile", cfg.ca_chain])
+        run(cmd, timeout=60)
+
+        run(
+            [
+                cfg.openssl_bin,
+                "pkcs12",
+                "-in",
+                tmp_pfx,
+                "-noout",
+                "-passin",
+                f"file:{cfg.pfx_password_file}",
+            ],
+            timeout=30,
+        )
+        run(
+            [
+                cfg.openssl_bin,
+                "pkcs12",
+                "-in",
+                tmp_pfx,
+                "-clcerts",
+                "-nokeys",
+                "-passin",
+                f"file:{cfg.pfx_password_file}",
+                "-out",
+                tmp_cert,
+            ],
+            timeout=30,
+        )
+        run(
+            [
+                cfg.openssl_bin,
+                "pkcs12",
+                "-in",
+                tmp_pfx,
+                "-nocerts",
+                "-nodes",
+                "-passin",
+                f"file:{cfg.pfx_password_file}",
+                "-out",
+                tmp_key,
+            ],
+            timeout=30,
+        )
+        pfx_cert = cert_info(tmp_cert, cfg.openssl_bin)
+        pem_cert = cert_info(cfg.cert_path, cfg.openssl_bin)
+        if pfx_cert.fingerprint != pem_cert.fingerprint:
+            raise RenewalError("published PFX certificate does not match the PEM")
+        key_material = Path(tmp_key).read_text(encoding="utf-8", errors="replace")
+        if "PRIVATE KEY" not in key_material:
+            raise RenewalError("published PFX does not contain a private key")
+
+        mode = int(cfg.pfx_mode, 8)
+        os.chmod(tmp_pfx, mode)
+        if os.geteuid() == 0:
+            uid, gid = _resolve_ids(cfg)
+            os.chown(tmp_pfx, uid, gid)
+        os.replace(tmp_pfx, cfg.pfx_path)
+        os.chmod(cfg.pfx_path, mode)
+        try:
+            dir_fd = os.open(pfx_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        LOG.info("atomically published PFX %s", cfg.pfx_path)
+    finally:
+        _unlink(tmp_pfx)
+        _unlink(tmp_cert)
+        _unlink(tmp_key)
+
+
+def dot_settings_body(cfg: Config) -> dict[str, str]:
+    """Build the Technitium settings body with its canonical PFX path."""
+
+    return {
+        "enableDnsOverTls": "true",
+        "dnsOverTlsPort": str(cfg.dot_port),
+        "dnsTlsCertificatePath": technitium_api_path(
+            cfg.pfx_path, cfg.technitium_config_dir
+        ),
+        "dnsTlsCertificatePassword": read_password(cfg),
+    }
+
+
+def apply_dot_settings(cfg: Config) -> None:
+    """Reconcile Technitium's DoT PFX settings.
+
+    Technitium only calls ``SetDnsTlsCertificate`` when the path or password
+    string differs; re-posting an unchanged pair does not force a reload. A new
+    PFX is therefore picked up by its 60-second mtime watcher, and callers must
+    give live verification a budget longer than that interval.
+    """
+
+    body = urllib.parse.urlencode(dot_settings_body(cfg)).encode("utf-8")
+    request = urllib.request.Request(
+        cfg.api_url.rstrip("/") + "/api/settings/set",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {cfg.api_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RenewalError(f"Technitium settings API returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RenewalError(f"Technitium settings API is unreachable: {exc.reason}") from exc
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RenewalError("Technitium settings API returned non-JSON") from exc
+    if parsed.get("status") != "ok":
+        raise RenewalError(
+            "Technitium settings API rejected TLS reload: "
+            f"{parsed.get('errorMessage', 'unknown error')}"
+        )
+
+
+def validate_live_certificate(
+    cfg: Config, info: CertificateInfo, now: Optional[float] = None
+) -> None:
+    """Validate the certificate actually served on DoT, not just its serial."""
+
+    current = time.time() if now is None else now
+    if info.not_after <= current:
+        raise RenewalError(
+            "live DoT certificate is expired at "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(info.not_after))}"
+        )
+    if info.not_before > current + 300:
+        raise RenewalError("live DoT certificate is not yet valid")
+    if set(info.dns_sans) != {cfg.cert_name}:
+        raise RenewalError(
+            f"live DoT certificate SANs {info.dns_sans} do not equal "
+            f"the enrolled name {cfg.cert_name}"
+        )
+    if info.ip_sans:
+        raise RenewalError(
+            f"live DoT certificate has unexpected IP SANs: {info.ip_sans}"
+        )
+    require_server_only_eku(info.eku, "live DoT certificate")
+
+
+def live_tls_certificate(cfg: Config) -> CertificateInfo:
+    """Read and validate the leaf served by native DoT on 127.0.0.1:853."""
+
+    proc = run(
+        [
+            cfg.openssl_bin,
+            "s_client",
+            "-connect",
+            f"127.0.0.1:{cfg.dot_port}",
+            "-servername",
+            cfg.cert_name,
+            "-verify_hostname",
+            cfg.cert_name,
+            "-CAfile",
+            cfg.ca_root,
+            "-verify_return_error",
+            "-showcerts",
+        ],
+        input_text="\n",
+        timeout=25,
+        check=False,
+    )
+    output = proc.stdout + "\n" + proc.stderr
+    if "Verify return code: 0 (ok)" not in output:
+        detail = [
+            line
+            for line in output.splitlines()
+            if "Verify return code" in line or "verify error" in line.lower()
+        ]
+        raise RenewalError(
+            "live DoT TLS verification failed: "
+            + ("; ".join(detail) if detail else "no verification result")
+        )
+    match = re.search(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        proc.stdout,
+        re.DOTALL,
+    )
+    if not match:
+        raise RenewalError("live DoT endpoint did not return a certificate")
+    fd, tmp_cert = tempfile.mkstemp(prefix=".live-", suffix=".crt")
+    os.close(fd)
+    try:
+        Path(tmp_cert).write_text(match.group(0) + "\n", encoding="ascii")
+        info = cert_info(tmp_cert, cfg.openssl_bin)
+        validate_live_certificate(cfg, info)
+        return info
+    finally:
+        _unlink(tmp_cert)
+
+
+def live_tls_fingerprint(cfg: Config) -> str:
+    return live_tls_certificate(cfg).fingerprint
+
+
+def verify_live_certificate(
+    cfg: Config,
+    expected_fingerprint: str,
+    *,
+    retries: Optional[int] = None,
+    delay: Optional[float] = None,
+    live_fn: Optional[Callable[[], str]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> str:
+    """Poll live DoT until it serves the expected certificate fingerprint.
+
+    The default budget (15 attempts, 5 seconds apart) spans 70 seconds so it
+    covers Technitium's 60-second certificate file watcher instead of giving up
+    after roughly ten seconds.  The whole budget belongs to one publication
+    attempt, so a stale watcher does not trigger repeated PFX rewrites.
+    """
+
+    attempts = max(1, int(cfg.verify_retries if retries is None else retries))
+    wait = max(0.0, float(cfg.verify_delay if delay is None else delay))
+    last: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            fingerprint = (live_fn or (lambda: live_tls_fingerprint(cfg)))()
+            if fingerprint != expected_fingerprint:
+                raise RenewalError(
+                    f"live DoT fingerprint {fingerprint} != published "
+                    f"fingerprint {expected_fingerprint}"
+                )
+            LOG.info(
+                "live DoT certificate fingerprint matches the published certificate"
+            )
+            return fingerprint
+        except RenewalError as exc:
+            last = exc
+            LOG.warning(
+                "live DoT verification attempt %d/%d failed: %s", attempt, attempts, exc
+            )
+            if attempt < attempts:
+                sleep_fn(wait)
+    raise PublicationError(
+        f"live DoT verification failed after {attempts} attempts: {last}"
+    )
+
+
+def ensure_publication(
+    cfg: Config,
+    expected_fingerprint: str,
+    *,
+    publish_fn: Optional[Callable[[], None]] = None,
+    apply_fn: Optional[Callable[[], None]] = None,
+    live_fn: Optional[Callable[[], str]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
+    """Publish, reconcile, and verify; retry only after a full live budget.
+
+    The live check uses the complete ``verify_retries``/``verify_delay`` budget
+    inside each publication attempt, which covers Technitium's 60-second file
+    watcher. A caller that passes ``publish_if_needed`` therefore waits for the
+    watcher to pick up an already-correct PFX instead of rewriting it on every
+    five-second poll.
+    """
+
+    attempts = max(1, int(cfg.publication_retries))
+    last: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if publish_fn is not None:
+                publish_fn()
+            else:
+                publish_pfx(cfg)
+            if apply_fn is not None:
+                apply_fn()
+            else:
+                apply_dot_settings(cfg)
+            verify_live_certificate(
+                cfg,
+                expected_fingerprint,
+                live_fn=live_fn,
+                sleep_fn=sleep_fn,
+            )
+            if attempt > 1:
+                LOG.warning(
+                    "publication succeeded after %d attempts (%d retries)",
+                    attempt,
+                    attempt - 1,
+                )
+            return attempt
+        except RenewalError as exc:
+            last = exc
+            LOG.error(
+                "publication attempt %d/%d failed: %s", attempt, attempts, exc
+            )
+            if attempt < attempts:
+                sleep_fn(min(max(0.0, float(cfg.verify_delay)), 5.0))
+    raise PublicationError(
+        f"PFX publication/live verification failed after {attempts} attempts: {last}"
+    )
+
+
+def acquire_lock(path: str) -> int:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise LockBusy(f"another renewal helper holds {path}") from exc
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    return fd
+
+
+def release_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def write_status(cfg: Config, status: dict) -> None:
+    if not cfg.status_file:
+        return
+    path = Path(cfg.status_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".status-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(status, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o0640)
+        os.replace(tmp, path)
+    finally:
+        _unlink(tmp)
+
+
+def _config_error(message: str) -> int:
+    LOG.error("%s", message)
+    return EXIT_CONFIG
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default="/etc/technitium-tls/renewal.env",
+        help="path to the renewal environment file",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="validate the enrolled certificate and exit without renewing",
+    )
+    parser.add_argument(
+        "--publish-only",
+        action="store_true",
+        help="publish/verify the existing certificate without renewing",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="verify the live DoT certificate for the existing certificate",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, RenewalError) as exc:
+        return _config_error(str(exc))
+
+    if args.check_only:
+        try:
+            info = validate_certificate(cfg)
+        except ReEnrollmentRequired as exc:
+            LOG.error("protected re-enrollment required: %s", exc)
+            return EXIT_REENROLL
+        except RenewalError as exc:
+            LOG.error("certificate validation failed: %s", exc)
+            return EXIT_FAILURE
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "serial": info.serial,
+                    "not_after": info.not_after,
+                    "dns_sans": list(info.dns_sans),
+                },
+                sort_keys=True,
+            )
+        )
+        return EXIT_OK
+
+    lock_fd: Optional[int] = None
+    try:
+        try:
+            lock_fd = acquire_lock(cfg.lock_file)
+        except LockBusy as exc:
+            LOG.warning("%s; skipping this invocation", exc)
+            return EXIT_LOCKED
+
+        try:
+            info = cert_info(cfg.cert_path, cfg.openssl_bin)
+        except RenewalError as exc:
+            LOG.error("protected re-enrollment required: %s", exc)
+            return EXIT_REENROLL
+        if info.not_after <= time.time():
+            LOG.error(
+                "certificate is expired; renewal after expiry is disabled. "
+                "Use the protected Technitium re-enrollment procedure."
+            )
+            return EXIT_REENROLL
+
+        try:
+            info = validate_certificate(cfg)
+        except ReEnrollmentRequired as exc:
+            LOG.error("protected re-enrollment required: %s", exc)
+            return EXIT_REENROLL
+        except RenewalError as exc:
+            LOG.error("certificate validation failed: %s", exc)
+            return EXIT_FAILURE
+
+        if args.verify_only:
+            try:
+                verify_live_certificate(cfg, info.fingerprint)
+            except PublicationError as exc:
+                LOG.error("%s", exc)
+                return EXIT_PUBLICATION
+            return EXIT_OK
+
+        if args.publish_only:
+            try:
+                attempts = ensure_publication(
+                    cfg,
+                    info.fingerprint,
+                    publish_fn=lambda: publish_if_needed(cfg, info),
+                )
+            except PublicationError as exc:
+                LOG.error("%s", exc)
+                return EXIT_PUBLICATION
+            status = {
+                "status": "ok",
+                "serial": info.serial,
+                "fingerprint": info.fingerprint,
+                "publication_attempts": attempts,
+                "publication_retries": attempts - 1,
+            }
+            write_status(cfg, status)
+            return EXIT_OK
+
+        renewed = False
+        try:
+            renewed = renew_if_due(cfg, info)
+        except ReEnrollmentRequired as exc:
+            LOG.error("protected re-enrollment required: %s", exc)
+            return EXIT_REENROLL
+        except RenewalError as exc:
+            LOG.error("renewal failed: %s", exc)
+            return EXIT_FAILURE
+
+        if renewed:
+            try:
+                info = validate_certificate(cfg)
+            except ReEnrollmentRequired as exc:
+                LOG.error("post-renewal certificate requires re-enrollment: %s", exc)
+                return EXIT_REENROLL
+            except RenewalError as exc:
+                LOG.error("post-renewal certificate validation failed: %s", exc)
+                return EXIT_FAILURE
+
+        try:
+            attempts = ensure_publication(
+                cfg,
+                info.fingerprint,
+                publish_fn=lambda: publish_if_needed(cfg, info),
+            )
+        except PublicationError as exc:
+            LOG.error("%s", exc)
+            return EXIT_PUBLICATION
+
+        remaining = info.not_after - time.time()
+        status = {
+            "status": "ok",
+            "serial": info.serial,
+            "fingerprint": info.fingerprint,
+            "renewed": renewed,
+            "publication_attempts": attempts,
+            "publication_retries": attempts - 1,
+            "remaining_seconds": int(remaining),
+            "not_after": info.not_after,
+        }
+        if remaining <= cfg.alert_before:
+            status["status"] = "expiration-alert"
+            write_status(cfg, status)
+            LOG.error(
+                "certificate expires in %.1f hours (alert threshold %.1f hours)",
+                remaining / 3600,
+                cfg.alert_before / 3600,
+            )
+            return EXIT_ALERT
+        write_status(cfg, status)
+        LOG.info("renewal/publication cycle complete; serial=%s", info.serial)
+        return EXIT_OK
+    finally:
+        if lock_fd is not None:
+            release_lock(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

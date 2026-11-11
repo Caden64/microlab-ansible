@@ -1,0 +1,244 @@
+---
+- name: Resolve and validate verification targets and names
+  ansible.builtin.include_tasks: targets.yml
+
+- name: Fail when the management host is also a challenge workload
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname not in (groups[micolab_verify_challenge_group] | default([]))
+    fail_msg: >-
+      The dedicated management host must be separate from challenge
+      workloads. Remove it from {{ micolab_verify_challenge_group }}.
+
+- name: Require verification inputs and local tooling
+  ansible.builtin.assert:
+    that:
+      - (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo | length > 0)
+      - (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo is not search('\s'))
+      - micolab_verify_tls_root | length > 0
+    fail_msg: >-
+      Set micolab_verify_git_repo to a disposable Forgejo test repository path
+      (for example owner/test-repo) and micolab_verify_tls_root to the public
+      step-ca root certificate. Git acceptance is a real HTTPS and SSH
+      clone/push, not a placeholder. If the inputs are unavailable, set
+      micolab_verify_accept_unexecuted_git_acceptance=true and accept a
+      clearly noncomplete result.
+
+- name: Check required verification commands
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - "command -v -- {{ item }}"
+  loop:
+    - dig
+    - curl
+    - openssl
+    - git
+    - ss
+    - systemctl
+    - python3
+  register: micolab_verify_command_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail when a required verification command is absent
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_command_check.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      Install the documented verification dependency bundle (dnsutils, curl,
+      openssl, git, iproute2, systemd). Do not weaken checks to work around a
+      missing tool.
+
+- name: Inspect the public step-ca root certificate
+  ansible.builtin.stat:
+    path: "{{ micolab_verify_tls_root }}"
+    follow: true
+  register: micolab_verify_root_stat
+
+- name: Fail closed when the public root certificate is missing
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_root_stat.stat.exists
+      - micolab_verify_root_stat.stat.isreg
+    fail_msg: >-
+      micolab_verify_tls_root must point to the public step-ca root
+      certificate PEM. Verification never uses insecure skip-verify.
+
+- name: Run authoritative A, AAAA, and NS record checks
+  ansible.builtin.include_tasks: dns_records.yml
+
+- name: Verify a real certificate for every public site
+  ansible.builtin.shell: |
+    set -euo pipefail
+    echo | openssl s_client \
+      -connect 127.0.0.1:{{ micolab_verify_https_port }} \
+      -servername {{ item }} \
+      -CAfile {{ micolab_verify_tls_root }} \
+      -verify_return_error \
+      -verify_hostname {{ item }} 2>/dev/null \
+    | openssl x509 -noout -checkend 0 -checkhost {{ item }} -issuer -subject
+  args:
+    executable: /bin/bash
+  loop: "{{ micolab_verify_public_sites }}"
+  register: micolab_verify_certificates
+  until: micolab_verify_certificates.rc == 0
+  retries: "{{ micolab_verify_command_retries }}"
+  delay: "{{ micolab_verify_command_delay }}"
+  changed_when: false
+  failed_when: >-
+    micolab_verify_certificates.rc != 0
+    or ('Caddy Local Authority' in micolab_verify_certificates.stdout)
+  check_mode: false
+
+- name: Run local DoH and DoT checks
+  ansible.builtin.include_tasks: encrypted_dns.yml
+
+- name: Run real HTTPS and SSH clone/push acceptance
+  ansible.builtin.include_tasks: git_acceptance.yml
+
+- name: Inspect loopback listeners
+  ansible.builtin.command:
+    argv:
+      - ss
+      - -lnt
+  register: micolab_verify_sockets
+  changed_when: false
+  check_mode: false
+
+- name: Require every internal service to bind only loopback
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_sockets.stdout_lines | select('search', '(127\.0\.0\.1|\[::1\]):' ~ (item.value | string)) | list | length > 0
+      - micolab_verify_sockets.stdout_lines | select('search', '(0\.0\.0\.0|\[::\]|\*):' ~ (item.value | string)) | list | length == 0
+    fail_msg: >-
+      {{ item.key }} on port {{ item.value }} is not loopback-only. Forgejo, CA,
+      DNS, and the Caddy admin API must not be reachable on a wildcard address.
+
+  loop: "{{ micolab_verify_loopback_ports | dict2items }}"
+  when: item.key != 'dns_tls' or (micolab_verify_enable_dot | bool)
+- name: Check systemd enablement for reboot persistence
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-enabled
+      - "{{ item }}"
+  loop: "{{ micolab_verify_required_services }}"
+  register: micolab_verify_enabled
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require all services to be enabled
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim == 'enabled'
+    fail_msg: >-
+      Service {{ item.item }} is not enabled. The static check cannot prove a
+      reboot, but a disabled unit is a definite reboot-persistence failure.
+
+  loop: "{{ micolab_verify_enabled.results }}"
+
+- name: Run real external-vantage ACL acceptance
+  ansible.builtin.include_tasks: external_acl.yml
+
+- name: Record each external ACL probe outcome for the acceptance file
+  ansible.builtin.set_fact:
+    micolab_verify_external_acl_recorded: >-
+      {{ (micolab_verify_external_acl_recorded | default([])) + [{
+           'name': item.item.name | default(item.item.check ~ '-' ~ item.item.expect),
+           'host': item.item.host,
+           'check': item.item.check,
+           'expect': item.item.expect,
+           'source_address': item.item.source_address | default(''),
+           'rc': item.rc | default(1),
+           'stdout': item.stdout | default('')
+         }] }}
+  loop: "{{ micolab_verify_external_acl_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default(item.item.check ~ '-' ~ item.item.expect) }}"
+
+- name: Compute the overall verification acceptance state
+  ansible.builtin.set_fact:
+    micolab_verify_overall_state: >-
+      {{ 'complete'
+         if (micolab_verify_git_accept_state == 'executed'
+             and micolab_verify_external_acl_state == 'executed')
+         else 'noncomplete' }}
+
+- name: Ensure the acceptance record directory exists
+  ansible.builtin.file:
+    path: "{{ micolab_verify_acceptance_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Write the machine-readable verification acceptance record
+  ansible.builtin.copy:
+    dest: "{{ micolab_verify_acceptance_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ {
+           'schema': 1,
+           'generated_at': ansible_date_time.iso8601 | default(''),
+           'overall': micolab_verify_overall_state,
+           'git': {
+             'state': micolab_verify_git_accept_state,
+             'visibility': micolab_verify_git_visibility,
+             'repo': micolab_verify_git_repo,
+             'https_clone_push': micolab_verify_git_accept_state,
+             'ssh_clone_push': micolab_verify_git_accept_state,
+             'https_cleanup': micolab_verify_git_https_cleanup | default('unknown'),
+             'ssh_cleanup': micolab_verify_git_ssh_cleanup | default('unknown'),
+             'credentials_removed': micolab_verify_git_credentials_removed | default(false),
+             'workspace_removed': micolab_verify_git_workspace_removed | default(false),
+             'override': micolab_verify_accept_unexecuted_git_acceptance | bool
+           },
+           'external_acl': {
+             'state': micolab_verify_external_acl_state,
+             'override': micolab_verify_accept_unverified_external_acl | bool,
+             'expected_cidrs': {
+               'dns_admin': micolab_verify_admin_cidrs,
+               'ca_management': micolab_verify_management_cidrs,
+               'doh': micolab_verify_dns_client_cidrs,
+               'dot': micolab_verify_dns_client_cidrs
+             },
+             'probes': micolab_verify_external_acl_probes,
+             'dot_evidence': {
+               'allowed': 'fixture answer from bound source_address',
+               'denied_fixture_zone_query_acl': micolab_verify_dns_fixture_name,
+               'denied_global_recursion_acl': micolab_verify_dns_recursion_denied_name,
+               'recursion_acl_config_readback': 'technitium_dns role (not this role)'
+             },
+             'probe_results': micolab_verify_external_acl_recorded | default([])
+           },
+           'dns': {
+             'service_domain': micolab_verify_service_domain,
+             'authoritative_zone': micolab_verify_zone,
+             'ns': micolab_verify_ns_name,
+             'doh': 'executed',
+             'dot': micolab_verify_dot_state
+           },
+           'unexecuted': [
+             'reboot persistence (static systemd enablement only)',
+             'offline ACME renewal',
+             'backup restore acceptance'
+           ]
+         } | to_nice_json }}
+
+- name: Report executed and noncomplete acceptance checks
+  ansible.builtin.debug:
+    msg:
+      - "OVERALL ACCEPTANCE: {{ micolab_verify_overall_state }}"
+      - "EXECUTED: DNS A ({{ micolab_verify_service_fqdns | join(', ') }}), NS {{ micolab_verify_zone }} -> {{ micolab_verify_ns_name }}, no-implicit-AAAA, DoH, DoT ({{ micolab_verify_dot_state }}), loopback binds, and systemd enablement."
+      - "GIT ACCEPTANCE: {{ micolab_verify_git_accept_state }} (HTTPS and SSH clone/push; visibility {{ micolab_verify_git_visibility }})."
+      - "EXTERNAL ACL ACCEPTANCE: {{ micolab_verify_external_acl_state }} (dns_admin, ca_management, doh, dot; allowed and denied probes)."
+      - "OVERRIDE: git={{ micolab_verify_accept_unexecuted_git_acceptance | bool }}, external_acl={{ micolab_verify_accept_unverified_external_acl | bool }}. Any true override is noncomplete, not a pass."
+      - "UNEXECUTED: reboot persistence was checked only statically; no reboot was performed."
+      - "UNEXECUTED: offline ACME renewal was not exercised; it requires a CA outage or renewal-window manipulation."
+      - "UNEXECUTED: backup restore acceptance was not exercised; use an isolated target and docs/backup-restore.md. restore.yml defaults to dry-run."

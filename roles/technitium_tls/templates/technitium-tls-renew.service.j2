@@ -1,0 +1,29 @@
+[Unit]
+Description=MicroLab Technitium DNS TLS renewal and live verification
+Documentation=file:{{ microlab_technitium_renewal_env_file }}
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={{ microlab_technitium_cert_path }}
+ConditionPathExists={{ microlab_technitium_pfx_password_file }}
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart={{ microlab_technitium_helper_path }} --config {{ microlab_technitium_renewal_env_file }}
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle
+StateDirectory={{ microlab_technitium_state_directory_name }}
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ microlab_technitium_cert_dir }}
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true

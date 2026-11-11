@@ -1,0 +1,165 @@
+; Managed by Ansible. Do not edit on the host.
+; Secrets are supplied as durable values and rendered with no_log/diff:false.
+APP_NAME = MicroLab Forgejo
+APP_SLOGAN = Git for MicroLab
+RUN_USER = {{ micolab_forgejo_user }}
+RUN_MODE = prod
+WORK_PATH = {{ micolab_forgejo_data_dir }}
+
+[server]
+PROTOCOL = http
+HTTP_ADDR = {{ micolab_forgejo_http_addr }}
+HTTP_PORT = {{ micolab_forgejo_http_port }}
+DOMAIN = {{ micolab_forgejo_domain }}
+ROOT_URL = {{ micolab_forgejo_root_url }}
+APP_DATA_PATH = {{ micolab_forgejo_app_data_path }}
+SSH_DOMAIN = {{ micolab_forgejo_ssh_domain }}
+SSH_PORT = {{ micolab_forgejo_ssh_port }}
+SSH_USER = {{ micolab_forgejo_user }}
+SSH_ROOT_PATH = {{ micolab_forgejo_home }}/.ssh
+START_SSH_SERVER = false
+DISABLE_SSH = false
+SSH_CREATE_AUTHORIZED_KEYS_FILE = true
+SSH_ALLOW_UNEXPECTED_AUTHORIZED_KEYS = false
+SSH_AUTHORIZED_PRINCIPALS_ALLOW = off
+SSH_CREATE_AUTHORIZED_PRINCIPALS_FILE = false
+LFS_START_SERVER = {{ 'true' if (micolab_forgejo_lfs_enabled | bool) else 'false' }}
+LFS_JWT_SIGNING_ALGORITHM = HS256
+LFS_JWT_SECRET = {{ micolab_forgejo_lfs_jwt_secret }}
+OFFLINE_MODE = true
+DISABLE_ROUTER_LOG = true
+ENABLE_GZIP = true
+LANDING_PAGE = login
+PER_WRITE_TIMEOUT = 60s
+PER_WRITE_PER_KB_TIMEOUT = 30s
+
+[database]
+DB_TYPE = sqlite3
+PATH = {{ micolab_forgejo_db_path }}
+SQLITE_TIMEOUT = 60000
+SQLITE_JOURNAL_MODE = WAL
+
+[repository]
+ROOT = {{ micolab_forgejo_repo_root }}
+SCRIPT_TYPE = bash
+DEFAULT_BRANCH = main
+DEFAULT_PRIVATE = last
+DISABLED_REPO_UNITS = repo.actions
+DEFAULT_REPO_UNITS = repo.code,repo.releases,repo.issues,repo.pulls,repo.wiki,repo.projects,repo.packages
+ALLOW_ADOPTION_OF_UNADOPTED_REPOSITORIES = false
+ALLOW_DELETION_OF_UNADOPTED_REPOSITORIES = false
+DISABLE_HTTP_GIT = false
+USE_COMPAT_SSH_URI = false
+
+[repository.upload]
+ENABLED = true
+TEMP_PATH = {{ micolab_forgejo_app_data_path }}/tmp/uploads
+FILE_MAX_SIZE = {{ micolab_forgejo_upload_max_mb }}
+MAX_FILES = {{ micolab_forgejo_upload_max_files }}
+
+[repository.release]
+DEFAULT_PAGING_NUM = 10
+
+[attachment]
+ENABLED = true
+PATH = {{ micolab_forgejo_app_data_path }}/attachments
+MAX_SIZE = {{ micolab_forgejo_attachment_max_mb }}
+MAX_FILES = {{ micolab_forgejo_upload_max_files }}
+
+[lfs]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/lfs
+
+[avatar]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/avatars
+
+[repo-avatar]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/repo-avatars
+
+[repo-archive]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/repo-archive
+
+[packages]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/packages
+
+[storage]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}
+
+[storage.actions_log]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/actions_log
+
+[storage.artifacts]
+STORAGE_TYPE = local
+PATH = {{ micolab_forgejo_app_data_path }}/actions_artifacts
+
+[security]
+INSTALL_LOCK = {{ 'true' if (micolab_forgejo_install_lock | bool) else 'false' }}
+SECRET_KEY = {{ micolab_forgejo_secret_key }}
+INTERNAL_TOKEN = {{ micolab_forgejo_internal_token }}
+PASSWORD_HASH_ALGO = pbkdf2
+MIN_PASSWORD_LENGTH = 12
+REVERSE_PROXY_LIMIT = 1
+# Only the local Caddy listener is trusted. Caddy overwrites X-Real-IP and
+# X-Forwarded-For, so a client cannot spoof its source address.
+REVERSE_PROXY_TRUSTED_PROXIES = 127.0.0.1/32,::1/128
+DISABLE_GIT_HOOKS = true
+ONLY_ALLOW_PUSH_IF_GITEA_ENVIRONMENT_SET = true
+IMPORT_LOCAL_PATHS = false
+
+[service]
+DISABLE_REGISTRATION = {{ 'true' if (micolab_forgejo_disable_registration | bool) else 'false' }}
+ENABLE_BASIC_AUTHENTICATION = true
+ENABLE_INTERNAL_SIGNIN = true
+REQUIRE_SIGNIN_VIEW = false
+DEFAULT_ALLOW_CREATE_ORGANIZATION = true
+DEFAULT_USER_IS_RESTRICTED = false
+
+[oauth2]
+ENABLED = false
+JWT_SIGNING_ALGORITHM = HS256
+JWT_SECRET = {{ micolab_forgejo_jwt_secret }}
+
+[actions]
+ENABLED = {{ 'true' if (micolab_forgejo_actions_enabled | bool) else 'false' }}
+
+[queue]
+TYPE = level
+DATADIR = {{ micolab_forgejo_app_data_path }}/queues
+LENGTH = 100000
+BATCH_LENGTH = 20
+
+[indexer]
+ISSUE_INDEXER_TYPE = bleve
+ISSUE_INDEXER_PATH = {{ micolab_forgejo_app_data_path }}/indexers/issues.bleve
+REPO_INDEXER_ENABLED = false
+
+[session]
+PROVIDER = file
+PROVIDER_CONFIG = {{ micolab_forgejo_app_data_path }}/sessions
+COOKIE_SECURE = true
+SAME_SITE = lax
+
+[log]
+MODE = console
+LEVEL = info
+
+[metrics]
+ENABLED = false
+
+[api]
+ENABLE_SWAGGER = false
+
+[federation]
+ENABLED = false
+
+[ssh.minimum_key_sizes]
+ED25519 = 256
+ECDSA = 256
+RSA = 3071
+DSA = -1

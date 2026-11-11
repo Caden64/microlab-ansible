@@ -1,0 +1,90 @@
+---
+# Local DoH and DoT checks. Requires tasks/targets.yml. The probed name is
+# git.<micolab_verify_service_domain>, never a name built from the zone apex.
+
+- name: Set the HTTPS URL suffix
+  ansible.builtin.set_fact:
+    micolab_verify_https_suffix: >-
+      {{ '' if (micolab_verify_https_port | int == 443)
+         else (':' ~ micolab_verify_https_port) }}
+
+- name: Set the expected probe address
+  ansible.builtin.set_fact:
+    micolab_verify_probe_ip: >-
+      {{ micolab_verify_expected_a_records[micolab_verify_probe_fqdn]
+         | default(micolab_verify_mgmt_ip) }}
+
+- name: Query DoH through Caddy with a real DNS JSON response
+  ansible.builtin.command:
+    argv:
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - --max-time
+      - "15"
+      - --cacert
+      - "{{ micolab_verify_tls_root }}"
+      - --resolve
+      - "{{ micolab_verify_doh_host }}:{{ micolab_verify_https_port }}:127.0.0.1"
+      - -H
+      - "accept: application/dns-json"
+      - "https://{{ micolab_verify_doh_host }}{{ micolab_verify_https_suffix }}{{ micolab_verify_doh_path }}?name={{ micolab_verify_probe_fqdn }}&type=A"
+  register: micolab_verify_doh
+  until: micolab_verify_doh.rc == 0
+  retries: "{{ micolab_verify_command_retries }}"
+  delay: "{{ micolab_verify_command_delay }}"
+  changed_when: false
+  failed_when: micolab_verify_doh.rc != 0
+  check_mode: false
+
+- name: Parse the DoH answer
+  ansible.builtin.set_fact:
+    micolab_verify_doh_json: "{{ micolab_verify_doh.stdout | from_json }}"
+
+- name: Require the DoH answer to preserve the query and address
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_doh_json.Status | default(1) == 0
+      - micolab_verify_doh_json.Answer is defined
+      - micolab_verify_probe_ip in (micolab_verify_doh_json.Answer | selectattr('type', 'equalto', 1) | map(attribute='data') | list)
+    fail_msg: >-
+      DoH at the exact /dns-query path did not return the expected A answer.
+      This also catches query-string stripping and a wrong reverse proxy.
+
+- name: Set initial DoT test state
+  ansible.builtin.set_fact:
+    micolab_verify_dot_state: "{{ 'disabled' if not (micolab_verify_enable_dot | bool) else 'pending' }}"
+
+- name: Query DoT with strict certificate and hostname validation
+  ansible.builtin.script: >-
+    dot_probe.py
+    --connect-host {{ micolab_verify_dot_connect_host }}
+    --port {{ micolab_verify_dot_port }}
+    --server-name {{ micolab_verify_dot_host }}
+    --ca-file {{ micolab_verify_tls_root }}
+    --name {{ micolab_verify_probe_fqdn }}
+    --expect {{ micolab_verify_probe_ip }}
+    --timeout 10
+  register: micolab_verify_dot
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: micolab_verify_enable_dot | bool
+
+- name: Require a real certificate-validated DoT A answer
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_dot.rc | default(1) == 0
+    fail_msg: >-
+      DoT did not return the expected A record over a certificate-validated TLS
+      connection. {{ micolab_verify_dot.stderr | default('') }} Do not disable
+      verification to make this pass.
+  when: micolab_verify_enable_dot | bool
+
+- name: Record successful DoT execution
+  ansible.builtin.set_fact:
+    micolab_verify_dot_state: "executed"
+  when:
+    - micolab_verify_enable_dot | bool
+    - micolab_verify_dot.rc | default(1) == 0

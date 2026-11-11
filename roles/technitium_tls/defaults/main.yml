@@ -1,0 +1,82 @@
+---
+# MicroLab Technitium DNS TLS role - public variable interface.
+#
+# Required secrets have no invented defaults. The role fails closed if they are
+# absent. See README.md and docs/certificate-renewal.md.
+
+microlab_technitium_enabled: true
+
+microlab_technitium_service_name: dns
+microlab_technitium_service_user: dns-server
+microlab_technitium_service_group: dns-server
+microlab_technitium_step_bin: /usr/local/bin/step
+
+microlab_technitium_ca_url: "https://127.0.0.1:4443"
+microlab_technitium_ca_root_cert: /etc/step-ca/certs/root_ca.crt
+microlab_technitium_ca_chain_cert: /etc/step-ca/certs/intermediate_ca.crt
+
+microlab_technitium_cert_name: dns.microlab.hnh
+# Technitium resolves a relative dnsTlsCertificatePath against its config
+# folder and stores in-folder paths relative again. Both the role and the
+# helper normalise through this value so comparisons are idempotent.
+microlab_technitium_config_dir: "{{ micolab_technitium_config_dir | default('/etc/dns') }}"
+# Canonical names use microlab_. The repository's existing shared interface
+# uses micolab_-prefixed path/password aliases; consume them when present.
+microlab_technitium_cert_dir: "{{ (micolab_technitium_tls_cert_path | default('/etc/dns/tls/dns.pfx')) | dirname }}"
+microlab_technitium_cert_path: "{{ microlab_technitium_cert_dir }}/dns.crt"
+microlab_technitium_key_path: "{{ micolab_technitium_tls_key_path | default(microlab_technitium_cert_dir ~ '/dns.key') }}"
+microlab_technitium_pfx_path: "{{ micolab_technitium_tls_cert_path | default(microlab_technitium_cert_dir ~ '/dns.pfx') }}"
+microlab_technitium_pfx_password_file: "{{ microlab_technitium_cert_dir }}/pfx.pass"
+
+# Protected inventory/vault inputs.
+microlab_technitium_pfx_password: "{{ micolab_technitium_tls_cert_password | default('') }}"
+microlab_technitium_api_token: "{{ micolab_technitium_api_token | default('') }}"
+# A short-lived, single-use token from
+# /usr/local/sbin/step-ca-technitium-token on the CA host. Only required when
+# the certificate is being enrolled for the first time or after protected
+# re-enrollment.
+microlab_technitium_enrollment_token: "{{ micolab_technitium_enrollment_token | default('') }}"
+
+microlab_technitium_api_url: "http://127.0.0.1:5380"
+microlab_technitium_doh_port: 8053
+# The shared micolab_technitium_doh_port is the public Caddy DoH port, not the
+# local Technitium backend; it is intentionally not consumed here.
+microlab_technitium_dot_port: "{{ micolab_technitium_dot_port | default(853) }}"
+microlab_technitium_doh_real_ip_header: X-Real-IP
+microlab_technitium_doh_reverse_proxy_acl:
+  - "127.0.0.1/32"
+
+# The PFX is readable only by the Technitium service group; the PEM/key and
+# password stay root-only. The helper runs as root so it can atomically publish.
+microlab_technitium_pfx_owner: root
+microlab_technitium_pfx_group: "{{ microlab_technitium_service_group }}"
+microlab_technitium_pfx_mode: "0640"
+
+microlab_technitium_renew_before: "72h"
+microlab_technitium_alert_before: "24h"
+microlab_technitium_publication_retries: 3
+# Technitium checks dnsTlsCertificatePath for a changed mtime on a 60-second
+# timer (TLS_CERTIFICATE_UPDATE_TIMER_INTERVAL). The live check must outlast a
+# full watcher interval: 14 sleeps * 5s = 70s before the final attempt.
+microlab_technitium_verify_retries: 15
+microlab_technitium_verify_delay: 5
+
+microlab_technitium_helper_path: /usr/local/sbin/technitium-tls-renew
+microlab_technitium_renewal_env_file: /etc/technitium-tls/renewal.env
+# Durable lock and status. A systemd RuntimeDirectory would be removed when
+# this oneshot unit stops, letting a timer run acquire a new lock inode while a
+# manual run still owns the old one. StateDirectory keeps one inode and one
+# status file across runs and reboots.
+microlab_technitium_state_directory_name: technitium-tls
+microlab_technitium_state_dir: "/var/lib/{{ microlab_technitium_state_directory_name }}"
+microlab_technitium_lock_file: "{{ microlab_technitium_state_dir }}/renew.lock"
+microlab_technitium_status_file: "{{ microlab_technitium_state_dir }}/status.json"
+microlab_technitium_service_unit: technitium-tls-renew.service
+microlab_technitium_timer_unit: technitium-tls-renew.timer
+
+microlab_technitium_healthcheck_retries: 12
+microlab_technitium_healthcheck_delay: 5
+
+# No AAAA or IPv6 SAN is published unless this is explicitly enabled as part
+# of a reviewed IPv6 design.
+microlab_technitium_ipv6_enabled: false

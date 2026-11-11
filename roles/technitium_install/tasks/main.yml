@@ -1,0 +1,384 @@
+---
+- name: Select the pinned Technitium artifact
+  ansible.builtin.set_fact:
+    micolab_technitium_artifact_candidates: >-
+      {{ micolab_staged_artifacts
+         | selectattr('name', 'equalto', 'technitium')
+         | list }}
+    micolab_dotnet_artifact_candidates: >-
+      {{ micolab_staged_artifacts
+         | selectattr('name', 'equalto', 'dotnet-aspnetcore-runtime')
+         | list }}
+
+- name: Require exactly one Technitium artifact and one runtime artifact
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_artifact_candidates | length == 1
+      - micolab_dotnet_artifact_candidates | length == 1
+    fail_msg: >-
+      micolab_staged_artifacts must contain exactly one 'technitium' entry and
+      exactly one 'dotnet-aspnetcore-runtime' entry. No download is attempted.
+    quiet: true
+
+- name: Bind artifact facts
+  ansible.builtin.set_fact:
+    micolab_technitium_artifact: "{{ micolab_technitium_artifact_candidates[0] }}"
+    micolab_dotnet_artifact: "{{ micolab_dotnet_artifact_candidates[0] }}"
+
+- name: Require matching version pins
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_artifact.version == micolab_technitium_version
+      - micolab_dotnet_artifact.version is match(micolab_technitium_runtime_major ~ '\..+')
+    fail_msg: >-
+      The staged artifact versions do not match micolab_technitium_version and
+      the declared .NET runtime major. Refusing to install an unpinned runtime.
+    quiet: true
+
+- name: Create the Technitium service group
+  ansible.builtin.group:
+    name: "{{ micolab_technitium_group }}"
+    system: true
+    state: present
+
+- name: Create the unprivileged Technitium service user
+  ansible.builtin.user:
+    name: "{{ micolab_technitium_user }}"
+    group: "{{ micolab_technitium_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    state: present
+
+- name: Create persistent and staging directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ micolab_technitium_install_dir | dirname }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_technitium_install_dir }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_technitium_config_dir }}", owner: "{{ micolab_technitium_user }}", group: "{{ micolab_technitium_group }}", mode: "0750" }
+    - { path: "{{ micolab_technitium_log_dir }}", owner: "{{ micolab_technitium_user }}", group: "{{ micolab_technitium_group }}", mode: "0750" }
+    - { path: "{{ micolab_technitium_stage_dir }}", owner: root, group: root, mode: "0750" }
+    - { path: "{{ micolab_dotnet_install_dir }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ micolab_dotnet_binary | dirname }}", owner: root, group: root, mode: "0755" }
+
+- name: Check the installed release marker
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_release_marker }}"
+  register: micolab_technitium_release_marker_stat
+
+- name: Read the installed release marker
+  ansible.builtin.slurp:
+    src: "{{ micolab_technitium_release_marker }}"
+  register: micolab_technitium_release_marker_slurp
+  when: micolab_technitium_release_marker_stat.stat.exists
+
+- name: Check the installed application binaries
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_install_dir }}/{{ item }}"
+  loop:
+    - DnsServerApp.dll
+    - DnsServerCore.dll
+  register: micolab_technitium_app_binaries
+
+- name: Determine whether the Technitium release needs installation
+  ansible.builtin.set_fact:
+    micolab_technitium_current_release: >-
+      {{ (micolab_technitium_release_marker_slurp.content | b64decode | trim)
+         if micolab_technitium_release_marker_stat.stat.exists else '' }}
+  no_log: false
+
+- name: Compare the installed release checksum
+  ansible.builtin.set_fact:
+    micolab_technitium_release_needs_install: >-
+      {{ (micolab_technitium_current_release | lower)
+         != (micolab_technitium_artifact.sha256 | lower)
+         or (micolab_technitium_app_binaries.results
+             | rejectattr('stat.exists', 'equalto', true) | list | length > 0) }}
+
+- name: Check for an existing systemd unit
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_systemd_unit }}"
+  register: micolab_technitium_unit_stat
+
+- name: Stop Technitium before replacing its binaries
+  ansible.builtin.systemd:
+    name: "{{ micolab_technitium_service_name }}"
+    state: stopped
+  when:
+    - micolab_technitium_release_needs_install | bool
+    - micolab_technitium_unit_stat.stat.exists
+
+- name: Remove only the role-owned install tree before a version change
+  ansible.builtin.file:
+    path: "{{ micolab_technitium_install_dir }}"
+    state: absent
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Recreate the empty install directory
+  ansible.builtin.file:
+    path: "{{ micolab_technitium_install_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Stage the pinned Technitium archive
+  ansible.builtin.copy:
+    src: "{{ micolab_technitium_artifact.path }}"
+    dest: "{{ micolab_technitium_stage_dir }}/DnsServerPortable-{{ micolab_technitium_version }}.tar.gz"
+    owner: root
+    group: root
+    mode: "0600"
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Verify the staged Technitium archive checksum
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_stage_dir }}/DnsServerPortable-{{ micolab_technitium_version }}.tar.gz"
+    checksum_algorithm: sha256
+  register: micolab_technitium_staged_archive
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Refuse a corrupted Technitium archive
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_staged_archive.stat.checksum | lower == micolab_technitium_artifact.sha256 | lower
+    fail_msg: The staged Technitium archive does not match the pinned SHA256.
+    quiet: true
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Extract the Technitium release
+  ansible.builtin.unarchive:
+    src: "{{ micolab_technitium_stage_dir }}/DnsServerPortable-{{ micolab_technitium_version }}.tar.gz"
+    dest: "{{ micolab_technitium_install_dir }}"
+    remote_src: true
+    owner: root
+    group: root
+    extra_opts:
+      - --no-same-owner
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Record the installed Technitium checksum
+  ansible.builtin.copy:
+    content: "{{ micolab_technitium_artifact.sha256 | lower }}\n"
+    dest: "{{ micolab_technitium_release_marker }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: micolab_technitium_release_needs_install | bool
+
+- name: Check the installed .NET runtime marker
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_runtime_marker }}"
+  register: micolab_technitium_runtime_marker_stat
+
+- name: Read the installed .NET runtime marker
+  ansible.builtin.slurp:
+    src: "{{ micolab_technitium_runtime_marker }}"
+  register: micolab_technitium_runtime_marker_slurp
+  when: micolab_technitium_runtime_marker_stat.stat.exists
+
+- name: Check the dotnet launcher
+  ansible.builtin.stat:
+    path: "{{ micolab_dotnet_binary }}"
+  register: micolab_dotnet_binary_stat
+
+- name: Enumerate any existing .NET runtimes before deciding to reinstall
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_dotnet_binary }}"
+      - --list-runtimes
+  register: micolab_dotnet_runtimes_before
+  when: micolab_dotnet_binary_stat.stat.exists
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Determine whether the runtime needs installation
+  ansible.builtin.set_fact:
+    micolab_technitium_runtime_current: >-
+      {{ (micolab_technitium_runtime_marker_slurp.content | b64decode | trim)
+         if micolab_technitium_runtime_marker_stat.stat.exists else '' }}
+    micolab_technitium_runtime_needs_install: >-
+      {{ ((micolab_technitium_runtime_marker_slurp.content | b64decode | trim)
+          if micolab_technitium_runtime_marker_stat.stat.exists else '')
+         != (micolab_dotnet_artifact.sha256 | lower)
+         or not micolab_dotnet_binary_stat.stat.exists
+         or (micolab_dotnet_runtimes_before.stdout | default('')
+             is not search('Microsoft\.AspNetCore\.App\s+'
+                           ~ (micolab_dotnet_artifact.version | regex_escape)
+                           ~ '\s')) }}
+
+- name: Stop Technitium before replacing the shared runtime
+  ansible.builtin.systemd:
+    name: "{{ micolab_technitium_service_name }}"
+    state: stopped
+  when:
+    - micolab_technitium_runtime_needs_install | bool
+    - micolab_technitium_unit_stat.stat.exists
+    - not ansible_check_mode
+
+- name: Stage the pinned ASP.NET Core runtime archive
+  ansible.builtin.copy:
+    src: "{{ micolab_dotnet_artifact.path }}"
+    dest: "{{ micolab_technitium_stage_dir }}/aspnetcore-runtime-{{ micolab_dotnet_artifact.version }}-linux-{{ micolab_expected_architecture }}.tar.gz"
+    owner: root
+    group: root
+    mode: "0600"
+  when: micolab_technitium_runtime_needs_install | bool
+
+- name: Verify the staged runtime archive checksum
+  ansible.builtin.stat:
+    path: "{{ micolab_technitium_stage_dir }}/aspnetcore-runtime-{{ micolab_dotnet_artifact.version }}-linux-{{ micolab_expected_architecture }}.tar.gz"
+    checksum_algorithm: sha256
+  register: micolab_technitium_staged_runtime
+  when: micolab_technitium_runtime_needs_install | bool
+
+- name: Refuse a corrupted runtime archive
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_staged_runtime.stat.checksum | lower == micolab_dotnet_artifact.sha256 | lower
+    fail_msg: The staged .NET runtime archive does not match the pinned SHA256.
+    quiet: true
+  when: micolab_technitium_runtime_needs_install | bool
+
+- name: Extract the ASP.NET Core runtime
+  ansible.builtin.unarchive:
+    src: "{{ micolab_technitium_stage_dir }}/aspnetcore-runtime-{{ micolab_dotnet_artifact.version }}-linux-{{ micolab_expected_architecture }}.tar.gz"
+    dest: "{{ micolab_dotnet_install_dir }}"
+    remote_src: true
+    owner: root
+    group: root
+    extra_opts:
+      - --no-same-owner
+  when: micolab_technitium_runtime_needs_install | bool
+
+- name: Link the pinned dotnet launcher
+  ansible.builtin.file:
+    src: "{{ micolab_dotnet_install_dir }}/dotnet"
+    dest: "{{ micolab_dotnet_binary }}"
+    state: link
+    force: true
+
+- name: Record the installed runtime checksum
+  ansible.builtin.copy:
+    content: "{{ micolab_dotnet_artifact.sha256 | lower }}\n"
+    dest: "{{ micolab_technitium_runtime_marker }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: micolab_technitium_runtime_needs_install | bool
+
+- name: Enumerate installed .NET runtimes
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_dotnet_binary }}"
+      - --list-runtimes
+  register: micolab_technitium_dotnet_runtimes
+  changed_when: false
+  check_mode: false
+
+- name: Require the pinned ASP.NET Core runtime
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_dotnet_runtimes.rc == 0
+      - micolab_technitium_dotnet_runtimes.stdout is search('Microsoft\.AspNetCore\.App\s+' ~ (micolab_dotnet_artifact.version | regex_escape) ~ '\s')
+    fail_msg: >-
+      The pinned Microsoft.AspNetCore.App {{ micolab_dotnet_artifact.version }}
+      is not installed in {{ micolab_dotnet_install_dir }}.
+    quiet: true
+
+- name: Verify ICU support with the pinned runtime
+  ansible.builtin.command:
+    argv:
+      - "{{ micolab_dotnet_binary }}"
+      - "{{ micolab_technitium_install_dir }}/DnsServerApp.dll"
+      - --icu-test
+    chdir: "{{ micolab_technitium_install_dir }}"
+  become: true
+  become_user: "{{ micolab_technitium_user }}"
+  register: micolab_technitium_icu_test
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require ICU support before starting Technitium
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_icu_test.rc == 0
+    fail_msg: >-
+      Technitium's ICU self-test failed. Install the Debian libicu package
+      (the exact name depends on the Debian release) from the offline package
+      set before continuing.
+    quiet: true
+
+- name: Install the Technitium systemd unit
+  ansible.builtin.template:
+    src: dns.service.j2
+    dest: "{{ micolab_technitium_systemd_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd units
+    - Restart Technitium DNS
+
+- name: Bound Technitium file logs with logrotate
+  ansible.builtin.template:
+    src: logrotate.j2
+    dest: "{{ micolab_technitium_logrotate_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start Technitium DNS
+  ansible.builtin.systemd:
+    name: "{{ micolab_technitium_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Wait for the loopback-only admin API
+  ansible.builtin.uri:
+    url: "http://{{ micolab_technitium_admin_bind_address }}:{{ micolab_technitium_admin_port }}/api/status"
+    method: GET
+    return_content: true
+    status_code: 200
+  register: micolab_technitium_status
+  until:
+    - micolab_technitium_status.status == 200
+    - (micolab_technitium_status.json | default({})).status | default('') == 'ok'
+  retries: "{{ micolab_technitium_health_retries }}"
+  delay: "{{ micolab_technitium_health_delay }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Confirm the DNS service is active
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ micolab_technitium_service_name }}"
+  register: micolab_technitium_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Gate on a running Technitium service
+  ansible.builtin.assert:
+    that:
+      - micolab_technitium_active.rc == 0
+      - micolab_technitium_active.stdout | trim == 'active'
+    fail_msg: >-
+      Technitium did not become active. Inspect journalctl -u
+      {{ micolab_technitium_service_name }}. The admin API was never exposed
+      beyond {{ micolab_technitium_admin_bind_address }}.
+    quiet: true
+  when: not ansible_check_mode

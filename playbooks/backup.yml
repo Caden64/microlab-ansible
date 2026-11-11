@@ -1,0 +1,826 @@
+---
+# Consistent, quiesced backup of the MicroLab management host.
+#
+# This playbook is intentionally manual.  It stops the services that own
+# state, waits for and then holds the same durable flock as the Technitium TLS
+# renewal helper, copies the full Forgejo state (database + WAL + repositories
+# + LFS + attachments + ini/secrets), the CA intermediate/database, DNS
+# config/zones, Caddy state, and the renewal credential/config directory.
+#
+# The offline root escrow is excluded by policy and checked before the archive
+# is accepted.  The archive is created root-only from its first byte and any
+# partial archive is removed on failure.
+- name: Back up MicroLab management state
+  hosts: microlab_management
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  vars_files:
+    - vars/technitium_tls_interface.yml
+  vars:
+    micolab_backup_archive_name: "micolab-backup-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+
+    # Interface values owned by roles/technitium_tls.  Read them, never edit
+    # that role here.  vars/technitium_tls_interface.yml resolves the canonical
+    # role names, the supported shared aliases, and the role-derived defaults in
+    # exactly the order the role itself uses.  There is no backup-specific
+    # override: an override here could move or archive a different lock or
+    # certificate than the renewal runtime uses.
+    micolab_backup_technitium_state_directory_name_effective: >-
+      {{ micolab_technitium_interface_state_directory_name }}
+    micolab_backup_technitium_state_dir_effective: >-
+      {{ micolab_technitium_interface_state_dir }}
+    micolab_backup_technitium_cert_dir_effective: >-
+      {{ micolab_technitium_interface_cert_dir }}
+    micolab_backup_technitium_cert_path_effective: >-
+      {{ micolab_technitium_interface_cert_path }}
+    micolab_backup_technitium_key_path_effective: >-
+      {{ micolab_technitium_interface_key_path }}
+    micolab_backup_technitium_pfx_path_effective: >-
+      {{ micolab_technitium_interface_pfx_path }}
+    micolab_backup_technitium_pfx_password_file_effective: >-
+      {{ micolab_technitium_interface_pfx_password_file }}
+    micolab_backup_technitium_ca_root_cert_effective: >-
+      {{ micolab_technitium_interface_ca_root_cert }}
+    micolab_backup_technitium_ca_chain_cert_effective: >-
+      {{ micolab_technitium_interface_ca_chain_cert }}
+    micolab_backup_renewal_env_file_effective: >-
+      {{ micolab_technitium_interface_renewal_env_file }}
+    micolab_backup_renewal_config_dir_effective: >-
+      {{ micolab_backup_renewal_env_file_effective | dirname }}
+    micolab_backup_renewal_timer_unit_effective: >-
+      {{ micolab_technitium_interface_timer_unit }}
+    micolab_backup_renewal_lock_file_effective: >-
+      {{ micolab_technitium_interface_lock_file }}
+
+    # Recovery helper wiring.  The helper directory is an interface variable so
+    # integration tests can exercise the real copy/invoke tasks in a temporary
+    # root without writing below /usr/local on the test machine.
+    micolab_backup_helper_dir: /usr/local/lib/microlab
+    micolab_backup_helper_owner: root
+    micolab_backup_helper_group: root
+    micolab_backup_python: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+    micolab_backup_root_prefix: "/"
+
+    micolab_backup_services_effective: >-
+      {{ micolab_backup_services | default(['caddy', 'forgejo', 'step-ca', 'dns']) }}
+
+    # Role-owned path interfaces.  The fallbacks match the documented role
+    # defaults so a site that moves state must only set the role variable.
+    micolab_backup_forgejo_data_dir_effective: >-
+      {{ (micolab_forgejo_data_dir | default('/var/lib/forgejo')).rstrip('/') }}
+    micolab_backup_forgejo_config_file_effective: >-
+      {{ (micolab_forgejo_config_file | default('/etc/forgejo/app.ini')).rstrip('/') }}
+    micolab_backup_forgejo_db_path_effective: >-
+      {{ (micolab_forgejo_db_path
+          | default(micolab_backup_forgejo_data_dir_effective ~ '/data/forgejo.db')).rstrip('/') }}
+    micolab_backup_forgejo_repo_root_effective: >-
+      {{ (micolab_forgejo_repo_root
+          | default(micolab_backup_forgejo_data_dir_effective ~ '/data/forgejo-repositories')).rstrip('/') }}
+    micolab_backup_caddy_state_dir_effective: >-
+      {{ (micolab_caddy_state_dir | default('/var/lib/caddy')).rstrip('/') }}
+    micolab_backup_ca_dir_effective: >-
+      {{ (microlab_step_ca_home | default('/etc/step-ca')).rstrip('/') }}
+    micolab_backup_dns_dir_effective: >-
+      {{ micolab_technitium_interface_config_dir.rstrip('/') }}
+    micolab_backup_forgejo_wal_effective: >-
+      {{ micolab_backup_forgejo_wal
+         | default(micolab_backup_forgejo_db_path_effective ~ '-wal') }}
+
+    micolab_backup_include_paths_effective: >-
+      {{ micolab_backup_include_paths | default(
+           [
+             micolab_backup_forgejo_data_dir_effective,
+             micolab_backup_forgejo_config_file_effective,
+             micolab_backup_ca_dir_effective,
+             micolab_backup_dns_dir_effective,
+             micolab_backup_caddy_state_dir_effective,
+             micolab_backup_renewal_config_dir_effective
+           ]
+         ) }}
+    micolab_backup_exclude_patterns_effective: >-
+      {{ micolab_backup_exclude_patterns | default([
+           '*/root_ca_key*', '*/root_ca.key*', '*/root_ca_private*',
+           '*/offline-root*', '*/offline_root*',
+           '*/offline-root/*', '*/offline_root/*'
+         ]) }}
+    micolab_backup_forbidden_patterns_effective: >-
+      {{ micolab_backup_forbidden_patterns | default([
+           '(^|/)(root_ca_key[^/]*|root_ca\.key[^/]*|root_ca_private[^/]*|offline[-_]root[^/]*)(/|$)'
+         ]) }}
+    micolab_backup_required_members_effective: >-
+      {{ micolab_backup_required_members | default([]) }}
+    micolab_backup_required_files_effective: >-
+      {{ micolab_backup_required_files | default(
+           ([
+             micolab_backup_forgejo_db_path_effective,
+             micolab_backup_forgejo_config_file_effective,
+             micolab_backup_renewal_env_file_effective
+           ] + micolab_backup_renewal_material_paths_effective)
+           | map('regex_replace', '^/', '') | list
+         ) }}
+    micolab_backup_required_dirs_effective: >-
+      {{ micolab_backup_required_dirs | default(
+           ([
+             micolab_backup_forgejo_repo_root_effective,
+             micolab_backup_caddy_state_dir_effective,
+             micolab_backup_ca_dir_effective,
+             micolab_backup_dns_dir_effective,
+             micolab_backup_renewal_config_dir_effective
+           ])
+           | map('regex_replace', '^/', '') | list
+         ) }}
+    micolab_backup_renewal_material_paths_effective: >-
+      {{ [
+           micolab_backup_technitium_pfx_path_effective,
+           micolab_backup_technitium_cert_path_effective,
+           micolab_backup_technitium_key_path_effective,
+           micolab_backup_technitium_pfx_password_file_effective,
+           micolab_backup_technitium_ca_root_cert_effective,
+           micolab_backup_technitium_ca_chain_cert_effective
+         ] }}
+    micolab_backup_required_coverage_paths_effective: >-
+      {{ [
+           micolab_backup_forgejo_data_dir_effective,
+           micolab_backup_forgejo_config_file_effective,
+           micolab_backup_forgejo_db_path_effective,
+           micolab_backup_forgejo_repo_root_effective,
+           micolab_backup_caddy_state_dir_effective,
+           micolab_backup_ca_dir_effective,
+           micolab_backup_dns_dir_effective,
+           micolab_backup_renewal_config_dir_effective
+         ] + micolab_backup_renewal_material_paths_effective }}
+    micolab_backup_start_order_effective: >-
+      {{ (micolab_backup_services
+          | default(['caddy', 'forgejo', 'step-ca', 'dns'])) | reverse | list }}
+    micolab_backup_archive_path: >-
+      {{ (micolab_backup_destination | default('')).rstrip('/') }}/{{ micolab_backup_archive_name }}
+
+  tasks:
+    - name: Refuse renewal aliases the renewal role never consumes
+      ansible.builtin.assert:
+        that:
+          - micolab_technitium_enabled is not defined
+          - micolab_technitium_state_directory_name is not defined
+          - micolab_technitium_state_dir is not defined
+          - micolab_technitium_lock_file is not defined
+          - micolab_technitium_status_file is not defined
+          - micolab_technitium_renewal_env_file is not defined
+          - micolab_technitium_helper_path is not defined
+          - micolab_technitium_service_unit is not defined
+          - micolab_technitium_timer_unit is not defined
+          - micolab_technitium_cert_dir is not defined
+          - micolab_technitium_cert_path is not defined
+          - micolab_technitium_key_path is not defined
+          - micolab_technitium_pfx_path is not defined
+          - micolab_technitium_pfx_password_file is not defined
+          - micolab_technitium_ca_root_cert is not defined
+          - micolab_technitium_ca_chain_cert is not defined
+        fail_msg: >-
+          Unsupported renewal interface variables are set. The real
+          roles/technitium_tls runtime never reads micolab_technitium_enabled,
+          micolab_technitium_state_directory_name, micolab_technitium_state_dir,
+          micolab_technitium_lock_file, micolab_technitium_status_file,
+          micolab_technitium_renewal_env_file,
+          micolab_technitium_helper_path,
+          micolab_technitium_service_unit,
+          micolab_technitium_timer_unit, micolab_technitium_cert_dir,
+          micolab_technitium_cert_path, micolab_technitium_key_path,
+          micolab_technitium_pfx_path,
+          micolab_technitium_pfx_password_file,
+          micolab_technitium_ca_root_cert, or
+          micolab_technitium_ca_chain_cert. Using one here would make the
+          backup hold or archive something other than the live renewal state.
+          There is no supported enabled=false bypass. Remove it and set the
+          canonical microlab_technitium_* variable. The only supported shared
+          aliases are
+          micolab_technitium_tls_cert_path,
+          micolab_technitium_tls_key_path,
+          micolab_technitium_tls_cert_password, and
+          micolab_technitium_config_dir.
+      tags:
+        - always
+
+    - name: Refuse backup flags that cannot disable the renewal runtime
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_renewal_enabled is not defined
+          - micolab_backup_require_renewal_timer is not defined
+          - micolab_backup_renewal_env_file is not defined
+          - micolab_backup_renewal_config_dir is not defined
+          - micolab_backup_renewal_timer_unit is not defined
+          - micolab_backup_renewal_lock_file is not defined
+          - micolab_backup_renewal_material_paths is not defined
+        fail_msg: >-
+          Unsupported backup renewal override or disable flag is set. There is
+          no supported enabled=false bypass: playbooks/site.yml includes
+          roles/technitium_tls unconditionally and the role starts its renewal
+          timer without consulting an enabled flag. An override here would move
+          the backup lock or material away from the runtime. Remove the flag and
+          set the canonical microlab_technitium_* role variable instead.
+      tags:
+        - always
+
+    - name: Require explicit backup confirmation and destination
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_confirm | default(false) | bool
+          - (micolab_backup_destination | default('')) | length > 0
+          - (micolab_backup_destination | default('')) is match('^/')
+          - (micolab_backup_destination | default('')) != '/'
+        fail_msg: >-
+          Set micolab_backup_confirm=true and micolab_backup_destination to an
+          absolute existing directory other than /. This playbook stops
+          services; it will not run by accident.
+
+    - name: Validate backup input shapes
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_services_effective | length > 0
+          - micolab_backup_services_effective | unique | length
+            == micolab_backup_services_effective | length
+          - micolab_backup_include_paths_effective | length > 0
+          - micolab_backup_include_paths_effective | unique | length
+            == micolab_backup_include_paths_effective | length
+          - micolab_backup_required_files_effective | length > 0
+          - micolab_backup_required_dirs_effective | length > 0
+          - micolab_backup_forbidden_patterns_effective | length > 0
+          - micolab_backup_archive_path not in micolab_backup_include_paths_effective
+        fail_msg: >-
+          Backup inputs are incomplete or ambiguous. Service, include,
+          required-file, required-directory, and forbidden-pattern lists must
+          be non-empty.
+
+    - name: Inspect the backup destination
+      ansible.builtin.stat:
+        path: "{{ micolab_backup_destination }}"
+        follow: true
+      register: micolab_backup_destination_stat
+
+    - name: Require a writable, pre-existing backup destination
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_destination_stat.stat.exists
+          - micolab_backup_destination_stat.stat.isdir
+          - micolab_backup_destination_stat.stat.writeable
+          - not (micolab_backup_destination_stat.stat.woth | default(false))
+        fail_msg: >-
+          {{ micolab_backup_destination }} must already exist, be writable, and
+          not be world-writable. Mount the approved backup target with
+          root-controlled permissions before running this playbook.
+
+    - name: Refuse to overwrite an existing archive
+      ansible.builtin.stat:
+        path: "{{ micolab_backup_archive_path }}"
+      register: micolab_backup_archive_stat
+
+    - name: Require a fresh archive name
+      ansible.builtin.assert:
+        that:
+          - not micolab_backup_archive_stat.stat.exists
+        fail_msg: >-
+          {{ micolab_backup_archive_path }} already exists. Retry after moving
+          the previous archive, or set a unique timestamped name.
+
+    - name: Inspect every included state path
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ micolab_backup_include_paths_effective }}"
+      register: micolab_backup_path_stats
+
+    - name: Require every included path to exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg or item.stat.isdir
+          - not item.stat.islnk
+        fail_msg: >-
+          Backup input {{ item.item }} is missing, is not a regular file or
+          directory, or is a symlink. A partial or aliased backup is not
+          acceptable; correct the path or explicitly remove it from
+          micolab_backup_include_paths.
+      loop: "{{ micolab_backup_path_stats.results }}"
+
+    - name: Inspect the configured Forgejo database, repository root, and config
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+      loop:
+        - { path: "{{ micolab_backup_forgejo_db_path_effective }}", kind: file }
+        - { path: "{{ micolab_backup_forgejo_repo_root_effective }}", kind: directory }
+        - { path: "{{ micolab_backup_forgejo_config_file_effective }}", kind: file }
+      register: micolab_backup_forgejo_state_stats
+
+    - name: Require the configured Forgejo state paths with the expected kind
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - not item.stat.islnk
+          - (item.item.kind == 'file' and item.stat.isreg)
+            or (item.item.kind == 'directory' and item.stat.isdir)
+        fail_msg: >-
+          {{ item.item.path }} is missing, a symlink, or not a
+          {{ item.item.kind }}. A partial or aliased backup is not acceptable.
+      loop: "{{ micolab_backup_forgejo_state_stats.results }}"
+
+    - name: Inspect the renewal helper credential file
+      ansible.builtin.stat:
+        path: "{{ micolab_backup_renewal_env_file_effective }}"
+      register: micolab_backup_renewal_env_stat
+
+    - name: Require recoverable renewal credentials unconditionally
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_renewal_env_stat.stat.exists
+          - micolab_backup_renewal_env_stat.stat.isreg
+          - not (micolab_backup_renewal_env_stat.stat.world_readable | default(false))
+        fail_msg: >-
+          {{ micolab_backup_renewal_env_file_effective }} is missing. The
+          backup would not contain the renewal environment (CA URL, token
+          path, PFX settings). The site includes roles/technitium_tls
+          unconditionally, so there is no supported disabled-TLS bypass and
+          this playbook will not silently drop renewal safeguards. Run the
+          Technitium TLS role first, or correct the canonical
+          microlab_technitium_renewal_env_file value.
+
+    - name: Inspect every required renewal material file
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ micolab_backup_renewal_material_paths_effective }}"
+      register: micolab_backup_renewal_material_stats
+
+    - name: Require every required renewal material file
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+        fail_msg: >-
+          Renewal material {{ item.item }} is missing, not a regular file, or a
+          symlink. A backup without it cannot restore a host that can renew
+          DoT. Enroll/reconcile the certificate first, or correct the canonical
+          microlab_technitium_* role path variable.
+      loop: "{{ micolab_backup_renewal_material_stats.results }}"
+
+    - name: Resolve the canonical backup destination
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ micolab_backup_destination }}"
+      register: micolab_backup_destination_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the canonical archive path
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ micolab_backup_archive_path }}"
+      register: micolab_backup_archive_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve every canonical included state path
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ item }}"
+      loop: "{{ micolab_backup_include_paths_effective }}"
+      register: micolab_backup_include_realpaths
+      changed_when: false
+      check_mode: false
+
+    - name: Resolve the canonical renewal lock path
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - -m
+          - --
+          - "{{ micolab_backup_renewal_lock_file_effective }}"
+      register: micolab_backup_lock_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Record canonical backup paths
+      ansible.builtin.set_fact:
+        micolab_backup_destination_real: "{{ micolab_backup_destination_realpath.stdout }}"
+        micolab_backup_archive_real: "{{ micolab_backup_archive_realpath.stdout }}"
+        micolab_backup_lock_real: "{{ micolab_backup_lock_realpath.stdout }}"
+        micolab_backup_include_real_map: >-
+          {{ micolab_backup_include_real_map | default({})
+             | combine({item.item: item.stdout}) }}
+      loop: "{{ micolab_backup_include_realpaths.results }}"
+
+    - name: Require the archive to stay directly below the backup destination
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_archive_real != micolab_backup_destination_real
+          - micolab_backup_archive_real.startswith(micolab_backup_destination_real ~ '/')
+        fail_msg: >-
+          The canonical archive path {{ micolab_backup_archive_real }} is not
+          directly below the canonical destination
+          {{ micolab_backup_destination_real }}.
+
+    - name: Refuse a destination or archive that resolves inside any archived tree
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_destination_real != item.value
+          - not micolab_backup_destination_real.startswith(item.value ~ '/')
+          - micolab_backup_archive_real != item.value
+          - not micolab_backup_archive_real.startswith(item.value ~ '/')
+        fail_msg: >-
+          The canonical backup destination or archive resolves to
+          {{ micolab_backup_destination_real }} / {{ micolab_backup_archive_real }},
+          which is inside the archived tree {{ item.key }} ({{ item.value }}).
+          A nested backup destination, including one reached through a symlink
+          alias, would archive itself.
+      loop: "{{ micolab_backup_include_real_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+
+    - name: Require configured state and renewal material inside a backed-up tree
+      ansible.builtin.assert:
+        that:
+          - item is match('^(' ~ (micolab_backup_include_paths_effective
+                                  | map('regex_replace', '/+$', '')
+                                  | map('regex_escape') | join('|')) ~ ')(/|$)')
+        fail_msg: >-
+          Configured state or renewal material {{ item }} is not below any
+          micolab_backup_include_paths entry. Set the role path variable or add
+          its directory to the backup includes.
+      loop: "{{ micolab_backup_required_coverage_paths_effective }}"
+
+    - name: Refuse to archive the renewal lock or its state directory
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_lock_real != '/'
+          - micolab_backup_lock_real != item.value
+          - not micolab_backup_lock_real.startswith(item.value ~ '/')
+        fail_msg: >-
+          The renewal lock {{ micolab_backup_lock_real }} is inside the archived
+          tree {{ item.key }} ({{ item.value }}). Restoring that archive would
+          replace the lock inode/directory used by the renewal helper.
+      loop: "{{ micolab_backup_include_real_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+
+    - name: Verify each configured service unit exists
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - -p
+          - LoadState
+          - --value
+          - "{{ item }}.service"
+      loop: "{{ micolab_backup_services_effective }}"
+      register: micolab_backup_unit_state
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require every configured service unit to be loaded
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim == 'loaded'
+        fail_msg: >-
+          Service {{ item.item }} is not a loaded systemd unit. Set
+          micolab_backup_services to the actual site service names; a silently
+          incomplete backup is not allowed.
+      loop: "{{ micolab_backup_unit_state.results }}"
+
+    - name: Record which services are currently active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ item }}"
+      loop: "{{ micolab_backup_services_effective }}"
+      register: micolab_backup_active_results
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Build the active-service map
+      ansible.builtin.set_fact:
+        micolab_backup_active_map: >-
+          {{ micolab_backup_active_map | default({})
+             | combine({item.item: ((item.stdout | trim) in ['active', 'activating', 'reloading'])}) }}
+      loop: "{{ micolab_backup_active_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Inspect the renewal timer unit
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - -p
+          - LoadState
+          - --value
+          - "{{ micolab_backup_renewal_timer_unit_effective }}"
+      register: micolab_backup_renewal_timer_state
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Default the renewal timer state before inspection
+      ansible.builtin.set_fact:
+        micolab_backup_renewal_timer_loaded: false
+        micolab_backup_renewal_timer_enabled_before: unknown
+        micolab_backup_renewal_timer_active_before: false
+
+    - name: Record whether the renewal timer is installed
+      ansible.builtin.set_fact:
+        micolab_backup_renewal_timer_loaded: >-
+          {{ (micolab_backup_renewal_timer_state.stdout | default('') | trim) == 'loaded' }}
+
+    - name: Require the live renewal timer to be installed
+      ansible.builtin.assert:
+        that:
+          - micolab_backup_renewal_timer_loaded | bool
+        fail_msg: >-
+          {{ micolab_backup_renewal_timer_unit_effective }} is not loaded.
+          The backup cannot prove that the renewal writer is quiesced. Set the
+          actual canonical role timer through
+          microlab_technitium_timer_unit. There is no supported disable bypass
+          because the site includes roles/technitium_tls unconditionally.
+
+    - name: Record the renewal timer enablement before backup
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-enabled
+          - "{{ micolab_backup_renewal_timer_unit_effective }}"
+      register: micolab_backup_renewal_timer_enabled
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: micolab_backup_renewal_timer_loaded | bool
+
+    - name: Record the renewal timer activity before backup
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ micolab_backup_renewal_timer_unit_effective }}"
+      register: micolab_backup_renewal_timer_active
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: micolab_backup_renewal_timer_loaded | bool
+
+    - name: Record the original renewal timer state
+      ansible.builtin.set_fact:
+        micolab_backup_renewal_timer_enabled_before: >-
+          {{ (micolab_backup_renewal_timer_enabled.stdout | default('unknown') | trim) }}
+        micolab_backup_renewal_timer_active_before: >-
+          {{ (micolab_backup_renewal_timer_active.stdout | default('inactive') | trim)
+             in ['active', 'activating', 'reloading'] }}
+      when: micolab_backup_renewal_timer_loaded | bool
+
+    - name: Back up all state while holding the renewal lock
+      when: not ansible_check_mode
+      block:
+        - name: Stop the renewal timer before taking the durable lock
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_backup_renewal_timer_unit_effective }}"
+            state: stopped
+          when: micolab_backup_renewal_timer_loaded | bool
+
+        - name: Ensure the protected recovery helper directory exists
+          ansible.builtin.file:
+            path: "{{ micolab_backup_helper_dir }}"
+            state: directory
+            owner: "{{ micolab_backup_helper_owner }}"
+            group: "{{ micolab_backup_helper_group }}"
+            mode: "0755"
+          tags:
+            - micolab-helper-integration
+
+        - name: Install the backup recovery helpers
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/{{ item }}"
+            dest: "{{ micolab_backup_helper_dir }}/{{ item }}"
+            owner: "{{ micolab_backup_helper_owner }}"
+            group: "{{ micolab_backup_helper_group }}"
+            mode: "0755"
+          loop:
+            - micolab_lock.py
+            - micolab_archive_guard.py
+            - micolab_backup_capture.py
+          tags:
+            - micolab-helper-integration
+
+        - name: Build the backup capture specification
+          ansible.builtin.set_fact:
+            micolab_backup_spec:
+              archive: "{{ micolab_backup_archive_path }}"
+              root_prefix: "{{ micolab_backup_root_prefix }}"
+              include_paths: "{{ micolab_backup_include_paths_effective }}"
+              exclude_patterns: "{{ micolab_backup_exclude_patterns_effective }}"
+              forbidden_patterns: "{{ micolab_backup_forbidden_patterns_effective }}"
+              required_members: "{{ micolab_backup_required_members_effective }}"
+              required_files: "{{ micolab_backup_required_files_effective }}"
+              required_dirs: "{{ micolab_backup_required_dirs_effective }}"
+              services: "{{ micolab_backup_services_effective }}"
+              active_before: "{{ micolab_backup_active_map | default({}) }}"
+              wal_path: "{{ micolab_backup_forgejo_wal_effective }}"
+              lock_file: "{{ micolab_backup_renewal_lock_file_effective }}"
+              lock_timeout_seconds: "{{ micolab_backup_renewal_lock_timeout | default(300) }}"
+              tar: "{{ micolab_backup_tar_binary | default('tar') }}"
+              systemctl: "{{ micolab_backup_systemctl_binary | default('systemctl') }}"
+              manifest:
+                created: "{{ ansible_date_time.iso8601 }}"
+                host: "{{ inventory_hostname }}"
+                included: "{{ micolab_backup_include_paths_effective }}"
+                excluded: "{{ micolab_backup_exclude_patterns_effective }}"
+                services_configured: "{{ micolab_backup_services_effective }}"
+                active_before: "{{ micolab_backup_active_map | default({}) }}"
+                note: >-
+                  Quiesced copy; offline root escrow excluded by policy. The
+                  renewal timer was stopped and its durable lock was held for
+                  the whole capture. Runtime renewal status/lock state is not
+                  archived.
+          tags:
+            - micolab-helper-integration
+
+        - name: Create and validate the quiesced archive while holding the lock
+          ansible.builtin.command:
+            argv:
+              - "{{ micolab_backup_python }}"
+              - "{{ micolab_backup_helper_dir }}/micolab_backup_capture.py"
+            stdin: "{{ micolab_backup_spec | to_nice_json }}"
+          register: micolab_backup_capture
+          changed_when: true
+          check_mode: false
+          tags:
+            - micolab-helper-integration
+
+        - name: Record the backup capture result
+          ansible.builtin.set_fact:
+            micolab_backup_capture_result: "{{ micolab_backup_capture.stdout | from_json }}"
+
+        - name: Report the validated backup
+          ansible.builtin.debug:
+            msg:
+              - "Archive: {{ micolab_backup_capture_result.archive }}"
+              - "SHA-256: {{ micolab_backup_capture_result.sha256 }}"
+              - "Members: {{ micolab_backup_capture_result.member_count }}"
+              - "WAL present after quiesce: {{ micolab_backup_capture_result.wal_present_after_quiesce }}"
+              - "Renewal lock held for {{ micolab_backup_capture_result.lock_held_seconds }}s"
+      always:
+        - name: Restart only the services that were active before the backup
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: started
+          loop: "{{ micolab_backup_start_order_effective }}"
+          when: micolab_backup_active_map[item] | bool
+          failed_when: false
+
+        - name: Restore persistently enabled renewal timer
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_backup_renewal_timer_unit_effective }}"
+            enabled: true
+          when:
+            - micolab_backup_renewal_timer_loaded | bool
+            - micolab_backup_renewal_timer_enabled_before == 'enabled'
+
+        - name: Restore runtime-enabled renewal timer
+          ansible.builtin.command:
+            argv:
+              - "{{ micolab_backup_systemctl_binary | default('systemctl') }}"
+              - enable
+              - --runtime
+              - "{{ micolab_backup_renewal_timer_unit_effective }}"
+          changed_when: true
+          when:
+            - micolab_backup_renewal_timer_loaded | bool
+            - micolab_backup_renewal_timer_enabled_before == 'enabled-runtime'
+
+        - name: Restore persistently disabled renewal timer
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_backup_renewal_timer_unit_effective }}"
+            enabled: false
+          when:
+            - micolab_backup_renewal_timer_loaded | bool
+            - micolab_backup_renewal_timer_enabled_before == 'disabled'
+
+        - name: Restore runtime-disabled renewal timer
+          ansible.builtin.command:
+            argv:
+              - "{{ micolab_backup_systemctl_binary | default('systemctl') }}"
+              - disable
+              - --runtime
+              - "{{ micolab_backup_renewal_timer_unit_effective }}"
+          changed_when: true
+          when:
+            - micolab_backup_renewal_timer_loaded | bool
+            - micolab_backup_renewal_timer_enabled_before == 'disabled-runtime'
+
+        - name: Restore the renewal timer activity state
+          ansible.builtin.systemd_service:
+            name: "{{ micolab_backup_renewal_timer_unit_effective }}"
+            state: "{{ 'started' if micolab_backup_renewal_timer_active_before | bool else 'stopped' }}"
+          when: micolab_backup_renewal_timer_loaded | bool
+
+        - name: Wait for previously active services to become active
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - is-active
+              - "{{ item }}"
+          loop: "{{ micolab_backup_start_order_effective }}"
+          register: micolab_backup_restart_status
+          until: (micolab_backup_restart_status.stdout | trim) == 'active'
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when: micolab_backup_active_map[item] | bool
+
+        - name: Health-gate Forgejo after the backup
+          ansible.builtin.uri:
+            url: "{{ micolab_backup_forgejo_health_url | default('http://127.0.0.1:3000/api/healthz') }}"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+          register: micolab_backup_forgejo_health
+          until: micolab_backup_forgejo_health.status == 200
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when:
+            - micolab_backup_active_map['forgejo'] | default(false) | bool
+
+        - name: Health-gate the public git endpoint after the backup
+          ansible.builtin.uri:
+            url: "https://{{ micolab_backup_git_host | default('git.microlab.hnh') }}/api/healthz"
+            ca_path: "{{ micolab_backup_tls_root | default('/usr/local/share/ca-certificates/microlab-root.crt') }}"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+            validate_certs: true
+          register: micolab_backup_caddy_health
+          until: micolab_backup_caddy_health.status == 200
+          retries: 30
+          delay: 2
+          changed_when: false
+          check_mode: false
+          when:
+            - micolab_backup_active_map['caddy'] | default(false) | bool
+            - micolab_backup_active_map['forgejo'] | default(false) | bool
+
+    # Debug/report only.  It performs no host changes and is not selected by a
+    # normal run; the integration tests select it with
+    # --tags micolab-interface-report to resolve the real play-level variables.
+    - name: Report the resolved backup renewal interface
+      ansible.builtin.debug:
+        msg:
+          micolab_backup_renewal_env_file_effective: "{{ micolab_backup_renewal_env_file_effective }}"
+          micolab_backup_renewal_config_dir_effective: "{{ micolab_backup_renewal_config_dir_effective }}"
+          micolab_backup_renewal_timer_unit_effective: "{{ micolab_backup_renewal_timer_unit_effective }}"
+          micolab_backup_renewal_lock_file_effective: "{{ micolab_backup_renewal_lock_file_effective }}"
+          micolab_backup_technitium_state_directory_name_effective: "{{ micolab_backup_technitium_state_directory_name_effective }}"
+          micolab_backup_technitium_state_dir_effective: "{{ micolab_backup_technitium_state_dir_effective }}"
+          micolab_backup_technitium_cert_dir_effective: "{{ micolab_backup_technitium_cert_dir_effective }}"
+          micolab_backup_technitium_cert_path_effective: "{{ micolab_backup_technitium_cert_path_effective }}"
+          micolab_backup_technitium_key_path_effective: "{{ micolab_backup_technitium_key_path_effective }}"
+          micolab_backup_technitium_pfx_path_effective: "{{ micolab_backup_technitium_pfx_path_effective }}"
+          micolab_backup_technitium_pfx_password_file_effective: "{{ micolab_backup_technitium_pfx_password_file_effective }}"
+          micolab_backup_technitium_ca_root_cert_effective: "{{ micolab_backup_technitium_ca_root_cert_effective }}"
+          micolab_backup_technitium_ca_chain_cert_effective: "{{ micolab_backup_technitium_ca_chain_cert_effective }}"
+          micolab_technitium_interface_pfx_password_sha256: "{{ micolab_technitium_interface_pfx_password_sha256 }}"
+          micolab_technitium_interface_cert_dir: "{{ micolab_technitium_interface_cert_dir }}"
+          micolab_technitium_interface_cert_path: "{{ micolab_technitium_interface_cert_path }}"
+          micolab_technitium_interface_key_path: "{{ micolab_technitium_interface_key_path }}"
+          micolab_technitium_interface_pfx_path: "{{ micolab_technitium_interface_pfx_path }}"
+          micolab_technitium_interface_pfx_password_file: "{{ micolab_technitium_interface_pfx_password_file }}"
+          micolab_technitium_interface_config_dir: "{{ micolab_technitium_interface_config_dir }}"
+          micolab_technitium_interface_ca_root_cert: "{{ micolab_technitium_interface_ca_root_cert }}"
+          micolab_technitium_interface_ca_chain_cert: "{{ micolab_technitium_interface_ca_chain_cert }}"
+          micolab_technitium_interface_state_directory_name: "{{ micolab_technitium_interface_state_directory_name }}"
+          micolab_technitium_interface_state_dir: "{{ micolab_technitium_interface_state_dir }}"
+          micolab_technitium_interface_lock_file: "{{ micolab_technitium_interface_lock_file }}"
+          micolab_technitium_interface_status_file: "{{ micolab_technitium_interface_status_file }}"
+          micolab_technitium_interface_renewal_env_file: "{{ micolab_technitium_interface_renewal_env_file }}"
+          micolab_technitium_interface_helper_path: "{{ micolab_technitium_interface_helper_path }}"
+          micolab_technitium_interface_service_unit: "{{ micolab_technitium_interface_service_unit }}"
+          micolab_technitium_interface_timer_unit: "{{ micolab_technitium_interface_timer_unit }}"
+          micolab_backup_renewal_material_paths_effective: "{{ micolab_backup_renewal_material_paths_effective }}"
+          micolab_backup_include_paths_effective: "{{ micolab_backup_include_paths_effective }}"
+          micolab_backup_required_files_effective: "{{ micolab_backup_required_files_effective }}"
+          micolab_backup_required_dirs_effective: "{{ micolab_backup_required_dirs_effective }}"
+          micolab_backup_required_coverage_paths_effective: "{{ micolab_backup_required_coverage_paths_effective }}"
+          micolab_backup_dns_dir_effective: "{{ micolab_backup_dns_dir_effective }}"
+          micolab_backup_ca_dir_effective: "{{ micolab_backup_ca_dir_effective }}"
+      when: micolab_report_effective_interface | default(false) | bool
+      tags:
+        - micolab-interface-report

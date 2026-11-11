@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: verify
+  author: MicroLab
+  description: End-to-end DNS, DoH, DoT, Git clone/push, loopback, and external ACL verification.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+  galaxy_tags:
+    - microlab
+    - verification
+dependencies: []

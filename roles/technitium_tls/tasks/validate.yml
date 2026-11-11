@@ -1,0 +1,125 @@
+---
+- name: Require Debian on a supported architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == "Debian"
+      - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+    fail_msg: >-
+      technitium_tls supports Debian on amd64 and arm64 only.
+    quiet: true
+
+- name: Require the existing Technitium service account and group
+  ansible.builtin.command:
+    argv:
+      - getent
+      - "{{ item.database }}"
+      - "{{ item.key }}"
+  loop:
+    - { database: passwd, key: "{{ microlab_technitium_service_user }}" }
+    - { database: group, key: "{{ microlab_technitium_service_group }}" }
+  register: microlab_technitium_getent
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to invent a different service account
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_getent.results[0].rc == 0
+      - microlab_technitium_getent.results[1].rc == 0
+    fail_msg: >-
+      The Technitium service user/group
+      {{ microlab_technitium_service_user }}:{{ microlab_technitium_service_group }}
+      does not exist. Install Technitium first or override the service
+      user/group explicitly. This role does not create a parallel account.
+    quiet: true
+
+- name: Require the offline-pinned step CLI and CA trust anchors on this host
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ microlab_technitium_step_bin }}"
+    - "{{ microlab_technitium_ca_root_cert }}"
+    - "{{ microlab_technitium_ca_chain_cert }}"
+  register: microlab_technitium_required_files
+
+- name: Fail closed when CA/client prerequisites are absent
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_required_files.results[0].stat.exists
+      - microlab_technitium_required_files.results[0].stat.executable
+      - microlab_technitium_required_files.results[1].stat.exists
+      - microlab_technitium_required_files.results[2].stat.exists
+    fail_msg: >-
+      The step CLI, public root, or intermediate chain is missing. Run the
+      step_ca role on the shared management host, or override the paths.
+    quiet: true
+
+- name: Require protected Technitium secrets from inventory/vault
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_pfx_password is string
+      - microlab_technitium_pfx_password | length > 0
+      - microlab_technitium_api_token is string
+      - microlab_technitium_api_token | length > 0
+    fail_msg: >-
+      Set microlab_technitium_pfx_password and
+      microlab_technitium_api_token from encrypted inventory/vault data.
+    quiet: true
+  no_log: true
+
+- name: Require the documented nine-day-safe seven-day renewal limits
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_renew_before in ['72h', '48h', '36h', '24h']
+      - microlab_technitium_alert_before in ['24h', '12h', '6h']
+      - not (microlab_technitium_allow_renewal_after_expiry | default(false) | bool)
+    fail_msg: >-
+      Use a seven-day certificate with early renewal (72h by default) and an
+      expiration alert. Renewal after expiry must remain disabled.
+    quiet: true
+
+- name: Require TLS for the direct CA URL
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_ca_url is match('^https://')
+      - microlab_technitium_cert_name is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+      - microlab_technitium_doh_port | int == 8053
+      - microlab_technitium_dot_port | int == 853
+    fail_msg: >-
+      The direct CA must be HTTPS, the certificate name must be a concrete
+      lowercase DNS name, DoH must use local 8053, and native DoT must use 853.
+    quiet: true
+
+- name: Require DoH to be reachable only through the local reverse proxy
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_doh_reverse_proxy_acl | length == 1
+      - microlab_technitium_doh_reverse_proxy_acl[0] in ['127.0.0.1/32', '127.0.0.1']
+      - microlab_technitium_doh_real_ip_header == 'X-Real-IP'
+    fail_msg: >-
+      Technitium DoH must be bound behind the local TLS terminator only:
+      dnsReverseProxyNetworkACL=[127.0.0.1/32] and
+      dnsOverHttpRealIpHeader=X-Real-IP. Do not add public or wildcard ACLs.
+    quiet: true
+
+- name: Require restrictive PFX ownership and mode
+  ansible.builtin.assert:
+    that:
+      - microlab_technitium_pfx_owner == 'root'
+      - microlab_technitium_pfx_group == microlab_technitium_service_group
+      - microlab_technitium_pfx_mode in ['0640', '0440']
+    fail_msg: >-
+      The published PFX must be root:{{ microlab_technitium_service_group }}
+      with mode 0640 (or 0440); it contains the server private key.
+    quiet: true
+
+- name: Forbid IPv6 SANs and addresses unless IPv6 is explicitly designed
+  ansible.builtin.assert:
+    that:
+      - "':' not in microlab_technitium_cert_name"
+      - microlab_technitium_doh_reverse_proxy_acl | select('search', ':') | list | length == 0
+    fail_msg: >-
+      Do not publish an IPv6 SAN, AAAA record, or IPv6 ACL unless IPv6 support
+      has been explicitly designed and enabled.
+    quiet: true
+  when: not (microlab_technitium_ipv6_enabled | bool)

@@ -1,0 +1,47 @@
+---
+# Cross-host integration harness for the step_ca preflight.
+#
+# The play runs on a target whose filesystem is simulated by the test-only
+# `stepca_isolated` connection (bubblewrap mount namespace). Controller-side
+# source validation delegates to localhost and therefore runs outside that
+# namespace. tests/test_step_ca_cross_host.py supplies an inventory, throwaway
+# CA material, and the sandbox mounts; this file only runs role code in role
+# order and reports observations for the tests to assert.
+- name: Exercise the step_ca preflight with isolated logical hosts
+  hosts: stepca_target
+  gather_facts: false
+  become: false
+  handlers:
+    - name: Restart step-ca
+      ansible.builtin.debug:
+        msg: No-op handler for the isolated preflight harness
+  tasks:
+    # Not delegated: this records what the simulated target itself can see at
+    # the controller source path, proving the two filesystems are distinct.
+    - name: Record the target's own view of the controller source path
+      ansible.builtin.stat:
+        path: "{{ microlab_step_ca_root_cert_src }}"
+        follow: true
+      register: microlab_test_target_source_stat
+
+    - name: Run the controller-side source preflight
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/source_preflight.yml"
+      when: not (microlab_test_skip_source_preflight | default(false) | bool)
+
+    - name: Run the step_ca target preflight
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/preflight.yml"
+
+    - name: Report the target's source-path observation
+      ansible.builtin.debug:
+        msg: >-
+          target_source_exists={{
+            microlab_test_target_source_stat.stat.exists | default(false)
+          }}
+
+    - name: Report the classified state
+      ansible.builtin.debug:
+        var: microlab_step_ca_state
+
+    - name: Deploy material only for the explicit first deployment
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../roles/step_ca/tasks/deploy_material.yml"
+      when: microlab_step_ca_state.action == 'initial-deploy'

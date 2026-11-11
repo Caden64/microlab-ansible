@@ -1,0 +1,11 @@
+---
+# MicroLab intentionally has no Galaxy role or collection dependency.
+# Everything used by the owned roles is ansible-core builtin.
+#
+# Offline installation:
+#   ansible-galaxy collection install -r requirements.yml --offline
+#
+# Static checks on a workstation additionally use ansible-lint and yamllint,
+# but those are development tools, not deployment dependencies.
+collections: []
+roles: []

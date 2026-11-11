@@ -1,0 +1,146 @@
+---
+# Naming. Two distinct concepts that must never be conflated:
+#   micolab_verify_service_domain  the domain that holds the service names
+#                                  (ns1/ca/dns/git.<service domain>), from the
+#                                  shared micolab_domain (microlab.hnh).
+#   micolab_verify_zone            the authoritative zone apex queried for NS,
+#                                  from the shared micolab_dns_zone (hnh).
+# Neither has a hard-coded fallback: a missing shared value fails closed in
+# tasks/naming.yml. The legacy micolab_dns_zone_fqdn is never used to build a
+# name; when it is set it must equal the service domain or the role fails.
+micolab_verify_service_domain: "{{ micolab_domain | default('') }}"
+micolab_verify_zone: "{{ micolab_dns_zone | default('') }}"
+micolab_verify_ns_name: "ns1.{{ micolab_verify_service_domain }}."
+micolab_verify_service_names:
+  - ns1
+  - ca
+  - dns
+  - git
+micolab_verify_management_group: "microlab_management"
+micolab_verify_challenge_group: "{{ micolab_challenge_group | default('microlab_challenge') }}"
+micolab_verify_management_host: ""
+micolab_verify_expected_a_records: {}
+micolab_verify_expected_aaaa_records: {}
+micolab_verify_enable_ipv6: false
+
+micolab_verify_dns_server: "127.0.0.1"
+micolab_verify_dns_port: 53
+micolab_verify_https_port: 443
+micolab_verify_public_sites:
+  - "ca.{{ micolab_verify_service_domain }}"
+  - "dns.{{ micolab_verify_service_domain }}"
+  - "git.{{ micolab_verify_service_domain }}"
+micolab_verify_ca_host: "ca.{{ micolab_verify_service_domain }}"
+micolab_verify_doh_host: "dns.{{ micolab_verify_service_domain }}"
+micolab_verify_doh_path: "/dns-query"
+# DoH keeps an infrastructure authoritative query: the expected answer is the
+# management address from the hnh zone. This proves the Caddy path and the
+# authoritative backend, not recursion.
+micolab_verify_dns_probe_name: "ns1.{{ micolab_verify_service_domain }}"
+micolab_verify_dot_host: "dns.{{ micolab_verify_service_domain }}"
+micolab_verify_dot_port: 853
+# A DoT denied result must be a positive DNS REFUSED. The hnh zone is
+# authoritative, so even an authoritative-only client receives a real answer
+# for ns1.<service domain>; querying it can never demonstrate refusal.
+#
+# Two separate pieces of evidence are collected from a denied DoT source:
+#   1. fixture zone query ACL: the DNS role's conditional-forwarder fixture
+#      (micolab_dns_fixture_name). Technitium serves FWD records through the
+#      authoritative zone path, so REFUSED here comes from the fixture zone's
+#      own query ACL. It is NOT proof of the global recursion setting.
+#   2. global recursion ACL: an RD=1 query for micolab_verify_dns_recursion_
+#      denied_name, a name outside every authoritative and forwarder zone.
+#      Only Technitium's global recursion policy (recursion=
+#      UseSpecifiedNetworkACL + recursionNetworkACL) can answer it with
+#      REFUSED. A denied source never triggers an upstream lookup, so no WAN is
+#      needed; if the source were wrongly recursion-allowed the server would
+#      try to recurse and return SERVFAIL/NXDOMAIN/timeout, which fails.
+# Allowed DoT sources query only the fixture and expect its known answer
+# (micolab_dns_fixture_expected_ip); they never send the out-of-zone name, so
+# acceptance never depends on WAN recursion. The certificate/SNI check still
+# uses micolab_verify_dot_host independently.
+micolab_verify_dns_fixture_name: "{{ micolab_dns_fixture_name | default('') }}"
+micolab_verify_dns_fixture_zone: "{{ micolab_dns_fixture_zone | default('') }}"
+micolab_verify_dns_fixture_expected_ip: >-
+  {{ micolab_dns_fixture_expected_ip | default('') }}
+# RFC 6761 .invalid: never delegated, so an accidental recursion attempt cannot
+# reach a real name. Must be outside the service domain, the authoritative zone
+# and the fixture zone (enforced before probes run).
+micolab_verify_dns_recursion_denied_name: "microlab-recursion-acl-probe.invalid"
+# Source-network classes used to validate each DoT probe against the configured
+# firewall and recursion policy. These mirror the baseline firewall and DNS
+# role interfaces; the verify role does not define or change them.
+micolab_verify_dns_authoritative_only_cidrs: >-
+  {{ micolab_dns_authoritative_only_cidrs | default([]) }}
+micolab_verify_dns_recursion_allowed_cidrs: >-
+  {{ ((micolab_admin_cidrs | default([]))
+      + (micolab_client_cidrs | default([]))
+      + (micolab_dns_recursion_allow_cidrs | default([]))) | unique | list }}
+micolab_verify_dns_firewall_admitted_cidrs: >-
+  {{ ((micolab_admin_cidrs | default([]))
+      + (micolab_client_cidrs | default([]))
+      + (micolab_dns_authoritative_only_cidrs | default([]))) | unique | list }}
+micolab_verify_dot_connect_host: "127.0.0.1"
+micolab_verify_enable_dot: true
+micolab_verify_tls_root: "{{ micolab_trust_bundle_path | default('/usr/local/share/ca-certificates/microlab-root.crt') }}"
+
+micolab_verify_git_host: "{{ micolab_forgejo_domain | default('git.' ~ micolab_verify_service_domain) }}"
+# A disposable test repository, never a production repository. The role
+# creates a unique branch, stages an explicit file, commits, pushes, verifies
+# the remote ref, deletes the branch, and proves the remote ref is absent and
+# the local credential helper/workspace are removed. SSH clone/push is required
+# for complete acceptance; disable only via the documented noncomplete override.
+micolab_verify_git_repo: ""
+micolab_verify_git_ssh_repo: "{{ micolab_verify_git_repo }}"
+micolab_verify_git_https_username: ""
+micolab_verify_git_https_token: ""
+micolab_verify_git_visibility: "private"
+micolab_verify_enable_ssh: true
+micolab_verify_ssh_private_key: ""
+micolab_verify_known_hosts: ""
+micolab_verify_ssh_port: 22
+micolab_verify_git_test_root: "/var/lib/microlab/verify-git"
+micolab_verify_git_test_author_name: "MicroLab Verify"
+micolab_verify_git_test_author_email: "verify@microlab.invalid"
+micolab_verify_git_test_commit_message: "microlab verification commit"
+# Explicit override: skip the real clone/push acceptance and mark the result
+# noncomplete. Never silently treated as a pass.
+micolab_verify_accept_unexecuted_git_acceptance: false
+
+# External-vantage ACL probes. Each item:
+#   name: human label
+#   host: inventory host that runs the probe (must be a real external vantage)
+#   check: dns_admin | ca_management | doh | dot
+#   expect: allowed | denied
+#   ca_file: optional CA path on the probe host (default micolab_verify_tls_root)
+#   source_address: dot only, REQUIRED. A local address on the probe host. The
+#           DoT socket is bound to it (bind((source_address, 0)) before
+#           connect) and the probe fails unless the connected socket's local
+#           address equals it. Its family must match the management address.
+#   access: dot only, REQUIRED. recursion-allowed | recursion-denied.
+# The role requires both allowed and denied results for every check class.
+micolab_verify_external_acl_probes: []
+micolab_verify_accept_unverified_external_acl: false
+micolab_verify_external_probe_timeout: 15
+# Per-run staging path for dot_probe.py on every external probe host. It is
+# removed in an always block.
+micolab_verify_dot_probe_stage_path: "/tmp/microlab-dot-probe.py"
+micolab_verify_acceptance_file: "/var/lib/microlab/verify-acceptance.json"
+
+micolab_verify_loopback_ports:
+  forgejo_http: 3000
+  step_ca_https: 4443
+  dns_http: 8053
+  caddy_admin: 2019
+micolab_verify_required_services:
+  - caddy
+  - forgejo
+  - step-ca
+  - dns
+
+micolab_verify_management_cidrs: "{{ micolab_caddy_management_cidrs | default([]) }}"
+micolab_verify_dns_client_cidrs: "{{ micolab_caddy_dns_client_cidrs | default([]) }}"
+micolab_verify_admin_cidrs: "{{ micolab_caddy_admin_cidrs | default([]) }}"
+
+micolab_verify_command_retries: 10
+micolab_verify_command_delay: 3

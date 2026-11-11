@@ -1,0 +1,315 @@
+---
+- name: Inspect the live Technitium admin listener
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ss
+      - -H
+      - -lntp
+  register: micolab_dns_admin_sockets
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Gate on a loopback-only admin listener
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_admin_sockets.rc == 0
+      - micolab_dns_admin_sockets.stdout_lines
+        | select('search', ':' ~ (micolab_technitium_admin_port | string))
+        | list | length > 0
+      - micolab_dns_admin_sockets.stdout_lines
+        | select('search', ':' ~ (micolab_technitium_admin_port | string))
+        | reject('search', micolab_technitium_admin_bind_address ~ ':' ~ (micolab_technitium_admin_port | string))
+        | list | length == 0
+    fail_msg: >-
+      The admin API is not bound only to
+      {{ micolab_technitium_admin_bind_address }}:{{ micolab_technitium_admin_port }}.
+      Refusing to continue with a publicly reachable admin listener.
+    quiet: true
+
+- name: Require dig for DNS health gates
+  ansible.builtin.stat:
+    path: /usr/bin/dig
+  register: micolab_dns_dig_binary
+
+- name: Fail closed when bind9-dnsutils is absent
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_dig_binary.stat.exists
+    fail_msg: >-
+      /usr/bin/dig is missing. The offline package set must include
+      bind9-dnsutils; local-only API calls cannot prove DNS answers.
+    quiet: true
+
+- name: Confirm the DNS service survived the persistence-gate restart
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ micolab_technitium_service_name }}"
+  register: micolab_dns_service_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Gate on an active DNS service
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_service_active.rc == 0
+      - micolab_dns_service_active.stdout | trim == 'active'
+    fail_msg: >-
+      Technitium is not active after the configuration change. DNS answers
+      cannot be trusted.
+    quiet: true
+
+- name: Query every desired record over UDP and capture the AA flag
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - "@127.0.0.1"
+      - "{{ item.name }}"
+      - "{{ item.type }}"
+  register: micolab_dns_udp_answer
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_udp_answer.rc == 0
+    and (micolab_dns_udp_answer.stdout | micolab_dns_status) == 'NOERROR'
+    and (micolab_dns_udp_answer.stdout | micolab_dns_has_aa)
+    and (item.value in (micolab_dns_udp_answer.stdout | micolab_dns_answer_values))
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+  loop: "{{ micolab_dns_desired_records }}"
+  loop_control:
+    label: "{{ item.key }} UDP"
+
+- name: Gate on every authoritative UDP answer and the AA flag
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - (item.stdout | micolab_dns_status) == 'NOERROR'
+      - item.stdout | micolab_dns_has_aa
+      - item.item.value in (item.stdout | micolab_dns_answer_values)
+    fail_msg: >-
+      UDP/53 did not return an authoritative (AA) answer for
+      {{ item.item.name }} {{ item.item.type }}. Expected {{ item.item.value }}.
+      Last output: {{ item.stdout | default('') }}
+    quiet: true
+  loop: "{{ micolab_dns_udp_answer.results }}"
+  loop_control:
+    label: "{{ item.item.key }} UDP"
+
+- name: Query every desired record over TCP and capture the AA flag
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +tcp
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - "@127.0.0.1"
+      - "{{ item.name }}"
+      - "{{ item.type }}"
+  register: micolab_dns_tcp_answer
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_tcp_answer.rc == 0
+    and (micolab_dns_tcp_answer.stdout | micolab_dns_status) == 'NOERROR'
+    and (micolab_dns_tcp_answer.stdout | micolab_dns_has_aa)
+    and (item.value in (micolab_dns_tcp_answer.stdout | micolab_dns_answer_values))
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+  loop: "{{ micolab_dns_desired_records }}"
+  loop_control:
+    label: "{{ item.key }} TCP"
+
+- name: Gate on every authoritative TCP answer and the AA flag
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - (item.stdout | micolab_dns_status) == 'NOERROR'
+      - item.stdout | micolab_dns_has_aa
+      - item.item.value in (item.stdout | micolab_dns_answer_values)
+    fail_msg: >-
+      TCP/53 did not return an authoritative (AA) answer for
+      {{ item.item.name }} {{ item.item.type }}. Expected {{ item.item.value }}.
+      Last output: {{ item.stdout | default('') }}
+    quiet: true
+  loop: "{{ micolab_dns_tcp_answer.results }}"
+  loop_control:
+    label: "{{ item.item.key }} TCP"
+
+- name: Query the authoritative SOA and capture the AA flag
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - SOA
+      - "{{ micolab_dns_zone }}"
+      - "@127.0.0.1"
+  register: micolab_dns_soa
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_soa.rc == 0
+    and (micolab_dns_soa.stdout | micolab_dns_status) == 'NOERROR'
+    and (micolab_dns_soa.stdout | micolab_dns_has_aa)
+    and (micolab_dns_soa.stdout | micolab_dns_soa_mname) == (micolab_dns_primary_ns | lower)
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+
+- name: Assert the authoritative SOA names the ns1 target
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_soa.rc == 0
+      - (micolab_dns_soa.stdout | micolab_dns_status) == 'NOERROR'
+      - micolab_dns_soa.stdout | micolab_dns_has_aa
+      - (micolab_dns_soa.stdout | micolab_dns_soa_mname) == (micolab_dns_primary_ns | lower)
+    fail_msg: >-
+      The hnh SOA does not authoritatively name {{ micolab_dns_primary_ns }}.
+      The zone was not created with the intended NS target. Last output:
+      {{ micolab_dns_soa.stdout | default('') }}
+    quiet: true
+
+- name: Prove no AAAA records were created while IPv6 is disabled
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - AAAA
+      - "{{ item }}"
+      - "@127.0.0.1"
+  register: micolab_dns_aaaa_probe
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_aaaa_probe.rc == 0
+    and (micolab_dns_aaaa_probe.stdout | micolab_dns_status) == 'NOERROR'
+    and (micolab_dns_aaaa_probe.stdout | micolab_dns_answer_values) | length == 0
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+  loop: >-
+    {{ micolab_dns_desired_records | map(attribute='name') | unique | list }}
+  loop_control:
+    label: "{{ item }} AAAA"
+  when: not micolab_dns_ipv6_enabled | bool
+
+- name: Fail if an authoritative AAAA record exists without IPv6 support
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - (item.stdout | micolab_dns_status) == 'NOERROR'
+      - item.stdout | micolab_dns_has_aa
+      - (item.stdout | micolab_dns_answer_values) | length == 0
+    fail_msg: >-
+      IPv6 is disabled but {{ item.item }} has an authoritative AAAA answer or
+      the query failed. Last output: {{ item.stdout | default('') }} Remove it
+      or enable IPv6 deliberately; this role does not manage AAAA implicitly.
+    quiet: true
+  loop: "{{ micolab_dns_aaaa_probe.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not micolab_dns_ipv6_enabled | bool
+    - not item.skipped | default(false)
+
+- name: Probe the controlled local recursion fixture through the loopback resolver
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - "@127.0.0.1"
+      - "{{ micolab_dns_fixture_name }}"
+      - A
+  register: micolab_dns_local_recursion
+  changed_when: false
+  failed_when: false
+  until: >-
+    micolab_dns_local_recursion.rc == 0
+    and (micolab_dns_local_recursion.stdout | micolab_dns_status) == 'NOERROR'
+    and not (micolab_dns_local_recursion.stdout | micolab_dns_has_aa)
+    and micolab_dns_fixture_expected_ip in (micolab_dns_local_recursion.stdout | micolab_dns_answer_values)
+  retries: "{{ micolab_dns_health_retries }}"
+  delay: "{{ micolab_dns_health_delay }}"
+
+- name: Gate on the controlled local recursion fixture answer
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_local_recursion.rc == 0
+      - (micolab_dns_local_recursion.stdout | micolab_dns_status) == 'NOERROR'
+      - not (micolab_dns_local_recursion.stdout | micolab_dns_has_aa)
+      - micolab_dns_fixture_expected_ip in (micolab_dns_local_recursion.stdout | micolab_dns_answer_values)
+    fail_msg: >-
+      Loopback recursion through the controlled fixture did not return
+      NOERROR, AA clear, and {{ micolab_dns_fixture_expected_ip }} for
+      {{ micolab_dns_fixture_name }}.
+      Status was {{ micolab_dns_local_recursion.stdout | micolab_dns_status }}.
+      SERVFAIL is not accepted as offline success: it does not prove that the
+      local forwarder/delegation path is healthy. Last output:
+      {{ micolab_dns_local_recursion.stdout | default('') }}
+    quiet: true
+
+- name: Record the controlled local recursion fixture result
+  ansible.builtin.set_fact:
+    micolab_dns_local_recursion_status: >-
+      {{ micolab_dns_local_recursion.stdout | micolab_dns_status }}
+    micolab_dns_local_recursion_result: "fixture-noerror-aa-clear"
+    micolab_dns_local_recursion_fixture: >-
+      {{ micolab_dns_fixture_identity | combine({
+           'status': micolab_dns_local_recursion.stdout | micolab_dns_status,
+           'answers': micolab_dns_local_recursion.stdout | micolab_dns_answer_values,
+           'aa': micolab_dns_local_recursion.stdout | micolab_dns_has_aa,
+           'zone_query_acl': micolab_dns_fixture_zone_query_acl_after
+         }) }}
+
+- name: Probe an optional connected public name through the loopback resolver
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +time=3
+      - +tries=1
+      - +noall
+      - +answer
+      - +comments
+      - "@127.0.0.1"
+      - "{{ micolab_dns_public_recursion_name }}"
+      - A
+  register: micolab_dns_public_recursion
+  changed_when: false
+  failed_when: false
+  when: micolab_dns_public_recursion_check | bool
+
+- name: Record the optional connected public result separately
+  ansible.builtin.set_fact:
+    micolab_dns_public_recursion_status: >-
+      {{ micolab_dns_public_recursion.stdout | micolab_dns_status }}
+    micolab_dns_public_recursion_result: >-
+      {{ micolab_dns_public_recursion.stdout | default('') }}
+  when: micolab_dns_public_recursion_check | bool
+
+- name: Record the local gates that actually ran
+  ansible.builtin.set_fact:
+    micolab_dns_local_gates: >-
+      {{ ['plain-dns-udp53-aa', 'plain-dns-tcp53-aa', 'soa-aa',
+          'local-recursion-fixture-noerror', 'settings-recursion-policy']
+         + (['aaaa-absence-aa'] if not micolab_dns_ipv6_enabled | bool else []) }}

@@ -1,0 +1,36 @@
+---
+- name: Add one desired record
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/records/add"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body: >-
+      {{ {'domain': rec.name, 'zone': micolab_dns_zone, 'type': rec.type,
+          'ttl': rec.ttl | int, 'comments': micolab_dns_managed_comment,
+          'overwrite': 'false'}
+         | combine({'ipAddress': rec.value}
+                   if rec.type in ['A', 'AAAA']
+                   else {'nameServer': rec.value}) }}
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_record_add
+  failed_when: false
+  changed_when: >-
+    micolab_dns_record_add.status | default(0) == 200
+    and (micolab_dns_record_add.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful record creation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_record_add.status | default(0) == 200
+      - (micolab_dns_record_add.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected record {{ rec.key }}:
+      {{ (micolab_dns_record_add.json | default({})).errorMessage | default('no error message') }}
+    quiet: true

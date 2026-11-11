@@ -1,0 +1,136 @@
+---
+# MicroLab management-plane deployment.
+#
+# Phases are deliberately ordered and serialized. Only the dedicated
+# microlab_management group is targeted; challenge workloads are never touched.
+# The second Caddy pass enables the Git vhost only after Forgejo is installed
+# and after the first pass has established TLS and the admin vhost.
+- name: Validate inventory topology before touching any host
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Require a management host and an empty-overlap challenge group
+      ansible.builtin.assert:
+        that:
+          - groups[micolab_management_group] | default([]) | length > 0
+          - (groups[micolab_management_group] | default([])
+             | intersect(groups[micolab_challenge_group] | default([])) | length == 0)
+        fail_msg: >-
+          Inventory must define at least one host in
+          {{ micolab_management_group }} and that host must not also be in
+          {{ micolab_challenge_group }}.
+        quiet: true
+
+- name: Deploy the MicroLab management plane
+  hosts: microlab_management
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  max_fail_percentage: 0
+  become: true
+
+  pre_tasks:
+    - name: Refuse to run against a challenge host
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname not in (groups[micolab_challenge_group] | default([]))
+        fail_msg: >-
+          {{ inventory_hostname }} belongs to the challenge group. This
+          playbook installs management services and must never run there.
+        quiet: true
+
+  tasks:
+    - name: "Phase 1: baseline validation, time, storage, packages, firewall"
+      ansible.builtin.include_role:
+        name: baseline
+
+    - name: Flush baseline handlers before installing services
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 2: pinned offline Technitium and runtime installation"
+      ansible.builtin.include_role:
+        name: technitium_install
+
+    - name: Flush install handlers before DNS convergence
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 3: Technitium settings, hnh zone, records, DNS gates"
+      ansible.builtin.include_role:
+        name: technitium_dns
+
+    - name: Flush DNS handlers before exposing dependent services
+      ansible.builtin.meta: flush_handlers
+
+    - name: Gate later phases on the recorded DNS acceptance state
+      ansible.builtin.assert:
+        that:
+          - (micolab_dns_external_acl_verified | default(false) | bool)
+            or (micolab_dns_accept_unverified_external_acl | default(false) | bool)
+        fail_msg: >-
+          DNS did not reach an accepted state. Refusing to start certificate,
+          proxy, or Git services on an unverified resolver/ACL.
+        quiet: true
+
+    - name: "Phase 4: internal step-ca issuance and trust distribution"
+      ansible.builtin.include_role:
+        name: step_ca
+      vars:
+        micolab_step_ca_trust_store_path: "{{ micolab_trust_bundle_path }}"
+
+    - name: Flush step-ca handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 5: Caddy edge with CA+DNS rendered and the Git vhost disabled"
+      ansible.builtin.include_role:
+        name: caddy
+      vars:
+        micolab_caddy_enable_git: false
+        # Render the dns vhost now so its certificate and Technitium admin
+        # proxy are proven before Forgejo. The DoH backend on 8053 is created
+        # in phase 6, so the first pass must not probe /dns-query yet.
+        micolab_caddy_enable_dns: true
+        micolab_caddy_verify_doh: false
+
+    - name: Flush first Caddy pass handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 6: encrypted DNS protocols using step-ca material"
+      ansible.builtin.include_role:
+        name: technitium_tls
+      vars:
+        micolab_technitium_dot_port: "{{ micolab_dns_dot_port }}"
+        micolab_technitium_doh_port: "{{ micolab_dns_doh_port }}"
+
+    - name: Flush encrypted DNS handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 6b: Caddy/DoH readiness after encrypted DNS is healthy"
+      ansible.builtin.include_role:
+        name: caddy
+        tasks_from: health_doh
+      vars:
+        micolab_caddy_enable_dns: true
+        micolab_caddy_verify_doh: true
+
+    - name: "Phase 7: Forgejo on loopback, no Git vhost yet"
+      ansible.builtin.include_role:
+        name: forgejo
+      vars: {}
+
+    - name: Flush Forgejo handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 8: Caddy edge with the Git vhost enabled"
+      ansible.builtin.include_role:
+        name: caddy
+      vars:
+        micolab_caddy_enable_git: true
+
+    - name: Flush final Caddy handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 9: cross-service verification"
+      ansible.builtin.include_role:
+        name: verify

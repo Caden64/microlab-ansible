@@ -1,0 +1,71 @@
+{
+  "root": {{ microlab_step_ca_root_cert_dest | to_json }},
+  "crt": {{ microlab_step_ca_intermediate_cert_dest | to_json }},
+  "key": {{ microlab_step_ca_intermediate_key_dest | to_json }},
+  "address": {{ microlab_step_ca_address | to_json }},
+  "dnsNames": {{ microlab_step_ca_dns_names | to_json }},
+  "logger": {
+    "format": "text"
+  },
+  "db": {
+    "type": {{ microlab_step_ca_db_type | to_json }},
+    "dataSource": {{ microlab_step_ca_db_dir | to_json }}
+  },
+  "authority": {
+    "disableIssuedAtCheck": {{ microlab_step_ca_disable_issued_at_check | bool | to_json }},
+    "claims": {
+      "minTLSCertDuration": "5m",
+      "maxTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+      "defaultTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+      "disableRenewal": false,
+      "allowRenewalAfterExpiry": false
+    },
+    "policy": {
+      "x509": {
+        "allow": {
+          "dns": {{ microlab_step_ca_allowed_dns_names | to_json }},
+          "ip": {{ microlab_step_ca_allowed_ip_addresses | to_json }}
+        },
+        "allowWildcardNames": {{ microlab_step_ca_allow_wildcard_names | bool | to_json }}
+      }
+    },
+    "provisioners": [
+      {
+        "type": "ACME",
+        "name": {{ microlab_step_ca_caddy_provisioner_name | to_json }},
+        "forceCN": false,
+        "challenges": ["http-01", "dns-01", "tls-alpn-01"],
+        "claims": {
+          "minTLSCertDuration": "5m",
+          "maxTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+          "defaultTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+          "disableRenewal": false,
+          "allowRenewalAfterExpiry": false
+        }
+      },
+      {
+        "type": "JWK",
+        "name": {{ microlab_step_ca_technitium_provisioner_name | to_json }},
+        "key": {{ microlab_step_ca_technitium_jwk_key | to_nice_json(indent=2) | indent(8) }},
+        "encryptedKey": {{ microlab_step_ca_technitium_jwk_encrypted_key | to_json }},
+        "options": {
+          "x509": {
+            "template": {{ lookup('file', role_path ~ '/files/technitium-x509.template.json') | to_json }}
+          }
+        },
+        "claims": {
+          "minTLSCertDuration": "5m",
+          "maxTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+          "defaultTLSCertDuration": {{ microlab_step_ca_cert_lifetime | to_json }},
+          "disableRenewal": false,
+          "allowRenewalAfterExpiry": false
+        }
+      }
+    ]
+  },
+  "tls": {
+    "minVersion": 1.2,
+    "maxVersion": 1.3,
+    "renegotiation": false
+  }
+}

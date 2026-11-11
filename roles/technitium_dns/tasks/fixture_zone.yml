@@ -1,0 +1,468 @@
+---
+# The fixture zone must be a conditional forwarder, not the hnh auth zone.
+# Technitium handles FWD records in the authoritative zone path, so the zone
+# also carries the same allow ACL as the recursion policy. That makes the
+# allowed probe resolve through the local upstream with AA clear and the
+# denied probe get a real REFUSED on the same fixture name.
+#
+# A zone whose type happens to be Forwarder is not enough to prove ownership:
+# it could belong to a human or another deployment. Ownership is the exact
+# marker comment on the single apex FWD record. The role reads the complete
+# FWD set before any record mutation and fails closed on unowned or ambiguous
+# forwarders; it never replaces an unrelated zone or record.
+
+- name: List the recursion fixture forwarder zone
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/list?filterName={{ micolab_dns_fixture_zone | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_list
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require fixture zone list access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_list.status | default(0) == 200
+      - (micolab_dns_fixture_zone_list.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Unable to list zones before creating the recursion fixture forwarder
+      zone {{ micolab_dns_fixture_zone }}. No fixture zone was changed.
+    quiet: true
+
+- name: Find the exact recursion fixture zone
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_zone_matches: >-
+      {{ micolab_dns_fixture_zone_list.json.response.zones
+         | selectattr('name', 'equalto', micolab_dns_fixture_zone)
+         | list }}
+
+- name: Refuse an existing fixture zone that is not an enabled Forwarder
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_matches[0].type == 'Forwarder'
+      - micolab_dns_fixture_zone_matches[0].disabled | default(false) is false
+    fail_msg: >-
+      {{ micolab_dns_fixture_zone }} already exists but is not an enabled
+      Forwarder zone. This role will not convert or delete an existing zone.
+      Choose a distinct fixture zone or fix that zone manually.
+    quiet: true
+  when: micolab_dns_fixture_zone_matches | length > 0
+
+# The marker is written before the zone is created, so a crash after creation
+# leaves an exact resumable state instead of an unmarked zone. It is never
+# sufficient by itself: the existing zone must still be an enabled Forwarder
+# with no FWD record before the role will finish it.
+- name: Ensure the fixture-zone state directory exists
+  ansible.builtin.file:
+    path: "{{ micolab_dns_fixture_zone_state_path | dirname }}"
+    state: directory
+    mode: "0755"
+  when: micolab_dns_fixture_zone_matches | length == 0
+
+- name: Record fixture-zone creation intent before creating the zone
+  ansible.builtin.copy:
+    dest: "{{ micolab_dns_fixture_zone_state_path }}"
+    mode: "0644"
+    content: |
+      schema=1
+      owner={{ micolab_dns_fixture_zone_marker }}
+      zone={{ micolab_dns_fixture_zone }}
+  when: micolab_dns_fixture_zone_matches | length == 0
+
+- name: Create the empty recursion fixture conditional-forwarder zone when absent
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/create"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body:
+      zone: "{{ micolab_dns_fixture_zone }}"
+      type: Forwarder
+      # Do not let Technitium create an unmarked FWD record. The role adds the
+      # single owned record only after re-reading the complete FWD set.
+      initializeForwarder: "false"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_fixture_zone_create
+  when: micolab_dns_fixture_zone_matches | length == 0
+  failed_when: false
+  changed_when: >-
+    micolab_dns_fixture_zone_create.status | default(0) == 200
+    and (micolab_dns_fixture_zone_create.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful fixture forwarder zone creation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_create.status | default(0) == 200
+      - (micolab_dns_fixture_zone_create.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected creation of the recursion fixture forwarder zone
+      {{ micolab_dns_fixture_zone }}:
+      {{ (micolab_dns_fixture_zone_create.json | default({})).errorMessage | default('no error message') }}.
+      The marker was written first, so a rerun can safely resume only if the
+      resulting zone is still empty.
+    quiet: true
+  when: micolab_dns_fixture_zone_matches | length == 0
+
+- name: Read the local fixture-zone creation marker
+  ansible.builtin.stat:
+    path: "{{ micolab_dns_fixture_zone_state_path }}"
+  register: micolab_dns_fixture_state_stat
+  changed_when: false
+
+- name: Read the fixture-zone creation marker content
+  ansible.builtin.slurp:
+    src: "{{ micolab_dns_fixture_zone_state_path }}"
+  register: micolab_dns_fixture_state_slurp
+  when: micolab_dns_fixture_state_stat.stat.exists | default(false)
+  failed_when: false
+  changed_when: false
+  no_log: true
+
+# The marker must be exactly the three lines written above, in order. Each
+# line is whitespace-trimmed (so a normal trailing newline or CRLF is fine),
+# but any duplicate, conflicting, blank, or extra line rejects it: membership
+# alone would accept a file that also names another owner or zone.
+- name: Decode the fixture-zone creation marker
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_state_lines: >-
+      {{ ((micolab_dns_fixture_state_slurp.content | b64decode).splitlines()
+          | map('trim') | list)
+         if (micolab_dns_fixture_state_slurp.content is defined) else [] }}
+
+- name: Decide whether the creation marker matches this exact fixture zone
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_state_marker_valid: >-
+      {{ micolab_dns_fixture_state_lines
+         == ['schema=1',
+             'owner=' ~ micolab_dns_fixture_zone_marker,
+             'zone=' ~ micolab_dns_fixture_zone] }}
+
+- name: Read every record in the recursion fixture forwarder zone
+  ansible.builtin.uri:
+    url: >-
+      {{ micolab_dns_api_base }}/api/zones/records/get?zone={{ micolab_dns_fixture_zone | urlencode }}&domain={{ micolab_dns_fixture_zone | urlencode }}&listZone=true
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_records
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require fixture zone record read access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_records.status | default(0) == 200
+      - (micolab_dns_fixture_zone_records.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Unable to read every record from the recursion fixture zone
+      {{ micolab_dns_fixture_zone }}. No FWD record or query ACL was changed.
+    quiet: true
+
+- name: Plan only the owned fixture forwarder record
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_fwd_plan: >-
+      {{ (micolab_dns_fixture_zone_records.json | default({})).response.records | default([])
+         | micolab_fixture_forwarder_plan(micolab_dns_fixture_zone,
+                                         micolab_dns_fixture_zone_marker,
+                                         micolab_dns_fixture_upstream) }}
+
+- name: Refuse unowned or conflicting fixture forwarder records
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_fwd_plan.errors | length == 0
+    fail_msg: >-
+      The fixture zone {{ micolab_dns_fixture_zone }} cannot be managed
+      safely: {{ micolab_dns_fixture_fwd_plan.errors | join('; ') }}.
+      Nothing was changed. This role does not claim an unmarked FWD record,
+      replace a zone, or delete a forwarder that it does not own. If this is
+      genuinely the MicroLab fixture, remove the conflicting forwarder or add
+      the exact comment line {{ micolab_dns_fixture_zone_marker }} to the sole
+      apex FWD record manually, then rerun.
+    quiet: true
+
+- name: Require exact creation intent before completing an empty fixture zone
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_state_marker_valid | bool
+    fail_msg: >-
+      {{ micolab_dns_fixture_zone }} already exists as an enabled Forwarder
+      with no FWD record, but the local creation marker is absent or does not
+      match this zone. This role will not silently claim an empty zone created
+      by someone else. Remove the zone or, if it is genuinely the fixture,
+      leave it empty and create {{ micolab_dns_fixture_zone_state_path }} with
+      the exact schema, owner, and zone lines, then rerun.
+    quiet: true
+  when: micolab_dns_fixture_fwd_plan.state == 'empty'
+
+- name: Require a directly validated configured fixture endpoint before the FWD mutation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_upstream_verified | default(false) | bool
+    fail_msg: >-
+      The configured fixture endpoint {{ micolab_dns_fixture_upstream }} was
+      not directly validated in this run with NOERROR, AA clear, and
+      {{ micolab_dns_fixture_expected_ip }} for
+      {{ micolab_dns_fixture_name }}. Refusing to add or re-point the fixture
+      FWD record at an unproven endpoint.
+    quiet: true
+  when: micolab_dns_fixture_fwd_plan.state in ['empty', 'owned-update']
+
+- name: Add the owned fixture FWD record to the empty forwarder zone
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/records/add"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body:
+      domain: "{{ micolab_dns_fixture_zone }}"
+      zone: "{{ micolab_dns_fixture_zone }}"
+      type: FWD
+      forwarder: "{{ micolab_dns_fixture_upstream }}"
+      protocol: Udp
+      dnssecValidation: "false"
+      forwarderPriority: "0"
+      comments: "{{ micolab_dns_fixture_zone_marker }}"
+      overwrite: "false"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_fwd_add
+  when: micolab_dns_fixture_fwd_plan.state == 'empty'
+  failed_when: false
+  changed_when: >-
+    micolab_dns_fixture_fwd_add.status | default(0) == 200
+    and (micolab_dns_fixture_fwd_add.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful owned fixture FWD creation
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_fwd_add.status | default(0) == 200
+      - (micolab_dns_fixture_fwd_add.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected creation of the owned fixture FWD record:
+      {{ (micolab_dns_fixture_fwd_add.json | default({})).errorMessage | default('no error message') }}.
+      The zone is still empty and the creation marker remains, so a rerun can
+      safely resume without replacing anything.
+    quiet: true
+  when: micolab_dns_fixture_fwd_plan.state == 'empty'
+
+- name: Converge only the owned fixture FWD record to the configured endpoint
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/records/update"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body: "{{ micolab_dns_fixture_fwd_plan['update'] }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_fwd_update
+  when: micolab_dns_fixture_fwd_plan.state == 'owned-update'
+  failed_when: false
+  changed_when: >-
+    micolab_dns_fixture_fwd_update.status | default(0) == 200
+    and (micolab_dns_fixture_fwd_update.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful owned fixture FWD endpoint update
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_fwd_update.status | default(0) == 200
+      - (micolab_dns_fixture_fwd_update.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected the owned fixture FWD endpoint update:
+      {{ (micolab_dns_fixture_fwd_update.json | default({})).errorMessage | default('no error message') }}.
+    quiet: true
+  when: micolab_dns_fixture_fwd_plan.state == 'owned-update'
+
+- name: Re-read every fixture forwarder record after convergence
+  ansible.builtin.uri:
+    url: >-
+      {{ micolab_dns_api_base }}/api/zones/records/get?zone={{ micolab_dns_fixture_zone | urlencode }}&domain={{ micolab_dns_fixture_zone | urlencode }}&listZone=true
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_records_after
+  when: micolab_dns_fixture_fwd_plan.state in ['empty', 'owned-update']
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Re-plan the fixture forwarder after convergence
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_fwd_plan: >-
+      {{ (micolab_dns_fixture_zone_records_after.json | default({})).response.records | default([])
+         | micolab_fixture_forwarder_plan(micolab_dns_fixture_zone,
+                                         micolab_dns_fixture_zone_marker,
+                                         micolab_dns_fixture_upstream) }}
+  when: micolab_dns_fixture_fwd_plan.state in ['empty', 'owned-update']
+
+- name: Gate on one owned fixture forwarder to the configured endpoint
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_records_after.status | default(0) == 200
+      - (micolab_dns_fixture_zone_records_after.json | default({})).status | default('') == 'ok'
+      - micolab_dns_fixture_fwd_plan.errors | length == 0
+      - micolab_dns_fixture_fwd_plan.state == 'owned-current'
+      - micolab_dns_fixture_fwd_plan.owned | length == 1
+      - micolab_dns_fixture_fwd_plan.owned[0].rData.forwarder | default('') == micolab_dns_fixture_upstream
+      - micolab_dns_fixture_fwd_plan['update'] is none
+    fail_msg: >-
+      The fixture zone {{ micolab_dns_fixture_zone }} did not converge to
+      exactly one owned FWD record for {{ micolab_dns_fixture_upstream }}.
+      Re-read state: {{ micolab_dns_fixture_fwd_plan }}. Nothing further will
+      be changed automatically; inspect the zone rather than allowing a
+      destructive replacement.
+    quiet: true
+  when: not (micolab_dns_fixture_zone_records_after.skipped | default(false))
+
+- name: Require proven fixture forwarder ownership before touching the query ACL
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_fwd_plan.errors | length == 0
+      - micolab_dns_fixture_fwd_plan.state == 'owned-current'
+      - micolab_dns_fixture_fwd_plan.owned | length == 1
+    fail_msg: >-
+      The fixture zone query ACL is only managed after exactly one owned apex
+      FWD record is proven. Refusing to change the ACL for an unowned zone.
+    quiet: true
+
+# A Conditional Forwarder zone would otherwise answer even a client that the
+# global recursion ACL denies, because Technitium processes the FWD record in
+# the authoritative zone path. Give the fixture zone the exact same allowed
+# network ACL as the recursion policy so the recursion-denied probe gets a
+# real REFUSED on the same fixture name. The global recursion ACL itself is
+# separately proven before mutation and after readback in settings.yml.
+- name: Read the fixture forwarder zone options
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/options/get?zone={{ micolab_dns_fixture_zone | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_options
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Require fixture zone option read access
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_options.status | default(0) == 200
+      - (micolab_dns_fixture_zone_options.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Unable to read options for the recursion fixture zone
+      {{ micolab_dns_fixture_zone }}.
+    quiet: true
+
+- name: Normalize the fixture zone query ACL
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_zone_query_acl: >-
+      {{ (((micolab_dns_fixture_zone_options.json | default({})).response | default({})).queryAccessNetworkACL | default([]))
+         | micolab_acl_normalize }}
+
+- name: Restrict fixture zone queries to the recursion-allowed networks
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/options/set"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body:
+      zone: "{{ micolab_dns_fixture_zone }}"
+      queryAccess: UseSpecifiedNetworkACL
+      queryAccessNetworkACL: "{{ micolab_dns_required_recursion_acl | join(',') }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_options_set
+  when: >-
+    (((micolab_dns_fixture_zone_options.json | default({})).response | default({})).queryAccess | default(''))
+    != 'UseSpecifiedNetworkACL'
+    or micolab_dns_fixture_zone_query_acl != micolab_dns_required_recursion_acl
+  failed_when: false
+  changed_when: >-
+    micolab_dns_fixture_zone_options_set.status | default(0) == 200
+    and (micolab_dns_fixture_zone_options_set.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful fixture zone query ACL update
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_options_set.status | default(0) == 200
+      - (micolab_dns_fixture_zone_options_set.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected the fixture zone query ACL update:
+      {{ (micolab_dns_fixture_zone_options_set.json | default({})).errorMessage | default('no error message') }}
+    quiet: true
+  when: not (micolab_dns_fixture_zone_options_set.skipped | default(false))
+
+- name: Re-read the fixture forwarder zone options
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/options/get?zone={{ micolab_dns_fixture_zone | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 15
+  register: micolab_dns_fixture_zone_options_after
+  failed_when: false
+  changed_when: false
+  no_log: true
+  diff: false
+
+- name: Normalize the verified fixture zone query ACL
+  ansible.builtin.set_fact:
+    micolab_dns_fixture_zone_query_acl_after: >-
+      {{ (((micolab_dns_fixture_zone_options_after.json | default({})).response | default({})).queryAccessNetworkACL | default([]))
+         | micolab_acl_normalize }}
+
+- name: Gate on the fixture zone query ACL
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_fixture_zone_options_after.status | default(0) == 200
+      - (micolab_dns_fixture_zone_options_after.json | default({})).status | default('') == 'ok'
+      - (((micolab_dns_fixture_zone_options_after.json | default({})).response | default({})).queryAccess | default('')) == 'UseSpecifiedNetworkACL'
+      - micolab_dns_fixture_zone_query_acl_after == micolab_dns_required_recursion_acl
+    fail_msg: >-
+      The recursion fixture forwarder zone {{ micolab_dns_fixture_zone }} does
+      not carry the exact recursion-allowed query ACL. Expected
+      {{ micolab_dns_required_recursion_acl }} but read
+      {{ micolab_dns_fixture_zone_query_acl_after }} with access
+      {{ ((micolab_dns_fixture_zone_options_after.json | default({})).response | default({})).queryAccess | default('unknown') }}.
+    quiet: true

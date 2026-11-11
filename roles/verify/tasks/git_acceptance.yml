@@ -1,0 +1,589 @@
+---
+# Real HTTPS and SSH clone/push acceptance against a disposable Forgejo test
+# repository. No credential is placed in argv or in a log: HTTPS uses an
+# askpass helper that reads environment variables, and the tasks that carry
+# credentials are no_log. Every test branch is unique.
+#
+# Success is recorded only after both remote branches are proven absent and
+# the local credential helper and workspace are removed. Remote deletion never
+# suppresses a cleanup failure: the deletion and the follow-up ls-remote are
+# registered, and a branch that cannot be proven absent fails acceptance with
+# an actionable branch name (never a credential).
+#
+# Every HTTPS Git invocation carries the same explicit pinned trust arguments.
+# A custom step-ca root is usually not installed in the system trust store, so
+# clone, push, ls-remote, and cleanup all pass -c http.sslCAInfo=<root> and
+# -c http.sslVerify=true. Insecure verification is never used.
+
+- name: Set the disposable Git acceptance state
+  ansible.builtin.set_fact:
+    micolab_verify_git_accept_state: >-
+      {{ 'overridden-unexecuted'
+         if (micolab_verify_accept_unexecuted_git_acceptance | bool)
+         else 'pending' }}
+    micolab_verify_git_branch: >-
+      microlab-verify-{{ ansible_date_time.epoch | default(lookup('pipe', 'date +%s')) }}-{{ lookup('pipe', 'date +%s%N') }}
+    micolab_verify_git_flow_ok: false
+    micolab_verify_git_failure: ""
+    micolab_verify_git_https_push_attempted: false
+    micolab_verify_git_ssh_push_attempted: false
+    micolab_verify_git_https_cleanup: "not-started"
+    micolab_verify_git_ssh_cleanup: "not-started"
+    micolab_verify_git_credentials_removed: false
+    micolab_verify_git_workspace_removed: false
+
+- name: Require disposable Git acceptance inputs
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_git_repo | length > 0
+      - micolab_verify_git_ssh_repo | length > 0
+      - micolab_verify_git_https_username | length > 0
+      - micolab_verify_git_https_token | length > 0
+      - micolab_verify_git_visibility in ['private', 'public']
+      - micolab_verify_enable_ssh | bool
+      - micolab_verify_ssh_private_key | length > 0
+      - micolab_verify_known_hosts | length > 0
+      - micolab_verify_git_test_root is match('^/')
+      - micolab_verify_git_test_root | length > 1
+      - micolab_verify_git_test_root not in ['/', '/tmp', '/var', '/home', '/root', '/usr', '/etc']
+      # Refuse a shallow/system path: cleanup recursively removes this exact
+      # directory, so it must be a site-specific leaf (for example
+      # /var/lib/microlab/verify-git), never a broad parent directory.
+      - micolab_verify_git_test_root.split('/') | length >= 4
+      - micolab_verify_git_test_root is not search('(^|/)\.\.(/|$)')
+      - micolab_verify_git_branch is match('^[A-Za-z0-9._-]+$')
+    fail_msg: >-
+      Complete Git acceptance needs an explicitly supplied disposable test
+      repository, HTTPS username/token, SSH repository path, operator SSH key,
+      pinned known_hosts file, and micolab_verify_git_visibility=private|public.
+      SSH clone/push is mandatory for complete acceptance. Supply the inputs,
+      or set micolab_verify_accept_unexecuted_git_acceptance=true to record a
+      clearly noncomplete override.
+  when: not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+
+- name: Inspect SSH Git acceptance material
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ micolab_verify_ssh_private_key }}"
+    - "{{ micolab_verify_known_hosts }}"
+  register: micolab_verify_ssh_material
+  when: not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+
+- name: Fail closed when SSH key material is not a regular file
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+    fail_msg: >-
+      SSH Git acceptance needs an operator-supplied private key and a pinned
+      known_hosts file as regular files on the target.
+  loop: "{{ micolab_verify_ssh_material.results }}"
+  when: not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+
+- name: Compose the pinned Git transport inputs
+  ansible.builtin.set_fact:
+    # The single source of HTTPS trust arguments. Every HTTPS Git invocation
+    # below expands this list so no later push/read/delete can silently omit
+    # the pinned root or fall back to the system trust store.
+    micolab_verify_git_https_tls_args:
+      - -c
+      - "http.sslCAInfo={{ micolab_verify_tls_root }}"
+      - -c
+      - "http.sslVerify=true"
+    micolab_verify_git_https_url: >-
+      https://{{ micolab_verify_git_host }}{{ micolab_verify_https_suffix | default('') }}/{{ micolab_verify_git_repo | regex_replace('^/', '') }}
+    micolab_verify_git_ssh_url: >-
+      git@{{ micolab_verify_git_host }}:{{ micolab_verify_git_ssh_repo | regex_replace('^/', '') }}
+    micolab_verify_git_ssh_command: >-
+      ssh -i {{ micolab_verify_ssh_private_key }}
+      -o IdentitiesOnly=yes -o BatchMode=yes
+      -o StrictHostKeyChecking=yes
+      -o UserKnownHostsFile={{ micolab_verify_known_hosts }}
+      -p {{ micolab_verify_ssh_port }}
+
+- name: Run real Git clone/push acceptance
+  when: not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+  block:
+    - name: Create the private Git acceptance workspace
+      ansible.builtin.file:
+        path: "{{ micolab_verify_git_test_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Remove stale HTTPS clone directory
+      ansible.builtin.file:
+        path: "{{ micolab_verify_git_test_root }}/https"
+        state: absent
+
+    - name: Remove stale SSH clone directory
+      ansible.builtin.file:
+        path: "{{ micolab_verify_git_test_root }}/ssh"
+        state: absent
+
+    - name: Write the HTTPS askpass helper without embedding credentials
+      ansible.builtin.copy:
+        dest: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          #!/bin/sh
+          case "$1" in
+            *sername*) printf '%s\n' "$MICOLAB_GIT_USERNAME" ;;
+            *) printf '%s\n' "$MICOLAB_GIT_TOKEN" ;;
+          esac
+      no_log: true
+
+    - name: Clone the disposable repository over HTTPS
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git'] + micolab_verify_git_https_tls_args
+             + ['clone', micolab_verify_git_https_url, micolab_verify_git_test_root ~ '/https'] }}
+      environment:
+        GIT_ASKPASS: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        GIT_ASKPASS_REQUIRE: "force"
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+        MICOLAB_GIT_USERNAME: "{{ micolab_verify_git_https_username }}"
+        MICOLAB_GIT_TOKEN: "{{ micolab_verify_git_https_token }}"
+      register: micolab_verify_git_https_clone
+      changed_when: true
+      no_log: true
+
+    - name: Create a unique HTTPS test branch
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/https"
+          - checkout
+          - -b
+          - "{{ micolab_verify_git_branch }}-https"
+      register: micolab_verify_git_https_branch
+      changed_when: true
+      no_log: true
+
+    - name: Write the HTTPS test commit content
+      ansible.builtin.copy:
+        dest: "{{ micolab_verify_git_test_root }}/https/microlab-verify.txt"
+        mode: "0644"
+        content: "MicroLab HTTPS acceptance {{ micolab_verify_git_branch }}\n"
+
+    - name: Stage exactly the HTTPS acceptance file
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/https"
+          - add
+          - --
+          - microlab-verify.txt
+      changed_when: true
+      no_log: true
+
+    - name: Commit the HTTPS test change
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/https"
+          - -c
+          - "user.name={{ micolab_verify_git_test_author_name }}"
+          - -c
+          - "user.email={{ micolab_verify_git_test_author_email }}"
+          - commit
+          - -m
+          - "{{ micolab_verify_git_test_commit_message }}"
+      changed_when: true
+      no_log: true
+
+    - name: Record the HTTPS push attempt before contacting the remote
+      ansible.builtin.set_fact:
+        micolab_verify_git_https_push_attempted: true
+
+    - name: Push the unique HTTPS test branch
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git', '-C', micolab_verify_git_test_root ~ '/https']
+             + micolab_verify_git_https_tls_args
+             + ['push', 'origin', micolab_verify_git_branch ~ '-https'] }}
+      environment:
+        GIT_ASKPASS: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        GIT_ASKPASS_REQUIRE: "force"
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+        MICOLAB_GIT_USERNAME: "{{ micolab_verify_git_https_username }}"
+        MICOLAB_GIT_TOKEN: "{{ micolab_verify_git_https_token }}"
+      register: micolab_verify_git_https_push
+      changed_when: true
+      no_log: true
+
+    - name: Verify the HTTPS branch exists on the remote
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git', '-C', micolab_verify_git_test_root ~ '/https']
+             + micolab_verify_git_https_tls_args
+             + ['ls-remote', '--exit-code', '--heads', 'origin', micolab_verify_git_branch ~ '-https'] }}
+      environment:
+        GIT_ASKPASS: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        GIT_ASKPASS_REQUIRE: "force"
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+        MICOLAB_GIT_USERNAME: "{{ micolab_verify_git_https_username }}"
+        MICOLAB_GIT_TOKEN: "{{ micolab_verify_git_https_token }}"
+      changed_when: false
+      no_log: true
+
+    - name: Clone the disposable repository over SSH with a pinned host key
+      ansible.builtin.command:
+        argv:
+          - git
+          - clone
+          - "{{ micolab_verify_git_ssh_url }}"
+          - "{{ micolab_verify_git_test_root }}/ssh"
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_SSH_COMMAND: "{{ micolab_verify_git_ssh_command }}"
+        GIT_TERMINAL_PROMPT: "0"
+      register: micolab_verify_git_ssh_clone
+      changed_when: true
+      no_log: true
+
+    - name: Create a unique SSH test branch
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - checkout
+          - -b
+          - "{{ micolab_verify_git_branch }}-ssh"
+      register: micolab_verify_git_ssh_branch
+      changed_when: true
+      no_log: true
+
+    - name: Write the SSH test commit content
+      ansible.builtin.copy:
+        dest: "{{ micolab_verify_git_test_root }}/ssh/microlab-verify.txt"
+        mode: "0644"
+        content: "MicroLab SSH acceptance {{ micolab_verify_git_branch }}\n"
+
+    - name: Stage exactly the SSH acceptance file
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - add
+          - --
+          - microlab-verify.txt
+      changed_when: true
+      no_log: true
+
+    - name: Commit the SSH test change
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - -c
+          - "user.name={{ micolab_verify_git_test_author_name }}"
+          - -c
+          - "user.email={{ micolab_verify_git_test_author_email }}"
+          - commit
+          - -m
+          - "{{ micolab_verify_git_test_commit_message }}"
+      changed_when: true
+      no_log: true
+
+    - name: Record the SSH push attempt before contacting the remote
+      ansible.builtin.set_fact:
+        micolab_verify_git_ssh_push_attempted: true
+
+    - name: Push the unique SSH test branch
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - push
+          - origin
+          - "{{ micolab_verify_git_branch }}-ssh"
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_SSH_COMMAND: "{{ micolab_verify_git_ssh_command }}"
+        GIT_TERMINAL_PROMPT: "0"
+      register: micolab_verify_git_ssh_push
+      changed_when: true
+      no_log: true
+
+    - name: Verify the SSH branch exists on the remote
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - ls-remote
+          - --exit-code
+          - --heads
+          - origin
+          - "{{ micolab_verify_git_branch }}-ssh"
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_SSH_COMMAND: "{{ micolab_verify_git_ssh_command }}"
+        GIT_TERMINAL_PROMPT: "0"
+      changed_when: false
+      no_log: true
+
+    - name: Check anonymous HTTPS Git access
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git'] + micolab_verify_git_https_tls_args
+             + ['ls-remote', micolab_verify_git_https_url] }}
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+      register: micolab_verify_git_anonymous
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the anonymous repository web page
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl --silent --show-error --max-time 15 \
+          --cacert "{{ micolab_verify_tls_root }}" \
+          --resolve "{{ micolab_verify_git_host }}:{{ micolab_verify_https_port }}:127.0.0.1" \
+          -o /dev/null -w '%{http_code}' \
+          "{{ micolab_verify_git_https_url }}"
+      args:
+        executable: /bin/bash
+      register: micolab_verify_git_anonymous_web
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Require anonymous access to match the declared visibility
+      ansible.builtin.assert:
+        that:
+          - (micolab_verify_git_visibility == 'public' and micolab_verify_git_anonymous.rc == 0)
+            or (micolab_verify_git_visibility == 'private' and micolab_verify_git_anonymous.rc != 0)
+          - (micolab_verify_git_visibility == 'public' and micolab_verify_git_anonymous_web.stdout | trim == '200')
+            or (micolab_verify_git_visibility == 'private' and micolab_verify_git_anonymous_web.stdout | trim in ['401', '403', '404'])
+        fail_msg: >-
+          Anonymous access does not match micolab_verify_git_visibility
+          '{{ micolab_verify_git_visibility }}'. Anonymous ls-remote rc was
+          {{ micolab_verify_git_anonymous.rc }} and the web status was
+          {{ micolab_verify_git_anonymous_web.stdout | trim }}. Set the
+          declared visibility to the repository's real policy; do not
+          fabricate a pass.
+
+    - name: Mark the Git transport flow as executed
+      ansible.builtin.set_fact:
+        micolab_verify_git_flow_ok: true
+
+  rescue:
+    - name: Record the failed Git acceptance step without exposing credentials
+      ansible.builtin.set_fact:
+        micolab_verify_git_flow_ok: false
+        micolab_verify_git_failure: >-
+          {{ ansible_failed_task.name | default('unknown Git acceptance task') }}
+
+  always:
+    - name: Delete the HTTPS test branch from the remote
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git', '-C', micolab_verify_git_test_root ~ '/https']
+             + micolab_verify_git_https_tls_args
+             + ['push', 'origin', '--delete', micolab_verify_git_branch ~ '-https'] }}
+      environment:
+        GIT_ASKPASS: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        GIT_ASKPASS_REQUIRE: "force"
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+        MICOLAB_GIT_USERNAME: "{{ micolab_verify_git_https_username }}"
+        MICOLAB_GIT_TOKEN: "{{ micolab_verify_git_https_token }}"
+      register: micolab_verify_git_https_delete
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when: micolab_verify_git_https_push_attempted | bool
+
+    - name: Verify the HTTPS test branch is absent from the remote
+      ansible.builtin.command:
+        argv: >-
+          {{ ['git', '-C', micolab_verify_git_test_root ~ '/https']
+             + micolab_verify_git_https_tls_args
+             + ['ls-remote', '--heads', 'origin', micolab_verify_git_branch ~ '-https'] }}
+      environment:
+        GIT_ASKPASS: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        GIT_ASKPASS_REQUIRE: "force"
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_TERMINAL_PROMPT: "0"
+        MICOLAB_GIT_USERNAME: "{{ micolab_verify_git_https_username }}"
+        MICOLAB_GIT_TOKEN: "{{ micolab_verify_git_https_token }}"
+      register: micolab_verify_git_https_remote_check
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when: micolab_verify_git_https_push_attempted | bool
+
+    - name: Classify HTTPS remote cleanup from the observed remote refs
+      ansible.builtin.set_fact:
+        micolab_verify_git_https_cleanup: >-
+          {{ 'not-needed' if not (micolab_verify_git_https_push_attempted | bool)
+             else ('deleted'
+                   if ((micolab_verify_git_https_remote_check.rc | default(1)) == 0
+                       and ((micolab_verify_git_https_remote_check.stdout | default('')) | trim) == '')
+                   else 'failed') }}
+
+    - name: Delete the SSH test branch from the remote
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - push
+          - origin
+          - --delete
+          - "{{ micolab_verify_git_branch }}-ssh"
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_SSH_COMMAND: "{{ micolab_verify_git_ssh_command }}"
+        GIT_TERMINAL_PROMPT: "0"
+      register: micolab_verify_git_ssh_delete
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when: micolab_verify_git_ssh_push_attempted | bool
+
+    - name: Verify the SSH test branch is absent from the remote
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ micolab_verify_git_test_root }}/ssh"
+          - ls-remote
+          - --heads
+          - origin
+          - "{{ micolab_verify_git_branch }}-ssh"
+      environment:
+        GIT_CONFIG_GLOBAL: "/dev/null"
+        GIT_CONFIG_NOSYSTEM: "1"
+        GIT_SSH_COMMAND: "{{ micolab_verify_git_ssh_command }}"
+        GIT_TERMINAL_PROMPT: "0"
+      register: micolab_verify_git_ssh_remote_check
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when: micolab_verify_git_ssh_push_attempted | bool
+
+    - name: Classify SSH remote cleanup from the observed remote refs
+      ansible.builtin.set_fact:
+        micolab_verify_git_ssh_cleanup: >-
+          {{ 'not-needed' if not (micolab_verify_git_ssh_push_attempted | bool)
+             else ('deleted'
+                   if ((micolab_verify_git_ssh_remote_check.rc | default(1)) == 0
+                       and ((micolab_verify_git_ssh_remote_check.stdout | default('')) | trim) == '')
+                   else 'failed') }}
+
+    - name: Remove the HTTPS askpass helper
+      ansible.builtin.file:
+        path: "{{ micolab_verify_git_test_root }}/askpass.sh"
+        state: absent
+      register: micolab_verify_git_askpass_removal
+      ignore_errors: true
+
+    - name: Remove the private Git acceptance workspace
+      ansible.builtin.file:
+        path: "{{ micolab_verify_git_test_root }}"
+        state: absent
+      register: micolab_verify_git_workspace_removal
+      ignore_errors: true
+
+    # A removal task that is ignored is not proof of deletion. Inspect the
+    # filesystem after both removals ran: a failed or missing stat leaves the
+    # corresponding "removed" flag false, never optimistically true.
+    - name: Verify the HTTPS askpass helper is absent after removal
+      ansible.builtin.stat:
+        path: "{{ micolab_verify_git_test_root }}/askpass.sh"
+      register: micolab_verify_git_askpass_stat
+      ignore_errors: true
+
+    - name: Verify the private Git acceptance workspace is absent after removal
+      ansible.builtin.stat:
+        path: "{{ micolab_verify_git_test_root }}"
+      register: micolab_verify_git_workspace_stat
+      ignore_errors: true
+
+    - name: Set the local removal states from the observed filesystem
+      ansible.builtin.set_fact:
+        micolab_verify_git_credentials_removed: >-
+          {{ (micolab_verify_git_askpass_stat is defined)
+             and not (micolab_verify_git_askpass_stat.failed | default(false))
+             and (micolab_verify_git_askpass_stat.stat is defined)
+             and (micolab_verify_git_askpass_stat.stat.exists is defined)
+             and not (micolab_verify_git_askpass_stat.stat.exists) }}
+        micolab_verify_git_workspace_removed: >-
+          {{ (micolab_verify_git_workspace_stat is defined)
+             and not (micolab_verify_git_workspace_stat.failed | default(false))
+             and (micolab_verify_git_workspace_stat.stat is defined)
+             and (micolab_verify_git_workspace_stat.stat.exists is defined)
+             and not (micolab_verify_git_workspace_stat.stat.exists) }}
+        micolab_verify_git_local_cleanup_error: >-
+          {{ ((micolab_verify_git_askpass_removal.msg | default(''))
+              ~ ' '
+              ~ (micolab_verify_git_workspace_removal.msg | default(''))) | trim }}
+
+- name: Require Git acceptance to finish with proven remote and local cleanup
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_git_flow_ok | bool
+      - micolab_verify_git_https_cleanup in ['deleted', 'not-needed']
+      - micolab_verify_git_ssh_cleanup in ['deleted', 'not-needed']
+      - micolab_verify_git_credentials_removed | bool
+      - micolab_verify_git_workspace_removed | bool
+    fail_msg: >-
+      Git acceptance did not finish cleanly. Failed transport step:
+      {{ micolab_verify_git_failure | default('none', true) }}. HTTPS cleanup:
+      {{ micolab_verify_git_https_cleanup | default('unknown') }}, SSH cleanup:
+      {{ micolab_verify_git_ssh_cleanup | default('unknown') }}, credentials
+      removed: {{ micolab_verify_git_credentials_removed | default(false) }},
+      workspace removed: {{ micolab_verify_git_workspace_removed | default(false) }}.
+      If a branch may still exist, delete it from an authorized workstation with
+      `git push origin --delete <branch>`: HTTPS
+      `{{ micolab_verify_git_branch | default('<unknown>') }}-https`, SSH
+      `{{ micolab_verify_git_branch | default('<unknown>') }}-ssh`, repository
+      `{{ micolab_verify_git_repo | default('<unknown>') }}`. Local credentials
+      and workspace are proven removed only by a successful stat of
+      `{{ micolab_verify_git_test_root }}/askpass.sh` and
+      `{{ micolab_verify_git_test_root }}`; a false flag means the path still
+      exists or could not be inspected. Inspect those exact paths and remove
+      them manually; do not delete a broader directory. Local cleanup detail:
+      {{ micolab_verify_git_local_cleanup_error | default('none', true) }}.
+      Do not record this run as acceptance.
+  when: not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+
+- name: Record successful real Git acceptance only after proven cleanup
+  ansible.builtin.set_fact:
+    micolab_verify_git_accept_state: "executed"
+  when:
+    - not (micolab_verify_accept_unexecuted_git_acceptance | bool)
+    - micolab_verify_git_flow_ok | bool
+    - micolab_verify_git_https_cleanup in ['deleted', 'not-needed']
+    - micolab_verify_git_ssh_cleanup in ['deleted', 'not-needed']
+    - micolab_verify_git_credentials_removed | bool
+    - micolab_verify_git_workspace_removed | bool

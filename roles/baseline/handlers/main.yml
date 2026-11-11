@@ -1,0 +1,12 @@
+---
+- name: Reload systemd units
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Apply MicroLab firewall
+  ansible.builtin.systemd:
+    name: micolab-firewall
+    state: restarted
+    daemon_reload: true
+  when: not ansible_check_mode

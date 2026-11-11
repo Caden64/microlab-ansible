@@ -1,0 +1,117 @@
+---
+# Authoritative record checks. Requires tasks/targets.yml. Service names are
+# <service>.<micolab_verify_service_domain>; NS is queried at the zone apex
+# micolab_verify_zone. dig argv is built here only, so tests can render it.
+
+- name: Query expected A records from the authoritative DNS server
+  ansible.builtin.command:
+    argv:
+      - dig
+      - +short
+      - +time=2
+      - +tries=1
+      - A
+      - "{{ item }}"
+      - "@{{ micolab_verify_dns_server }}"
+      - -p
+      - "{{ micolab_verify_dns_port }}"
+  loop: "{{ micolab_verify_service_fqdns }}"
+  register: micolab_verify_a_results
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require every service A record to match the inventory SSH IP
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - (item.stdout_lines | map('trim') | reject('equalto', '') | sort) == [expected]
+    fail_msg: >-
+      A record {{ item.item }} does not match the expected address
+      {{ expected }}. No AAAA is created implicitly.
+  loop: "{{ micolab_verify_a_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    expected: "{{ micolab_verify_expected_a_records[item.item] | default(micolab_verify_mgmt_ip) }}"
+
+- name: Query AAAA records to enforce the no-implicit-IPv6 rule
+  ansible.builtin.command:
+    argv:
+      - dig
+      - +short
+      - +time=2
+      - +tries=1
+      - AAAA
+      - "{{ item }}"
+      - "@{{ micolab_verify_dns_server }}"
+      - -p
+      - "{{ micolab_verify_dns_port }}"
+  loop: "{{ micolab_verify_service_fqdns }}"
+  register: micolab_verify_aaaa_results
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Refuse implicit AAAA records when IPv6 support is not enabled
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout_lines | map('trim') | reject('equalto', '') | list | length == 0
+    fail_msg: >-
+      AAAA records exist for {{ item.item }} without explicit IPv6 support (or
+      the query failed). Remove them or set micolab_verify_enable_ipv6=true and
+      provide explicit expected AAAA values.
+  loop: "{{ micolab_verify_aaaa_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not (micolab_verify_enable_ipv6 | bool)
+
+- name: Require explicit expected AAAA values when IPv6 is enabled
+  ansible.builtin.assert:
+    that:
+      - item in micolab_verify_expected_aaaa_records
+    fail_msg: >-
+      IPv6 is enabled but no expected AAAA value was supplied for {{ item }}.
+  loop: "{{ micolab_verify_service_fqdns }}"
+  when: micolab_verify_enable_ipv6 | bool
+
+- name: Require every enabled AAAA record to match its explicit value
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - expected_aaaa in (item.stdout_lines | map('trim') | reject('equalto', '') | list)
+    fail_msg: >-
+      AAAA record {{ item.item }} does not match the explicit expected value.
+  loop: "{{ micolab_verify_aaaa_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    expected_aaaa: "{{ micolab_verify_expected_aaaa_records[item.item] }}"
+  when: micolab_verify_enable_ipv6 | bool
+
+- name: Query the authoritative zone NS record
+  ansible.builtin.command:
+    argv:
+      - dig
+      - +short
+      - +time=2
+      - +tries=1
+      - NS
+      - "{{ micolab_verify_zone }}"
+      - "@{{ micolab_verify_dns_server }}"
+      - -p
+      - "{{ micolab_verify_dns_port }}"
+  register: micolab_verify_ns
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require the ns1 nameserver record
+  ansible.builtin.assert:
+    that:
+      - micolab_verify_ns.rc == 0
+      - (micolab_verify_ns_name | lower) in (micolab_verify_ns.stdout_lines | map('lower') | map('trim') | list)
+    fail_msg: >-
+      The zone {{ micolab_verify_zone }} must publish NS
+      {{ micolab_verify_ns_name }}.

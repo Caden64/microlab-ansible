@@ -1,0 +1,37 @@
+---
+- name: Update an owned record's TTL or ownership comment
+  ansible.builtin.uri:
+    url: "{{ micolab_dns_api_base }}/api/zones/records/update"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ micolab_technitium_token }}"
+    body_format: form-urlencoded
+    body: >-
+      {{ {'domain': rec.name, 'zone': micolab_dns_zone, 'type': rec.type,
+          'ttl': rec.ttl | int, 'comments': micolab_dns_managed_comment}
+         | combine({'ipAddress': dns_record.micolab_raw_value | default(dns_record.micolab_value),
+                   'newIpAddress': rec.value}
+                   if rec.type in ['A', 'AAAA']
+                   else {'nameServer': dns_record.micolab_raw_value | default(dns_record.micolab_value),
+                         'newNameServer': rec.value}) }}
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: micolab_dns_record_update
+  failed_when: false
+  changed_when: >-
+    micolab_dns_record_update.status | default(0) == 200
+    and (micolab_dns_record_update.json | default({})).status | default('') == 'ok'
+  no_log: true
+  diff: false
+  notify: Technitium DNS restart for persistence gate
+
+- name: Require successful record update
+  ansible.builtin.assert:
+    that:
+      - micolab_dns_record_update.status | default(0) == 200
+      - (micolab_dns_record_update.json | default({})).status | default('') == 'ok'
+    fail_msg: >-
+      Technitium rejected update of owned record {{ rec.key }}:
+      {{ (micolab_dns_record_update.json | default({})).errorMessage | default('no error message') }}
+    quiet: true

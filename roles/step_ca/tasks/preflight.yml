@@ -1,0 +1,199 @@
+---
+# Read-only target CA preflight.
+#
+# Everything in this file observes the target and fails closed before
+# configure.yml creates users, directories, material, or ca.json. It does not
+# validate controller-side source artifacts: source_preflight.yml does that on
+# the controller, because `copy: src=` reads the controller, not the target.
+# The only allowed writes happen later, and only for the explicitly selected
+# transition.
+
+- name: Inspect existing CA state before writing anything
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ microlab_step_ca_config_file }}"
+    - "{{ microlab_step_ca_root_cert_dest }}"
+    - "{{ microlab_step_ca_intermediate_cert_dest }}"
+    - "{{ microlab_step_ca_intermediate_key_dest }}"
+    - "{{ microlab_step_ca_password_dest }}"
+    - "{{ microlab_step_ca_db_dir }}"
+    - "{{ microlab_step_ca_secrets_dir }}/root_ca_key"
+    - "{{ microlab_step_ca_home }}"
+  register: microlab_step_ca_stat
+
+- name: Index existing CA state without trusting simple existence
+  ansible.builtin.set_fact:
+    microlab_step_ca_config_exists: "{{ microlab_step_ca_stat.results[0].stat.exists | default(false) | bool }}"
+    microlab_step_ca_config_valid: >-
+      {{ (microlab_step_ca_stat.results[0].stat.exists | default(false) | bool)
+         and (microlab_step_ca_stat.results[0].stat.isreg | default(false) | bool)
+         and not (microlab_step_ca_stat.results[0].stat.islnk | default(false) | bool)
+         and ((microlab_step_ca_stat.results[0].stat.size | default(0) | int) > 0) }}
+    microlab_step_ca_root_exists: "{{ microlab_step_ca_stat.results[1].stat.exists | default(false) | bool }}"
+    microlab_step_ca_root_valid: >-
+      {{ (microlab_step_ca_stat.results[1].stat.exists | default(false) | bool)
+         and (microlab_step_ca_stat.results[1].stat.isreg | default(false) | bool)
+         and not (microlab_step_ca_stat.results[1].stat.islnk | default(false) | bool)
+         and ((microlab_step_ca_stat.results[1].stat.size | default(0) | int) > 0) }}
+    microlab_step_ca_crt_exists: "{{ microlab_step_ca_stat.results[2].stat.exists | default(false) | bool }}"
+    microlab_step_ca_crt_valid: >-
+      {{ (microlab_step_ca_stat.results[2].stat.exists | default(false) | bool)
+         and (microlab_step_ca_stat.results[2].stat.isreg | default(false) | bool)
+         and not (microlab_step_ca_stat.results[2].stat.islnk | default(false) | bool)
+         and ((microlab_step_ca_stat.results[2].stat.size | default(0) | int) > 0) }}
+    microlab_step_ca_key_exists: "{{ microlab_step_ca_stat.results[3].stat.exists | default(false) | bool }}"
+    microlab_step_ca_key_valid: >-
+      {{ (microlab_step_ca_stat.results[3].stat.exists | default(false) | bool)
+         and (microlab_step_ca_stat.results[3].stat.isreg | default(false) | bool)
+         and not (microlab_step_ca_stat.results[3].stat.islnk | default(false) | bool)
+         and ((microlab_step_ca_stat.results[3].stat.size | default(0) | int) > 0) }}
+    microlab_step_ca_password_exists: "{{ microlab_step_ca_stat.results[4].stat.exists | default(false) | bool }}"
+    microlab_step_ca_password_valid: >-
+      {{ (microlab_step_ca_stat.results[4].stat.exists | default(false) | bool)
+         and (microlab_step_ca_stat.results[4].stat.isreg | default(false) | bool)
+         and not (microlab_step_ca_stat.results[4].stat.islnk | default(false) | bool)
+         and ((microlab_step_ca_stat.results[4].stat.size | default(0) | int) > 0) }}
+    microlab_step_ca_db_path_exists: "{{ microlab_step_ca_stat.results[5].stat.exists | default(false) | bool }}"
+    microlab_step_ca_db_is_dir: "{{ microlab_step_ca_stat.results[5].stat.isdir | default(false) | bool }}"
+    microlab_step_ca_db_is_link: "{{ microlab_step_ca_stat.results[5].stat.islnk | default(false) | bool }}"
+    microlab_step_ca_root_key_exists: "{{ microlab_step_ca_stat.results[6].stat.exists | default(false) | bool }}"
+    microlab_step_ca_home_exists: "{{ microlab_step_ca_stat.results[7].stat.exists | default(false) | bool }}"
+    microlab_step_ca_home_is_dir: "{{ microlab_step_ca_stat.results[7].stat.isdir | default(false) | bool }}"
+    microlab_step_ca_home_is_link: "{{ microlab_step_ca_stat.results[7].stat.islnk | default(false) | bool }}"
+
+- name: Fail closed when the root private key is present on the host
+  ansible.builtin.assert:
+    that:
+      - not (microlab_step_ca_root_key_exists | bool)
+    fail_msg: >-
+      A root private key was found at
+      {{ microlab_step_ca_secrets_dir }}/root_ca_key. Remove it from the host
+      immediately and keep the root key offline. This role will not continue
+      while root key material is present.
+    quiet: true
+
+# The previous condition used `microlab_step_ca_home is exists`, which tests
+# the *controller* filesystem and skips the target scan whenever the controller
+# has no such path. Drive the scan from the target's own stat result and refuse
+# a symlinked or non-directory home rather than silently skipping it. Note the
+# scan is a best-effort filename heuristic under the registered target home; it
+# is not proof that no root key exists elsewhere or under an unrecognised name.
+- name: Refuse an existing CA home that is a symlink or not a directory
+  ansible.builtin.assert:
+    that:
+      - not (microlab_step_ca_home_exists | bool)
+        or ((microlab_step_ca_home_is_dir | bool)
+            and not (microlab_step_ca_home_is_link | bool))
+    fail_msg: >-
+      {{ microlab_step_ca_home }} exists on the target but is a symlink or not
+      a directory. This role will not scan or deploy through an unexpected CA
+      home. Restore a real directory or remove the path after an explicit
+      review; no target state was written.
+    quiet: true
+
+- name: Search the target CA home for any root private key material
+  ansible.builtin.find:
+    paths: "{{ microlab_step_ca_home }}"
+    recurse: true
+    hidden: true
+    follow: false
+    file_type: any
+    patterns:
+      - "*root*key*"
+      - "*root*private*"
+      - "root_ca_key*"
+      - "root_ca_private*"
+  register: microlab_step_ca_root_key_files
+  when:
+    - microlab_step_ca_home_exists | bool
+    - microlab_step_ca_home_is_dir | bool
+    - not (microlab_step_ca_home_is_link | bool)
+
+- name: Refuse to continue if any root private key material is present
+  ansible.builtin.assert:
+    that:
+      - (microlab_step_ca_root_key_files.matched | default(0)) == 0
+    fail_msg: >-
+      Root private key material was found under
+      {{ microlab_step_ca_home }}. Remove it from the target and keep it
+      offline. Only the public root and the encrypted intermediate may be here.
+      This filename scan is best-effort; review the host before continuing.
+    quiet: true
+
+- name: Inspect the CA database for durable badgerv2 state
+  ansible.builtin.find:
+    paths: "{{ microlab_step_ca_db_dir }}"
+    recurse: true
+    hidden: true
+    file_type: any
+  register: microlab_step_ca_db_contents
+  when:
+    - microlab_step_ca_db_path_exists | bool
+    - microlab_step_ca_db_is_dir | bool
+    - not (microlab_step_ca_db_is_link | bool)
+
+# Controller sources are validated by source_preflight.yml on the controller.
+# main.yml runs that file before install.yml; this gate keeps a direct include
+# of this preflight fail-closed rather than silently assuming the sources are
+# valid. It also makes the include order testable.
+- name: Require the controller-side source preflight before an explicit first deployment
+  ansible.builtin.assert:
+    that:
+      - (microlab_step_ca_sources_preflighted | default([]))
+        ==
+        [microlab_step_ca_root_cert_src,
+         microlab_step_ca_intermediate_cert_src,
+         microlab_step_ca_intermediate_key_src]
+    fail_msg: >-
+      An explicit first deployment requires
+      tasks/source_preflight.yml to validate these exact controller-side source
+      artifacts before this target preflight. Run the role through main.yml (or
+      include source_preflight.yml first); no target state was written.
+    quiet: true
+  when: microlab_step_ca_initial_deploy | bool
+
+- name: Classify the CA state against the recovery matrix
+  ansible.builtin.set_fact:
+    microlab_step_ca_state: >-
+      {{ {
+           'config_exists': microlab_step_ca_config_exists | bool,
+           'config_valid': microlab_step_ca_config_valid | bool,
+           'root_exists': microlab_step_ca_root_exists | bool,
+           'root_valid': microlab_step_ca_root_valid | bool,
+           'crt_exists': microlab_step_ca_crt_exists | bool,
+           'crt_valid': microlab_step_ca_crt_valid | bool,
+           'key_exists': microlab_step_ca_key_exists | bool,
+           'key_valid': microlab_step_ca_key_valid | bool,
+           'password_exists': microlab_step_ca_password_exists | bool,
+           'password_valid': microlab_step_ca_password_valid | bool,
+           'db_exists': (microlab_step_ca_db_path_exists | bool)
+                         and (microlab_step_ca_db_is_dir | bool)
+                         and not (microlab_step_ca_db_is_link | bool),
+           'db_invalid': (microlab_step_ca_db_path_exists | bool)
+                         and ((not (microlab_step_ca_db_is_dir | bool))
+                              or (microlab_step_ca_db_is_link | bool)),
+           'db_files': microlab_step_ca_db_contents.files | default([]),
+           'db_type': microlab_step_ca_db_type,
+           'initial_deploy': microlab_step_ca_initial_deploy | bool,
+           'recover_missing_config': microlab_step_ca_recover_missing_config | bool,
+           'source_material_valid': true,
+         } | step_ca_state }}
+
+- name: Require one complete, explicitly selected CA state transition
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_state.action in ['normal', 'initial-deploy', 'recover-config']
+    fail_msg: "{{ microlab_step_ca_state.reason }}"
+    quiet: true
+
+- name: Validate existing durable material before any recovery or redeploy write
+  ansible.builtin.include_tasks: verify_material.yml
+  vars:
+    microlab_step_ca_verify_root: "{{ microlab_step_ca_root_cert_dest }}"
+    microlab_step_ca_verify_crt: "{{ microlab_step_ca_intermediate_cert_dest }}"
+    microlab_step_ca_verify_key: "{{ microlab_step_ca_intermediate_key_dest }}"
+    microlab_step_ca_verify_password_arg: "file:{{ microlab_step_ca_password_dest }}"
+    microlab_step_ca_verify_label: deployed
+  when: microlab_step_ca_state.material_complete | bool
