@@ -1,0 +1,158 @@
+---
+- name: Validate the two-host boundary without connecting to targets
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Require exactly one infra host isolated from challenge workloads
+      ansible.builtin.assert:
+        that:
+          - groups['microlab_management'] | default([]) | length == 1
+          - (groups['microlab_management'] | default([]) | intersect(groups['microlab_challenge'] | default([]))) | length == 0
+          - groups['microlab_challenge'] | default([]) | length <= 1
+        fail_msg: >-
+          Define one infra host in microlab_management for Technitium, step-ca,
+          Caddy and Forgejo together. The separate rCTF/microVM host belongs
+          only in microlab_challenge (it may be added later). Probe hosts need
+          neither group. These playbooks never configure challenge hosts.
+        quiet: true
+
+    - name: Reject a challenge alias pointing at the infra address
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].ansible_host | default(item)) != (hostvars[groups['microlab_management'][0]].ansible_host | default(groups['microlab_management'][0]))
+        fail_msg: The rCTF/microVM host must have a different address from infra.
+        quiet: true
+      loop: "{{ groups['microlab_challenge'] | default([]) }}"
+
+- name: Deploy the single infra host
+  hosts: microlab_management
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    microlab_installation_mode: true
+  pre_tasks:
+    - name: Load inventory-preserving shared defaults
+      ansible.builtin.import_tasks: install_defaults.yml
+
+    - name: Enforce workflow mode
+      ansible.builtin.assert:
+        that:
+          - microlab_installation_mode | bool == true
+        quiet: true
+
+  tasks:
+    - name: "Phase 1: baseline validation, time, storage, packages, firewall"
+      ansible.builtin.include_role:
+        name: baseline
+
+    - name: Flush baseline handlers before installing services
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 2: pinned offline Technitium and runtime installation"
+      ansible.builtin.include_role:
+        name: technitium_install
+
+    - name: Flush install handlers before DNS convergence
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 3: Technitium settings, hnh zone, records, DNS gates"
+      ansible.builtin.include_role:
+        name: technitium_dns
+
+    - name: Flush DNS handlers before exposing dependent services
+      ansible.builtin.meta: flush_handlers
+
+    - name: Gate later phases on the recorded DNS acceptance state
+      ansible.builtin.assert:
+        that:
+          - (microlab_installation_mode | default(false) | bool)
+            or (micolab_dns_external_acl_verified | default(false) | bool)
+            or (micolab_dns_accept_unverified_external_acl | default(false) | bool)
+        fail_msg: >-
+          DNS did not reach an accepted state. Refusing to start certificate,
+          proxy, or Git services on an unverified resolver/ACL.
+        quiet: true
+
+    - name: "Phase 4: internal step-ca issuance and trust distribution"
+      ansible.builtin.include_role:
+        name: step_ca
+      vars:
+        microlab_step_ca_trust_store_path: "{{ micolab_trust_bundle_path }}"
+
+    - name: Flush step-ca handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 5: Caddy edge with CA+DNS rendered and the Git vhost disabled"
+      ansible.builtin.include_role:
+        name: caddy
+      vars:
+        micolab_caddy_enable_git: false
+        # Render the dns vhost now so its certificate and Technitium admin
+        # proxy are proven before Forgejo. The DoH backend on 8053 is created
+        # in phase 6, so the first pass must not probe /dns-query yet.
+        micolab_caddy_enable_dns: true
+        micolab_caddy_verify_doh: false
+
+    - name: Flush first Caddy pass handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 6: encrypted DNS protocols using step-ca material"
+      ansible.builtin.include_role:
+        name: technitium_tls
+      vars:
+        micolab_technitium_dot_port: "{{ micolab_dns_dot_port }}"
+        micolab_technitium_doh_port: "{{ micolab_dns_doh_port }}"
+
+    - name: Flush encrypted DNS handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 6b: Caddy/DoH readiness after encrypted DNS is healthy"
+      ansible.builtin.include_role:
+        name: caddy
+        tasks_from: health_doh
+      vars:
+        micolab_caddy_enable_dns: true
+        micolab_caddy_verify_doh: true
+
+    - name: "Phase 7: Forgejo on loopback, no Git vhost yet"
+      ansible.builtin.include_role:
+        name: forgejo
+      vars: {}
+
+    - name: Flush Forgejo handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: "Phase 8: Caddy edge with the Git vhost enabled"
+      ansible.builtin.include_role:
+        name: caddy
+      vars:
+        micolab_caddy_enable_git: true
+
+    - name: Flush final Caddy handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Run all local cross-service gates and record pending external acceptance
+      ansible.builtin.include_role:
+        name: verify
+
+    - name: Record local installation readiness
+      ansible.builtin.copy:
+        dest: /var/lib/microlab/install-status.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ {'schema': 1, 'phase': 'deploy', 'local_ready': true,
+              'overall': 'local-ready', 'external_acceptance': 'pending',
+              'git_acceptance': 'pending', 'acceptance_file': micolab_verify_acceptance_file | default('/var/lib/microlab/verify-acceptance.json')} | to_nice_json }}
+
+    - name: Report local readiness and pending acceptance
+      ansible.builtin.debug:
+        msg: >-
+          LOCAL-READY: infra convergence and local correctness/security checks
+          passed. External ACLs and HTTPS/SSH Git clone/push are PENDING.
+          Run verify with real vantages and a disposable repository later.

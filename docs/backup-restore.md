@@ -177,11 +177,14 @@ cannot silently leak escrow material.
    **and** failure, waits for the services, and health-gates Forgejo and the
    public HTTPS git endpoint.
 
-Example (the destination must already be mounted):
+Example from the **controller**, using the private inventory created in the
+[fresh-clone guide](fresh-clone.md). The target destination must already be
+mounted and created with root-only access:
 
 ```bash
-ansible-playbook -i inventories/<site>/hosts.yml playbooks/backup.yml \
-  -e micolab_backup_confirm=true \
+ansible-playbook -i inventories/site/hosts.yml playbooks/backup.yml \
+  --ask-vault-pass --ask-become-pass \
+  -e '{"micolab_backup_confirm": true}' \
   -e micolab_backup_destination=/srv/microlab-backups
 ```
 
@@ -256,38 +259,143 @@ production operation. It is an isolated-target workflow:
   `micolab_restore_start_services=true`; starting the timer additionally needs
   `micolab_restore_start_renewal_timer=true`.
 
-Example validation-only run on the isolated target:
+### Create the isolated recovery inventory and inputs
+
+`inventories/restore-lab/` is **not shipped in the repository**. On the
+controller, from the checkout root, create it from your private site inventory
+once. Do not overwrite an existing recovery inventory:
 
 ```bash
-ansible-playbook -i inventories/<isolated>/hosts.yml playbooks/restore.yml \
-  -e micolab_restore_archive=/srv/microlab-backups/microlab-backup-<timestamp>.tar.gz \
-  -e micolab_restore_checksum=<sha256> \
-  -e micolab_restore_confirm=RESTORE-ISOLATED-MICROLAB \
-  -e micolab_restore_isolated=true
+if [ -e inventories/restore-lab ]; then
+  echo 'Recovery inventory already exists; inspect it before continuing.'
+else
+  cp -a inventories/site inventories/restore-lab
+  chmod 700 inventories/restore-lab
+fi
+git check-ignore inventories/restore-lab/hosts.yml
+nano inventories/restore-lab/hosts.yml
 ```
 
-Then, after reviewing the dry-run output, explicitly commit:
+Change the copied management host's `ansible_host`, SSH account and controller
+private-key path to the **isolated recovery machine**. Review copied group
+variables, DNS addresses, probe targets, artifact paths and Vault inputs before
+using it. A different inventory filename does not isolate a machine: verify
+the actual IP, routing and firewall isolation. Do not remove a production group
+label to bypass the restore guard, and do not run site.yml against this copy
+as a shortcut to recovery; site.yml starts services and changes DNS/firewall state.
+
+On the **proven isolated target**, create the marker and upload directory:
 
 ```bash
-ansible-playbook ... -e micolab_restore_commit=true
+sudo install -d -m 0755 /etc/microlab
+sudo install -m 0600 /dev/null /etc/microlab/isolated-restore-target
+install -d -m 0700 "$HOME/microlab-restore-upload"
+sudo install -d -m 0700 /srv/microlab-backups
 ```
 
-Services and the renewal timer remain stopped by default. Start services only
-after inspection:
+Transfer the selected archive and its matching checksum/manifest through your
+protected backup channel. For a backup already retrieved to the controller,
+this example uploads the archive to the isolated account (replace all uppercase
+placeholders; use the actual emitted `micolab-backup-...` name):
 
 ```bash
-ansible-playbook ... -e micolab_restore_commit=true \
-  -e micolab_restore_start_services=true
+# CONTROLLER
+scp -i /REPLACE_WITH_CONTROLLER_RECOVERY_SSH_KEY \
+  /REPLACE_WITH_CONTROLLER_BACKUP_DIR/micolab-backup-REPLACE_TIMESTAMP.tar.gz \
+  REPLACE_USER@REPLACE_ISOLATED_IP:microlab-restore-upload/
+# ISOLATED TARGET, logged in as that account
+sudo install -m 0600 \
+  "$HOME/microlab-restore-upload/micolab-backup-REPLACE_TIMESTAMP.tar.gz" \
+  /srv/microlab-backups/micolab-backup-REPLACE_TIMESTAMP.tar.gz
+sudo sha256sum /srv/microlab-backups/micolab-backup-REPLACE_TIMESTAMP.tar.gz
 ```
 
-Start the renewal timer only after the certificate, API credential, and DoT
-health checks pass:
+Compare that hash to the independently retained backup checksum and manifest.
+Do not accept a newly calculated hash alone as proof that the transfer is the
+intended backup. The archive path below is **on the isolated target**, not the
+controller. Preserve the archive mode 0600.
+
+On the controller, create `inventories/restore-lab/restore-inputs.yml` with your
+editor. This new file does not exist until you create it; the commands below
+load it explicitly with `-e @...`:
+
+```yaml
+---
+micolab_restore_archive: /srv/microlab-backups/micolab-backup-REPLACE_TIMESTAMP.tar.gz
+micolab_restore_checksum: "REPLACE_WITH_64_HEX_VERIFIED_ARCHIVE_SHA256"
+micolab_restore_confirm: RESTORE-ISOLATED-MICROLAB
+micolab_restore_isolated: true
+micolab_restore_commit: false
+micolab_restore_start_services: false
+micolab_restore_start_renewal_timer: false
+```
+
+Before committing restored state, prepare the matching service accounts, pinned
+binaries, dependencies and systemd units on the isolated target. They are not
+all in the state archive, and this restore playbook does not reconstruct the
+whole operating system. Archive validation alone does not prove that the main
+service units are installed or usable. In particular, ownership normalization needs the named
+service users/groups. An existing isolated test installation at the matching
+versions can supply those prerequisites; do not initialize a replacement CA
+merely to create them. A fully automated bare-metal provisioning procedure is
+not supplied by this restore playbook.
+
+Run validation from the **controller**, with the venv activated:
 
 ```bash
-ansible-playbook ... -e micolab_restore_commit=true \
-  -e micolab_restore_start_services=true \
-  -e micolab_restore_start_renewal_timer=true
+ansible-playbook -i inventories/restore-lab/hosts.yml playbooks/restore.yml \
+  --ask-vault-pass --ask-become-pass \
+  -e @inventories/restore-lab/restore-inputs.yml
 ```
+
+After reviewing validation and prerequisites, change **only**
+`micolab_restore_commit` to `true` in `restore-inputs.yml` and run the same
+complete command:
+
+```bash
+ansible-playbook -i inventories/restore-lab/hosts.yml playbooks/restore.yml \
+  --ask-vault-pass --ask-become-pass \
+  -e @inventories/restore-lab/restore-inputs.yml
+```
+
+This installs restored state and leaves services/timer stopped. Reset
+`micolab_restore_commit` to `false` after a successful restore to avoid an
+accidental repeat. Do not repeatedly recommit the archive merely to start
+services. After inspecting the restored state and isolation, start each service
+on the **isolated target** and inspect its status/logs before moving to the next:
+
+```bash
+sudo systemctl enable --now dns
+sudo systemctl enable --now step-ca
+sudo systemctl enable --now caddy
+sudo systemctl enable --now forgejo
+sudo systemctl status dns step-ca caddy forgejo --no-pager
+```
+
+Regenerate Forgejo's forced-command SSH entries on the isolated target, using
+your effective service user and paths if they differ from these defaults. They
+are not in the backup; this explicit manual-start procedure does not execute
+the restore playbook's optional start-services/key-regeneration tasks:
+
+```bash
+sudo -u git env HOME=/home/git USER=git /usr/local/bin/forgejo \
+  --config /etc/forgejo/app.ini --work-path /var/lib/forgejo admin regenerate keys
+```
+
+Use the validation checklist below before restoring client access. Start the
+renewal timer only after certificate, API credential and live DoT checks pass:
+
+```bash
+sudo /usr/local/sbin/technitium-tls-renew \
+  --config /etc/technitium-tls/renewal.env --check-only
+sudo /usr/local/sbin/technitium-tls-renew \
+  --config /etc/technitium-tls/renewal.env --verify-only
+sudo systemctl enable --now technitium-tls-renew.timer
+```
+
+If a leaf expired while offline, follow protected re-enrollment rather than
+enabling renewal-after-expiry. Recreate acceptance SSH material separately;
+`/root/microlab-acceptance` is outside the default state archive.
 
 ### Ownership notes
 
@@ -303,8 +411,9 @@ ansible-playbook ... -e micolab_restore_commit=true \
   `micolab_restore_apply_ownership=false` when numeric ownership is already
   correct.
 - `/home/git/.ssh/authorized_keys` is intentionally not backed up as
-  authoritative state. After a started restore, the playbook runs
-  `forgejo admin regenerate keys`; the database is authoritative.
+  authoritative state. With its optional service-start flag, the playbook runs
+  `forgejo admin regenerate keys`; the manual-start procedure above must run
+  that command explicitly. The database is authoritative.
 
 ### Configuration is code
 

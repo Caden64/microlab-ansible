@@ -175,7 +175,9 @@
            'external_acl_override': (micolab_dns_accept_unverified_external_acl | bool)
                                     and (micolab_dns_remote_probes | length == 0),
            'unexecuted_gates': micolab_dns_unexecuted_gates | default([]),
-           'remote_probe_count': micolab_dns_remote_probes | length,
+           'remote_probe_count': (0 if (microlab_installation_mode | default(false) | bool) else (micolab_dns_remote_probes | length)),
+           'configured_remote_probe_count': micolab_dns_remote_probes | length,
+           'installation_mode': microlab_installation_mode | default(false) | bool,
            'resolver_managed': micolab_dns_manage_resolv_conf | bool,
            'managed_records': micolab_dns_desired_records | map(attribute='key') | list
          } | to_nice_json }}

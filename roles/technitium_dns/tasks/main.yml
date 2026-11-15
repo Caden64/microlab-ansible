@@ -273,6 +273,18 @@
 
 - name: Include remote client acceptance probes
   ansible.builtin.include_tasks: remote_probes.yml
+  when: not (microlab_installation_mode | default(false) | bool)
+
+- name: Record external DNS acceptance pending during installation
+  ansible.builtin.set_fact:
+    micolab_dns_external_acl_verified: false
+    micolab_dns_external_gates: []
+    micolab_dns_unexecuted_gates:
+      - external-authoritative-aa
+      - external-recursion-allowed
+      - external-recursion-denied
+      - external-firewall-denied
+  when: microlab_installation_mode | default(false) | bool
 
 - name: Include resolver switch after all DNS gates
   ansible.builtin.include_tasks: resolver.yml

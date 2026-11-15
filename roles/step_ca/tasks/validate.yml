@@ -45,7 +45,9 @@
       file:/// URL. Set microlab_step_ca_allow_remote_artifacts=true only for a
       reviewed mirror, never for an unpinned download.
     quiet: true
-  when: not (microlab_step_ca_allow_remote_artifacts | bool)
+  when:
+    - not (microlab_step_ca_allow_remote_artifacts | bool)
+    - microlab_step_ca_artifact_src | length == 0 or microlab_step_cli_artifact_src | length == 0
 
 - name: Require pinned step-ca version and per-architecture checksum
   ansible.builtin.assert:

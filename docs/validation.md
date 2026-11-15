@@ -1,12 +1,48 @@
 # Validation status
 
 **Experimental prerelease.** Local checks have passed; deployment acceptance
-on a real management host remains outstanding. This document records prior
-root-thread verification supplied for this checkout. The license/documentation
-edit did not rerun the suite. These results are a historical record, not a
-guarantee for later changes in the shared checkout.
+on a real management host remains outstanding. Historical full-suite results
+and current onboarding checks are recorded separately below. Neither is a
+guarantee for later changes in this shared checkout.
 
-## Recorded local checks
+## Current onboarding checks (2026-11-13)
+
+`tests/test_setup_experience.py`: **10 passed, zero skipped**. These run the
+actual launcher in disposable copied checkouts with temporary fresh and filled
+inventories. Synthetic ELF/archive fixtures replace publisher downloads;
+mock Vault, inventory and Ansible subprocesses replace encryption and remote
+execution. The fixtures contain no real keys and contact no inventory targets.
+
+They establish the five command/help interfaces, fresh same-subnet setup,
+byte-preserving filled-inventory/Vault reuse, artifact staging/rerun preservation,
+required specific admin identity, pre-mutation CA checkpoint, bootstrap to
+deploy/verify command routing, failure exit propagation and local-only status.
+The fresh-directory case exercises setup → artifacts → bootstrap → deploy →
+verify → status. A successful mock verify **does not prove acceptance**.
+
+```bash
+python -m unittest discover -s tests -p test_setup_experience.py
+```
+
+Syntax checks passed for `bootstrap.yml`, `deploy.yml` and `verify.yml`, using
+only `inventories/example/hosts.yml`; no target connection was made.
+
+The broader focused run also passed: **46 setup/artifact tests**
+(`test_*setup*.py`, including the 10 onboarding cases above) and **9 staged
+workflow tests** (`test_install_workflow.py`), zero skipped. The workflow tests
+use local mock roles and disposable state, not inventory targets. The historical
+258-test full suite below was not rerun for this documentation/test change.
+
+Current launcher limitations: `status` does not retrieve remote reports or
+unlock encrypted configuration; it labels remote state UNVERIFIED. Deploy
+stage selection currently relies on both TLS tokens being present, so clearing
+a consumed enrollment token selects bootstrap again. An explicit resume stage
+or enrollment-aware selection remains needed. Do not keep consumed/dummy tokens
+to work around selection. The wrapper exposes no artifact `--offline`/`--check`
+flags; those belong to the standalone artifact module. See
+[fresh-clone onboarding](fresh-clone.md) for the actual command contract.
+
+## Historical full-suite checks
 
 - Python unittest discovery: **258 tests passed, zero skipped**.
 - Ansible syntax checks: `site.yml`, `backup.yml`, and `restore.yml` passed.
@@ -67,23 +103,47 @@ No recorded local result proves a deployed Caddy/Forgejo/step-ca/Technitium
 stack, real network policy, or client trust. Implemented checks in
 `roles/verify` still need to be run against the intended environment.
 
-## Inputs still required before deployment
+## Installation inputs and later acceptance inputs
 
-The example inventory deliberately contains placeholders. Supply reviewed
-version pins, SHA-256 checksums, and staged artifacts for Technitium, .NET,
-step-ca, step CLI, Caddy, and Forgejo; the real management/SSH IP and user;
-admin, client, and authoritative-only CIDRs; and the controlled local DNS
-fixture values. Supply vaulted service/admin secrets, API/enrollment tokens,
-and the PFX password, plus a disposable Git repository, credentials, operator
-SSH key, and pinned SSH host key for acceptance.
+The example inventory deliberately contains placeholders. Reuse an already
+filled private inventory; setup must not overwrite it. This site's two hosts
+are infra `10.72.78.73` and rCTF/microVM `10.72.78.72`, both reachable by players
+on `10.72.78.0/24`. The admin workstation `/32` or protected VPN CIDR remains
+unknown and required. Client access is not CA/DNS admin permission. A stable
+DHCP reservation is sufficient; no router or host static-network rewrite is
+needed. Those addresses belong in site inputs, not universal role defaults.
 
-Complete the offline root ceremony and separate root-key escrow, public root
-fingerprint/trust distribution, intermediate material, and provisioner inputs
-described in [CA recovery](ca-recovery.md). Root private material must remain
-offline, outside the controller and management host. Provide real probe clients
-with configured source addresses in the allowed, recursion-denied, and
-firewall-denied networks, including the external HTTPS/DoH/DoT ACL cases.
-Missing infrastructure or inputs are prerequisites, not completed validation.
+Installation needs reviewed versions, checksums and controller artifacts for
+Technitium, .NET, step-ca, step CLI, Caddy and Forgejo; actual SSH identity,
+architecture, client/admin CIDRs, storage/time policy and local DNS fixture
+values. The staged artifact workflow supplies controller CA archive paths for
+Ansible to copy; legacy `site.yml` can also use the existing target-local
+artifact interface. A downloaded/validated artifact is not service acceptance.
+
+The offline root ceremony, separate root-key escrow, public root fingerprint,
+intermediate material and provisioner inputs remain operator work. See
+[CA recovery](ca-recovery.md). Root private material stays offline, outside
+both infra and the controller. Durable secrets and the TLS API/enrollment
+handoff are still required; no unknown tokens are created by setup.
+
+A disposable Git repo/credentials/SSH identity and real external ACL probe
+vantages are **later full-acceptance inputs**, not a requirement to provision
+extra physical installation hosts. Real source addresses and policy remain
+necessary to prove denial. On this shared client subnet some denial classes
+have no supplied vantage; they remain pending. Do not change client policy or
+invent five networks to make the installation appear accepted.
+
+Staged `bootstrap.yml` records `credential-checkpoint`; `deploy.yml` records
+`local-ready` only after its local checks. `verify.yml` requests external DNS,
+HTTPS/DoH/DoT and Git acceptance and refuses incomplete-acceptance overrides.
+Missing probes are never passed tests. These playbooks target one infra host;
+the separate rCTF/microVM host is not configured by them.
+
+The CLI selects these installation stages explicitly with `deploy --stage
+bootstrap` and `deploy --stage services`. After first enrollment, clear the
+consumed enrollment token and keep using `--stage services`; a missing one-use
+token does not prove the target needs bootstrap. Local CLI regression tests
+exercise this handoff with mocked playbook execution, not a live certificate.
 
 ## Real-host acceptance still outstanding
 

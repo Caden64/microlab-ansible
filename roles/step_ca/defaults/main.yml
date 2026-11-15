@@ -13,6 +13,9 @@ microlab_step_ca_enabled: true
 #   step_linux_<version>_<arch>.tar.gz     (contains step_<version>/bin/step)
 microlab_step_ca_artifact_base_url: "file:///srv/microlab/artifacts"
 microlab_step_ca_allow_remote_artifacts: false
+# Absolute controller archive paths; empty preserves legacy target file:// staging.
+microlab_step_ca_artifact_src: ""
+microlab_step_cli_artifact_src: ""
 microlab_step_ca_version: ""
 microlab_step_ca_checksums: {}
 microlab_step_cli_version: ""

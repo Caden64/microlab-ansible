@@ -14,14 +14,22 @@
     - name: Require a management host and an empty-overlap challenge group
       ansible.builtin.assert:
         that:
-          - groups[micolab_management_group] | default([]) | length > 0
-          - (groups[micolab_management_group] | default([])
-             | intersect(groups[micolab_challenge_group] | default([])) | length == 0)
+          - groups['microlab_management'] | default([]) | length == 1
+          - (groups['microlab_management'] | default([])
+             | intersect(groups['microlab_challenge'] | default([])) | length == 0)
         fail_msg: >-
-          Inventory must define at least one host in
-          {{ micolab_management_group }} and that host must not also be in
-          {{ micolab_challenge_group }}.
+          Inventory must define exactly one infra host in
+          microlab_management and that host must not also be in
+          microlab_challenge.
         quiet: true
+
+    - name: Reject a challenge alias pointing at the infra address
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].ansible_host | default(item)) != (hostvars[groups['microlab_management'][0]].ansible_host | default(groups['microlab_management'][0]))
+        fail_msg: The rCTF/microVM host must have a different address from infra.
+        quiet: true
+      loop: "{{ groups['microlab_challenge'] | default([]) }}"
 
 - name: Deploy the MicroLab management plane
   hosts: microlab_management
@@ -32,10 +40,13 @@
   become: true
 
   pre_tasks:
+    - name: Load inventory-preserving shared defaults
+      ansible.builtin.import_tasks: install_defaults.yml
+
     - name: Refuse to run against a challenge host
       ansible.builtin.assert:
         that:
-          - inventory_hostname not in (groups[micolab_challenge_group] | default([]))
+          - inventory_hostname not in (groups['microlab_challenge'] | default([]))
         fail_msg: >-
           {{ inventory_hostname }} belongs to the challenge group. This
           playbook installs management services and must never run there.
@@ -77,7 +88,7 @@
       ansible.builtin.include_role:
         name: step_ca
       vars:
-        micolab_step_ca_trust_store_path: "{{ micolab_trust_bundle_path }}"
+        microlab_step_ca_trust_store_path: "{{ micolab_trust_bundle_path }}"
 
     - name: Flush step-ca handlers
       ansible.builtin.meta: flush_handlers

@@ -130,7 +130,6 @@ micolab_verify_acceptance_file: "/var/lib/microlab/verify-acceptance.json"
 micolab_verify_loopback_ports:
   forgejo_http: 3000
   step_ca_https: 4443
-  dns_http: 8053
   caddy_admin: 2019
 micolab_verify_required_services:
   - caddy

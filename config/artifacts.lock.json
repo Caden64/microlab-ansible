@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "verification": "Publisher HTTPS metadata pins; no signature verification or live integration certification. Native archives were inspected without executing binaries.",
+  "artifacts": {
+    "caddy": {
+      "amd64": {
+        "version": "2.11.9",
+        "filename": "caddy_2.11.9_linux_amd64.tar.gz",
+        "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_linux_amd64.tar.gz",
+        "sha256": "5b8cb7faf8726a2028ad96a66e54e6e81e8f361bc6175e5d22bbd997cc5177fb",
+        "publisher_hash": {
+          "sha256": "5b8cb7faf8726a2028ad96a66e54e6e81e8f361bc6175e5d22bbd997cc5177fb"
+        },
+        "metadata_url": "https://api.github.com/repos/caddyserver/caddy/releases/tags/v2.11.9",
+        "member": "caddy"
+      },
+      "arm64": {
+        "version": "2.11.9",
+        "filename": "caddy_2.11.9_linux_arm64.tar.gz",
+        "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_linux_arm64.tar.gz",
+        "sha256": "5e377cff994fc9362a6fcf695c53f226cfca3a3ef85bd3a3687cf252d6310165",
+        "publisher_hash": {
+          "sha256": "5e377cff994fc9362a6fcf695c53f226cfca3a3ef85bd3a3687cf252d6310165"
+        },
+        "metadata_url": "https://api.github.com/repos/caddyserver/caddy/releases/tags/v2.11.9",
+        "member": "caddy"
+      }
+    },
+    "step-ca": {
+      "amd64": {
+        "version": "0.30.2",
+        "filename": "step-ca_linux_0.30.2_amd64.tar.gz",
+        "url": "https://github.com/smallstep/certificates/releases/download/v0.30.2/step-ca_linux_0.30.2_amd64.tar.gz",
+        "sha256": "126615795bafe3f2d3f890e2d628fa6e2857315fb48d0671d34b23047cc37d73",
+        "publisher_hash": {
+          "sha256": "126615795bafe3f2d3f890e2d628fa6e2857315fb48d0671d34b23047cc37d73"
+        },
+        "metadata_url": "https://api.github.com/repos/smallstep/certificates/releases/tags/v0.30.2",
+        "member": "step-ca"
+      },
+      "arm64": {
+        "version": "0.30.2",
+        "filename": "step-ca_linux_0.30.2_arm64.tar.gz",
+        "url": "https://github.com/smallstep/certificates/releases/download/v0.30.2/step-ca_linux_0.30.2_arm64.tar.gz",
+        "sha256": "43f79d1b0b8cab9895dbadd46b0a014006f682a6b1341e1fadf0be31d4b9f4b4",
+        "publisher_hash": {
+          "sha256": "43f79d1b0b8cab9895dbadd46b0a014006f682a6b1341e1fadf0be31d4b9f4b4"
+        },
+        "metadata_url": "https://api.github.com/repos/smallstep/certificates/releases/tags/v0.30.2",
+        "member": "step-ca"
+      }
+    },
+    "step-cli": {
+      "amd64": {
+        "version": "0.31.0",
+        "filename": "step_linux_0.31.0_amd64.tar.gz",
+        "url": "https://github.com/smallstep/cli/releases/download/v0.31.0/step_linux_0.31.0_amd64.tar.gz",
+        "sha256": "a7e13726efa8782f3d5459174dacf602ab3514b9431f2d42a6a75950b7685e5f",
+        "publisher_hash": {
+          "sha256": "a7e13726efa8782f3d5459174dacf602ab3514b9431f2d42a6a75950b7685e5f"
+        },
+        "metadata_url": "https://api.github.com/repos/smallstep/cli/releases/tags/v0.31.0",
+        "member": "step_0.31.0/bin/step"
+      },
+      "arm64": {
+        "version": "0.31.0",
+        "filename": "step_linux_0.31.0_arm64.tar.gz",
+        "url": "https://github.com/smallstep/cli/releases/download/v0.31.0/step_linux_0.31.0_arm64.tar.gz",
+        "sha256": "9937964c7d47de47a511cd775bd07101b8ee9854db210abd402c69093f0a6fd4",
+        "publisher_hash": {
+          "sha256": "9937964c7d47de47a511cd775bd07101b8ee9854db210abd402c69093f0a6fd4"
+        },
+        "metadata_url": "https://api.github.com/repos/smallstep/cli/releases/tags/v0.31.0",
+        "member": "step_0.31.0/bin/step"
+      }
+    },
+    "dotnet-aspnetcore-runtime": {
+      "amd64": {
+        "version": "10.0.15",
+        "filename": "aspnetcore-runtime-10.0.15-linux-x64.tar.gz",
+        "url": "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/10.0.15/aspnetcore-runtime-10.0.15-linux-x64.tar.gz",
+        "sha256": "029d600b47d8e1676fbb652b8d1564bc76167bbbac5b8c3004a2bd3c33e55ee5",
+        "publisher_hash": {
+          "sha512": "704751c6d671b720935a18849e8f10cdb6938549e9cf25493050ebc838a95eb5cb1caa9936d2edae3b85c5975778ed926e9b736e3a2582d861411babba3229c3"
+        },
+        "metadata_url": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+        "member": "dotnet"
+      },
+      "arm64": {
+        "version": "10.0.15",
+        "filename": "aspnetcore-runtime-10.0.15-linux-arm64.tar.gz",
+        "url": "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/10.0.15/aspnetcore-runtime-10.0.15-linux-arm64.tar.gz",
+        "sha256": "ea7a65aa1c33efd3375564ac03bae3c413e9817252adc89d11978fd8509520ea",
+        "publisher_hash": {
+          "sha512": "1d82a6822871c0e750d2d3d3b9b27657d24a2083eb999c2f78b39b0cd10862178cb2c6d21f941579cd521baf5738a78d3378e5754c5895a93d7546135eb40ec6"
+        },
+        "metadata_url": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+        "member": "dotnet"
+      }
+    },
+    "forgejo": {
+      "amd64": {
+        "version": "17.0.1",
+        "filename": "forgejo-17.0.1-linux-amd64",
+        "url": "https://code.forgejo.org/forgejo/forgejo/releases/download/v17.0.1/forgejo-17.0.1-linux-amd64",
+        "sha256": "51a8cdf4a1252e79f4b3855d7a7891af6c6635105420768c460e2f0690385d6f",
+        "publisher_hash": {
+          "sha256": "51a8cdf4a1252e79f4b3855d7a7891af6c6635105420768c460e2f0690385d6f"
+        },
+        "metadata_url": "https://code.forgejo.org/forgejo/forgejo/releases/download/v17.0.1/forgejo-17.0.1-linux-amd64.sha256",
+        "member": null
+      },
+      "arm64": {
+        "version": "17.0.1",
+        "filename": "forgejo-17.0.1-linux-arm64",
+        "url": "https://code.forgejo.org/forgejo/forgejo/releases/download/v17.0.1/forgejo-17.0.1-linux-arm64",
+        "sha256": "1e99403746406e8199efc903ddd1940d5728a60e50241f7aa6c9f2b907bd8ec9",
+        "publisher_hash": {
+          "sha256": "1e99403746406e8199efc903ddd1940d5728a60e50241f7aa6c9f2b907bd8ec9"
+        },
+        "metadata_url": "https://code.forgejo.org/forgejo/forgejo/releases/download/v17.0.1/forgejo-17.0.1-linux-arm64.sha256",
+        "member": null
+      }
+    },
+    "technitium": {
+      "amd64": {
+        "version": "15.6.2",
+        "filename": "DnsServerPortable.tar.gz",
+        "url": "https://download.technitium.com/dns/archive/15.6.2/DnsServerPortable.tar.gz",
+        "sha256": "51f2d4ebaf156a85035e820afde5e1d428f1920a37d7f0c65203fb1766917e08",
+        "publisher_hash": {
+          "sha256": "51f2d4ebaf156a85035e820afde5e1d428f1920a37d7f0c65203fb1766917e08"
+        },
+        "metadata_url": "https://download.technitium.com/dns/archive/15.6.2/DnsServerPortable.tar.gz.sha256",
+        "member": "DnsServerApp.dll"
+      },
+      "arm64": {
+        "version": "15.6.2",
+        "filename": "DnsServerPortable.tar.gz",
+        "url": "https://download.technitium.com/dns/archive/15.6.2/DnsServerPortable.tar.gz",
+        "sha256": "51f2d4ebaf156a85035e820afde5e1d428f1920a37d7f0c65203fb1766917e08",
+        "publisher_hash": {
+          "sha256": "51f2d4ebaf156a85035e820afde5e1d428f1920a37d7f0c65203fb1766917e08"
+        },
+        "metadata_url": "https://download.technitium.com/dns/archive/15.6.2/DnsServerPortable.tar.gz.sha256",
+        "member": "DnsServerApp.dll"
+      }
+    }
+  }
+}

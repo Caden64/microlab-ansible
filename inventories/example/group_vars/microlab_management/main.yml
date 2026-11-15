@@ -57,15 +57,16 @@ micolab_dns_ipv6_addresses: {}
 micolab_dns_forwarders: []
 micolab_dns_allow_online_forwarders: false
 
-# REQUIRED cold-start recursion fixture. The default managed fixture service
+# Internal cold-start recursion fixture; these synthetic values are ready to use.
+# The answer address is data only, not another host to provision. The service
 # listens on 127.0.0.1:5353, so set the upstream to exactly that endpoint. The
 # zone must be distinct from hnh and outside micolab_domain; the name must sit
 # inside the fixture zone. The expected answer is the known A value returned by
 # that local upstream, never a public address. See docs/dns.md.
 micolab_dns_fixture_upstream: "127.0.0.1:5353"
-micolab_dns_fixture_zone: REPLACE_WITH_FIXTURE_ZONE
-micolab_dns_fixture_name: REPLACE_WITH_FIXTURE_NAME
-micolab_dns_fixture_expected_ip: REPLACE_WITH_FIXTURE_ANSWER_IPV4
+micolab_dns_fixture_zone: fixture.test
+micolab_dns_fixture_name: probe.fixture.test
+micolab_dns_fixture_expected_ip: 10.77.254.1
 micolab_dns_fixture_manage_service: true
 micolab_dns_fixture_listen_address: "127.0.0.1"
 micolab_dns_fixture_port: 5353
@@ -95,9 +96,9 @@ micolab_trust_targets:
 
 micolab_max_powered_off_interval_seconds: REPLACE_WITH_POSITIVE_INTEGER
 
-# Required by the verify phase: a real repository that exists after Forgejo is
-# bootstrapped. Verification performs an actual git ls-remote; it is not skipped.
-micolab_verify_git_repo: REPLACE_WITH_OWNER/REPO
+# Optional during installation; required by playbooks/verify.yml later.
+# Supply an existing disposable owner/repo for real HTTPS and SSH clone/push.
+micolab_verify_git_repo: ""
 
 # Required only when technitium_tls enables DoT/DoH/DoQ.
 micolab_technitium_tls_cert_password: ""

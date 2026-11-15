@@ -138,6 +138,7 @@
       log_retention_days: "{{ micolab_dns_log_retention_days }}"
       stats_retention_days: "{{ micolab_dns_stats_retention_days }}"
       log_queries: "{{ micolab_dns_log_queries }}"
+      installation_mode: "{{ microlab_installation_mode | default(false) | bool }}"
       verify_git_repo: "{{ micolab_verify_git_repo | default('') }}"
       required_packages: "{{ micolab_required_packages }}"
       required_package_prefixes: "{{ micolab_required_package_prefixes }}"

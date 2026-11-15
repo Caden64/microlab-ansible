@@ -20,6 +20,15 @@
     - "{{ microlab_step_ca_extract_dir }}"
     - "{{ microlab_step_cli_extract_dir }}"
 
+- name: Copy pinned step-ca archive from the controller
+  ansible.builtin.copy:
+    src: "{{ microlab_step_ca_artifact_src }}"
+    dest: "{{ microlab_step_ca_archive_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+  when: microlab_step_ca_artifact_src | length > 0
+
 - name: Stage pinned step-ca archive from the offline artifact store
   ansible.builtin.get_url:
     url: "{{ microlab_step_ca_artifact_base_url }}/{{ microlab_step_ca_archive_name }}"
@@ -29,6 +38,22 @@
     group: root
     mode: "0640"
   notify: Restart step-ca
+
+  when: microlab_step_ca_artifact_src | length == 0
+
+- name: Hash staged step-ca archive before extraction
+  ansible.builtin.stat:
+    path: "{{ microlab_step_ca_archive_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: microlab_step_ca_archive_stat
+
+- name: Reject an unpinned step-ca archive
+  ansible.builtin.assert:
+    that:
+      - microlab_step_ca_archive_stat.stat.isreg | default(false)
+      - microlab_step_ca_archive_stat.stat.checksum | default('') == (microlab_step_ca_checksums[microlab_step_ca_arch] | lower)
+    quiet: true
 
 - name: Extract the pinned step-ca binary
   ansible.builtin.unarchive:
@@ -67,6 +92,15 @@
       {{ microlab_step_ca_version }}. Refusing to continue.
     quiet: true
 
+- name: Copy pinned step CLI archive from the controller
+  ansible.builtin.copy:
+    src: "{{ microlab_step_cli_artifact_src }}"
+    dest: "{{ microlab_step_cli_archive_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+  when: microlab_step_cli_artifact_src | length > 0
+
 - name: Stage pinned step CLI archive from the offline artifact store
   ansible.builtin.get_url:
     url: "{{ microlab_step_ca_artifact_base_url }}/{{ microlab_step_cli_archive_name }}"
@@ -75,6 +109,22 @@
     owner: root
     group: root
     mode: "0640"
+
+  when: microlab_step_cli_artifact_src | length == 0
+
+- name: Hash staged step CLI archive before extraction
+  ansible.builtin.stat:
+    path: "{{ microlab_step_cli_archive_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: microlab_step_cli_archive_stat
+
+- name: Reject an unpinned step CLI archive
+  ansible.builtin.assert:
+    that:
+      - microlab_step_cli_archive_stat.stat.isreg | default(false)
+      - microlab_step_cli_archive_stat.stat.checksum | default('') == (microlab_step_cli_checksums[microlab_step_ca_arch] | lower)
+    quiet: true
 
 - name: Extract the pinned step CLI
   ansible.builtin.unarchive:

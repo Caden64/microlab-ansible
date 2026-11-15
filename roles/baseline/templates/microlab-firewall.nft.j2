@@ -64,6 +64,9 @@ table inet {{ micolab_firewall_table }} {
     type filter hook input priority filter; policy drop;
 
     iifname "lo" accept
+    # Technitium binds HTTP DoH on its DNS endpoints, potentially wildcard.
+    # Only Caddy on loopback may reach this plaintext backend (IPv4 and IPv6).
+    iifname != "lo" tcp dport 8053 drop
     ct state established,related accept
     ct state invalid drop
 

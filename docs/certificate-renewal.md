@@ -158,22 +158,89 @@ and `notAfter`.
 ## Protected re-enrollment recovery
 
 When the certificate is missing, expired, has the wrong names, or the key pair
-is incomplete:
+is incomplete, plan a maintenance window and retain the old material for diagnosis.
+The commands below use the default paths. If you changed the canonical
+`microlab_technitium_cert_path`, `_key_path`, `_lock_file` or `_timer_unit`, use
+those actual effective values instead; a different lock path does not serialize
+with the deployed helper.
 
-1. On the CA host, mint a new short-lived, single-use token:
-   `/usr/local/sbin/step-ca-technitium-token dns.microlab.hnh`.
-2. Pass it through encrypted inventory as
-   `microlab_technitium_enrollment_token`.
-3. Remove only the old certificate and key pair (not the PFX password file or
-   API token) and rerun the role. The role generates a local P-256 key and a
-   CSR, signs the CSR directly with the one-time token through
-   `step ca sign`, and publishes the key pair. It will not create material
-   without a token.
-4. If the PFX password must change, update the vaulted value and let the helper
-   publish a new PFX and reload Technitium.
-5. Re-run the role; it validates the new certificate, publishes the PFX,
-   reconciles settings, verifies the live certificate fingerprint, and only then enables the
-   timer.
+First, on the **management target**, stop new timer invocations. Take the same
+durable lock as the helper before moving only the PEM leaf/key out of their
+served paths. `flock` waits for an already-running helper to finish. It does
+not remove or replace the lock file:
+
+```bash
+# TARGET: default layout only; do not run this to simulate expiry on production.
+(
+set -eu
+sudo systemctl stop technitium-tls-renew.timer
+sudo test -f /var/lib/technitium-tls/renew.lock
+sudo flock --exclusive /var/lib/technitium-tls/renew.lock sh -eu -c '
+  umask 077
+  recovery_dir=$(mktemp -d /root/microlab-reenroll.XXXXXX)
+  for material in /etc/dns/tls/dns.crt /etc/dns/tls/dns.key; do
+    if [ -e "$material" ]; then
+      mv -- "$material" "$recovery_dir/"
+    fi
+  done
+  printf "Preserved prior PEM material in %s\n" "$recovery_dir"
+'
+)
+```
+
+If the timer stop, lock existence check or move fails, stop and investigate;
+do not keep executing later commands. The new root-only recovery directory
+contains private key material. Preserve it securely until recovery is validated,
+then retire it according to your key-retention policy. Leave the PFX, PFX
+password file, API token and CA database unchanged. Do not run another manual
+renewal while preparing the replacement.
+
+On the CA/management target, mint a new short-lived token interactively:
+
+```bash
+sudo /usr/local/sbin/step-ca-technitium-token dns.microlab.hnh
+```
+
+Enter the protected JWK provisioner password. On the **controller**, return to
+the repository root, activate `.venv`, and open the existing encrypted inventory:
+
+```bash
+. .venv/bin/activate
+EDITOR=nano ansible-vault edit inventories/site/group_vars/microlab_management/vault.yml
+```
+
+For the inventory created by the [fresh-clone guide](fresh-clone.md), update
+`micolab_technitium_enrollment_token`. That shared alias feeds canonical
+`microlab_technitium_enrollment_token`; do not define both with conflicting
+values. Sites already using the canonical key should update that existing key.
+If a deliberate PFX password rotation is also required, update its existing
+vaulted value; do not regenerate unrelated durable secrets.
+
+Before the ten-minute token expires, run on the **controller**:
+
+```bash
+ansible-playbook -i inventories/site/hosts.yml playbooks/site.yml \
+  --ask-vault-pass --ask-become-pass
+```
+
+There is no phase-tag shortcut: this runs the full ordered deployment, changes
+managed state and starts services. Earlier DNS/CA/Caddy gates must still pass.
+The TLS role generates a new local P-256 key/CSR only when both final PEM paths
+are absent, signs with the one-use token, validates, publishes the PFX and
+verifies the live certificate before enabling its timer. An incomplete pair
+fails closed. If the token expires before TLS is reached, mint a new one rather
+than weakening authentication. If the run fails, inspect its precise phase;
+do not assume the timer was restarted.
+
+After successful enrollment and live verification, clear the consumed enrollment
+token in Vault, retain the API token/PFX password, and confirm the timer:
+
+```bash
+# TARGET
+sudo systemctl is-active technitium-tls-renew.timer
+sudo /usr/local/sbin/technitium-tls-renew \
+  --config /etc/technitium-tls/renewal.env --verify-only
+```
 
 Do not enable renewal after expiry to avoid this procedure. Expired renewal
 would let a stolen key extend its own trust.
@@ -203,20 +270,28 @@ The API token is passed as `Authorization: Bearer`. Secret-bearing tasks use
 
 ## Operational checks
 
+Run these commands on the **management target**. The renewal environment is
+root-only, so helper invocations require sudo. The service is a oneshot and can
+be inactive between successful timer runs. A normal helper run renews only
+inside its configured renewal window; there is no force-renew option.
+
 ```sh
-systemctl status technitium-tls-renew.timer
-systemctl status technitium-tls-renew.service
-journalctl -u technitium-tls-renew.service --since -24h
-cat /var/lib/technitium-tls/status.json
+sudo systemctl status technitium-tls-renew.timer
+sudo systemctl status technitium-tls-renew.service
+sudo journalctl -u technitium-tls-renew.service --since -24h
+sudo cat /var/lib/technitium-tls/status.json
 
 # Manual, serialized run (uses the same lock).
-/usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env
+sudo /usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env
 
 # Validate only; does not renew or publish.
-/usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env --check-only
+sudo /usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env --check-only
 
-# Verify the live 853 certificate fingerprint only.
-/usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env --verify-only
+# Retry publication/live verification of the current PEM; does not renew it.
+sudo /usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env --publish-only
+
+# Validate enrolled material and verify the live DoT certificate.
+sudo /usr/local/sbin/technitium-tls-renew --config /etc/technitium-tls/renewal.env --verify-only
 ```
 
 Exit codes: `0` success, `1` validation/renewal failure, `2` configuration,

@@ -1,0 +1,69 @@
+---
+- name: Validate the two-host boundary without connecting to targets
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Require exactly one infra host isolated from challenge workloads
+      ansible.builtin.assert:
+        that:
+          - groups['microlab_management'] | default([]) | length == 1
+          - (groups['microlab_management'] | default([]) | intersect(groups['microlab_challenge'] | default([]))) | length == 0
+          - groups['microlab_challenge'] | default([]) | length <= 1
+        fail_msg: >-
+          Define one infra host in microlab_management for Technitium, step-ca,
+          Caddy and Forgejo together. The separate rCTF/microVM host belongs
+          only in microlab_challenge (it may be added later). Probe hosts need
+          neither group. These playbooks never configure challenge hosts.
+        quiet: true
+
+    - name: Reject a challenge alias pointing at the infra address
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].ansible_host | default(item)) != (hostvars[groups['microlab_management'][0]].ansible_host | default(groups['microlab_management'][0]))
+        fail_msg: The rCTF/microVM host must have a different address from infra.
+        quiet: true
+      loop: "{{ groups['microlab_challenge'] | default([]) }}"
+
+- name: Verify local gates and full external and Git acceptance
+  hosts: microlab_management
+  gather_facts: true
+  any_errors_fatal: true
+  become: true
+  vars:
+    microlab_installation_mode: false
+  pre_tasks:
+    - name: Load inventory-preserving shared defaults
+      ansible.builtin.import_tasks: install_defaults.yml
+
+    - name: Enforce workflow mode
+      ansible.builtin.assert:
+        that:
+          - microlab_installation_mode | bool == false
+        quiet: true
+
+  tasks:
+    - name: Refuse incomplete acceptance overrides in the full verify workflow
+      ansible.builtin.assert:
+        that:
+          - not (micolab_dns_accept_unverified_external_acl | bool)
+          - micolab_dns_remote_probes | length > 0
+          - not (micolab_verify_accept_unverified_external_acl | default(false) | bool)
+          - not (micolab_verify_accept_unexecuted_git_acceptance | default(false) | bool)
+        quiet: true
+
+    - name: Require real plain-DNS external acceptance
+      ansible.builtin.include_role:
+        name: technitium_dns
+        tasks_from: remote_probes
+
+    - name: Require plain-DNS probes to have actually completed
+      ansible.builtin.assert:
+        that:
+          - micolab_dns_external_acl_verified | default(false) | bool
+        quiet: true
+
+    - name: Require complete cross-service acceptance
+      ansible.builtin.include_role:
+        name: verify

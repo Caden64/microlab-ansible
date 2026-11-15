@@ -13,8 +13,8 @@
 - name: Require verification inputs and local tooling
   ansible.builtin.assert:
     that:
-      - (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo | length > 0)
-      - (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo is not search('\s'))
+      - (microlab_installation_mode | default(false) | bool) or (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo | length > 0)
+      - (microlab_installation_mode | default(false) | bool) or (micolab_verify_accept_unexecuted_git_acceptance | bool) or (micolab_verify_git_repo is not search('\s'))
       - micolab_verify_tls_root | length > 0
     fail_msg: >-
       Set micolab_verify_git_repo to a disposable Forgejo test repository path
@@ -98,6 +98,12 @@
 
 - name: Run real HTTPS and SSH clone/push acceptance
   ansible.builtin.include_tasks: git_acceptance.yml
+  when: not (microlab_installation_mode | default(false) | bool)
+
+- name: Record Git acceptance pending during installation
+  ansible.builtin.set_fact:
+    micolab_verify_git_accept_state: pending
+  when: microlab_installation_mode | default(false) | bool
 
 - name: Inspect loopback listeners
   ansible.builtin.command:
@@ -119,6 +125,9 @@
 
   loop: "{{ micolab_verify_loopback_ports | dict2items }}"
   when: item.key != 'dns_tls' or (micolab_verify_enable_dot | bool)
+- name: Verify HTTP DoH containment for the shared Technitium listener
+  ansible.builtin.include_tasks: doh_exposure.yml
+
 - name: Check systemd enablement for reboot persistence
   ansible.builtin.command:
     argv:
@@ -143,6 +152,12 @@
 
 - name: Run real external-vantage ACL acceptance
   ansible.builtin.include_tasks: external_acl.yml
+  when: not (microlab_installation_mode | default(false) | bool)
+
+- name: Record external ACL acceptance pending during installation
+  ansible.builtin.set_fact:
+    micolab_verify_external_acl_state: pending
+  when: microlab_installation_mode | default(false) | bool
 
 - name: Record each external ACL probe outcome for the acceptance file
   ansible.builtin.set_fact:
@@ -187,6 +202,8 @@
            'schema': 1,
            'generated_at': ansible_date_time.iso8601 | default(''),
            'overall': micolab_verify_overall_state,
+           'local_ready': true,
+           'installation_mode': microlab_installation_mode | default(false) | bool,
            'git': {
              'state': micolab_verify_git_accept_state,
              'visibility': micolab_verify_git_visibility,
@@ -234,8 +251,9 @@
 - name: Report executed and noncomplete acceptance checks
   ansible.builtin.debug:
     msg:
+      - "LOCAL-READY: local gates passed; external and Git states are reported independently."
       - "OVERALL ACCEPTANCE: {{ micolab_verify_overall_state }}"
-      - "EXECUTED: DNS A ({{ micolab_verify_service_fqdns | join(', ') }}), NS {{ micolab_verify_zone }} -> {{ micolab_verify_ns_name }}, no-implicit-AAAA, DoH, DoT ({{ micolab_verify_dot_state }}), loopback binds, and systemd enablement."
+      - "EXECUTED: DNS A ({{ micolab_verify_service_fqdns | join(', ') }}), NS {{ micolab_verify_zone }} -> {{ micolab_verify_ns_name }}, no-implicit-AAAA, DoH, DoT ({{ micolab_verify_dot_state }}), loopback binds for private services, HTTP DoH firewall/proxy containment, and systemd enablement."
       - "GIT ACCEPTANCE: {{ micolab_verify_git_accept_state }} (HTTPS and SSH clone/push; visibility {{ micolab_verify_git_visibility }})."
       - "EXTERNAL ACL ACCEPTANCE: {{ micolab_verify_external_acl_state }} (dns_admin, ca_management, doh, dot; allowed and denied probes)."
       - "OVERRIDE: git={{ micolab_verify_accept_unexecuted_git_acceptance | bool }}, external_acl={{ micolab_verify_accept_unverified_external_acl | bool }}. Any true override is noncomplete, not a pass."

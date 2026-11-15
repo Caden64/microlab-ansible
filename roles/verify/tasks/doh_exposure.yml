@@ -1,0 +1,59 @@
+---
+# Technitium HTTP DoH follows dnsServerLocalEndPoints (plain DNS is wildcard).
+# Unlike Forgejo, step-ca and admin APIs, its protection is nftables + app ACL.
+- name: Read active ingress firewall rules
+  ansible.builtin.command:
+    argv: [nft, -j, list, table, inet, "{{ micolab_firewall_table }}"]
+  register: microlab_verify_doh_nft
+  changed_when: false
+  check_mode: false
+
+- name: Ensure the verification helper directory exists
+  ansible.builtin.file:
+    path: /usr/local/lib/microlab
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the read-only HTTP backend firewall checker
+  ansible.builtin.copy:
+    src: check_doh_firewall.py
+    dest: /usr/local/lib/microlab/check_doh_firewall.py
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Require an early IPv4 and IPv6 non-loopback HTTP backend drop
+  ansible.builtin.command:
+    argv: [python3, /usr/local/lib/microlab/check_doh_firewall.py, "{{ micolab_firewall_table }}"]
+    stdin: "{{ microlab_verify_doh_nft.stdout }}"
+  changed_when: false
+  check_mode: false
+
+- name: Read live HTTP DoH application restrictions
+  ansible.builtin.uri:
+    url: http://127.0.0.1:5380/api/settings/get
+    headers:
+      Authorization: "Bearer {{ microlab_technitium_api_token | default(micolab_technitium_api_token | default('')) }}"
+    use_proxy: false
+    return_content: true
+    status_code: 200
+  register: microlab_verify_doh_settings
+  changed_when: false
+  no_log: true
+
+- name: Require loopback-only proxy trust and the real-client header
+  ansible.builtin.assert:
+    that:
+      - microlab_verify_doh_settings.json.status == 'ok'
+      - microlab_verify_doh_settings.json.response.enableDnsOverHttp | bool
+      - microlab_verify_doh_settings.json.response.dnsOverHttpPort | int == 8053
+      - microlab_verify_doh_settings.json.response.dnsOverHttpRealIpHeader == 'X-Real-IP'
+      - microlab_verify_doh_settings.json.response.dnsReverseProxyNetworkACL in [['127.0.0.1/32'], ['127.0.0.1']]
+    fail_msg: >-
+      HTTP DoH must trust only the actual loopback Caddy proxy and X-Real-IP.
+      Local firewall/config checks prove containment configuration, not an
+      external denied-client result; full external acceptance remains separate.
+    quiet: true
+  no_log: true

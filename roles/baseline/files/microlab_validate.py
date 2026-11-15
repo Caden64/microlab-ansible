@@ -449,9 +449,10 @@ def main() -> int:
     if not isinstance(data.get("log_queries"), bool):
         fail("micolab_dns_log_queries must be a boolean")
 
-    verify_repo = text(data.get("verify_git_repo"), "micolab_verify_git_repo")
-    if verify_repo and (re.search(r"\s", verify_repo) or verify_repo.count("/") != 1):
-        fail("micolab_verify_git_repo must be a real owner/repo path with no spaces")
+    if data.get("installation_mode") is not True:
+        verify_repo = text(data.get("verify_git_repo"), "micolab_verify_git_repo")
+        if verify_repo and (re.search(r"\s", verify_repo) or verify_repo.count("/") != 1):
+            fail("micolab_verify_git_repo must be a real owner/repo path with no spaces")
 
     # --- packages -----------------------------------------------------------
     packages = data.get("required_packages") or []

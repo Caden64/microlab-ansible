@@ -144,7 +144,9 @@
         == ((item.value) | string | lower))
     fail_msg: >-
       Technitium did not retain the required setting {{ item.key }}. DoH must be
-      local 8053 behind 127.0.0.1 only, with X-Real-IP, and native DoT must use
+      8053 behind the loopback Caddy proxy only, with X-Real-IP and an
+      ingress firewall drop for non-loopback 8053. The HTTP listener follows
+      dnsServerLocalEndPoints and may bind wildcard; native DoT must use
       853 with the enrolled PFX.
     quiet: true
   loop: "{{ microlab_technitium_desired_settings | dict2items }}"

@@ -102,9 +102,11 @@ Do not run it on the management host.
 
 5. Stage the certificate/key sources in a protected **controller-local**
    directory; their `*_src` variables are read and checked on the controller.
-   Stage the binary archives separately on the **management host** for
-   `microlab_step_ca_artifact_base_url` (default `file:///srv/microlab/artifacts`).
-   The archive `get_url` tasks run on the target. Required material:
+   `./microlab artifacts` stages the pinned step-ca and step CLI archives on
+   the controller and the role transfers them. Only without that command do
+   you stage the archives on the **management host** yourself for
+   `microlab_step_ca_artifact_base_url` (default `file:///srv/microlab/artifacts`),
+   where the archive `get_url` tasks run on the target. Required material:
 
    - `root_ca.crt` (public only)
    - `intermediate_ca.crt`

@@ -1,0 +1,14 @@
+---
+- name: Read shared defaults without overriding inventory
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/../group_vars/all.yml"
+    name: microlab_shared_defaults
+
+- name: Supply only undefined shared inputs
+  ansible.builtin.set_fact:
+    "{{ item }}": "{{ microlab_shared_defaults[item] }}"
+  loop: "{{ microlab_shared_defaults.keys() | list }}"
+  when: lookup('ansible.builtin.vars', item, default='__microlab_undefined__') == '__microlab_undefined__'
+  loop_control:
+    label: "{{ item }}"
+  no_log: true

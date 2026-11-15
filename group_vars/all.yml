@@ -64,18 +64,20 @@ micolab_dns_authoritative_only_cidrs_v6: []
 micolab_dns_forwarders: []
 micolab_dns_allow_online_forwarders: false
 
-# REQUIRED: controlled local recursion fixture for cold, WAN-disconnected
-# acceptance. These are not public names and must not be the hnh zone or a
+# Managed local recursion fixture for cold, WAN-disconnected
+# acceptance. These fixed synthetic defaults need no additional host or network.
+# The expected address is DNS answer data only, never assigned to an interface.
+# These are not public names and must not be the hnh zone or a
 # subdomain of micolab_domain. The role creates a conditional-forwarder zone
 # for the fixture zone on a reachable local upstream and requires the known A
 # answer with AA clear. The managed fixture service (default) is a tiny stdlib
 # UDP responder on IPv4 loopback, so no internet or extra package is needed.
 # Set manage_service=false only when an equivalent local upstream is staged
 # externally at exactly micolab_dns_fixture_upstream.
-micolab_dns_fixture_upstream: ""             # REQUIRED "127.0.0.1:5353"
-micolab_dns_fixture_zone: ""                 # REQUIRED, distinct from hnh
-micolab_dns_fixture_name: ""                 # REQUIRED, inside the fixture zone
-micolab_dns_fixture_expected_ip: ""          # REQUIRED, known A answer
+micolab_dns_fixture_upstream: "127.0.0.1:5353"
+micolab_dns_fixture_zone: "fixture.test"
+micolab_dns_fixture_name: "probe.fixture.test"
+micolab_dns_fixture_expected_ip: "10.77.254.1"
 micolab_dns_fixture_manage_service: true
 micolab_dns_fixture_listen_address: "127.0.0.1"
 micolab_dns_fixture_port: 5353
