@@ -166,6 +166,61 @@ class SetupCLI(unittest.TestCase):
         run.assert_not_called()
         self.assertIn("UNVERIFIED", self.out.getvalue())
 
+    def test_ca_init_refuses_when_inventory_already_has_ca_settings(self):
+        self.save(self.inventory_data())
+        directory = self.inventory.parent / "group_vars/microlab_management"
+        directory.mkdir(parents=True)
+        (directory / "mine.yml").write_text("microlab_step_ca_root_fingerprint_sha256: abc\n")
+        with patch.object(cli, "controller_step") as step:
+            self.assertEqual(self.run_cli(["ca-init", "--inventory", str(self.inventory)]), 2)
+        step.assert_not_called()
+        self.assertIn("already has CA settings", self.err.getvalue())
+        self.assertFalse((self.inventory.parent / "ca").exists())
+        self.assertFalse((directory / "ca.yml").exists())
+
+    def test_ca_init_never_replaces_an_existing_ca_directory(self):
+        self.save(self.inventory_data())
+        (self.inventory.parent / "ca").mkdir()
+        with patch.object(cli, "controller_step") as step:
+            self.assertEqual(self.run_cli(["ca-init", "--inventory", str(self.inventory)]), 2)
+        step.assert_not_called()
+        self.assertIn("never replaces CA material", self.err.getvalue())
+
+    def test_jwe_compact_matches_step_ca_encrypted_key_shape(self):
+        serialized = '{"protected":"aaa","encrypted_key":"bbb","iv":"ccc","ciphertext":"ddd","tag":"eee"}'
+        self.assertEqual(cli.jwe_compact(serialized), "aaa.bbb.ccc.ddd.eee")
+        with self.assertRaises(cli.Checkpoint):
+            cli.jwe_compact('{"protected":"aaa","iv":"ccc"}')
+
+    @unittest.skipUnless(os.environ.get("MICROLAB_STEP_CLI_ARCHIVE") and shutil.which("ansible-vault") and shutil.which("openssl"),
+                         "set MICROLAB_STEP_CLI_ARCHIVE to the pinned controller step CLI archive")
+    def test_ca_init_creates_material_the_role_accepts(self):
+        self.save(self.inventory_data())
+        cache = self.root / "artifacts"
+        cache.mkdir()
+        import platform
+        arch = cli.CONTROLLER_ARCH[platform.machine()]
+        shutil.copyfile(os.environ["MICROLAB_STEP_CLI_ARCHIVE"], cache / ("step-cli-0.31.0-%s.tar.gz" % arch))
+        self.assertEqual(self.run_cli(["ca-init", "--inventory", str(self.inventory)]), 0, self.err.getvalue())
+        ca = self.inventory.parent / "ca"
+        plain = yaml.safe_load((self.inventory.parent / "group_vars/microlab_management/ca.yml").read_text())
+        self.assertTrue(plain["microlab_step_ca_initial_deploy"])
+        self.assertNotIn("d", plain["microlab_step_ca_technitium_jwk_key"])
+        self.assertEqual(plain["microlab_step_ca_root_cert_src"], str(ca / "root_ca.crt"))
+        # The root key is kept apart for removal and never referenced by inventory.
+        self.assertTrue((ca / "offline-root/root_ca_key").is_file())
+        self.assertNotIn("root_ca_key", (self.inventory.parent / "group_vars/microlab_management/ca.yml").read_text())
+        for vaulted in (self.inventory.parent / "group_vars/microlab_management/ca-vault.yml",
+                        ca / "technitium-provisioner-password.vault.yml", ca / "offline-root/root-key-password.vault.yml"):
+            self.assertTrue(vaulted.read_bytes().startswith(b"$ANSIBLE_VAULT;"), vaulted)
+        secret = yaml.safe_load(subprocess.run(["ansible-vault", "view", str(self.inventory.parent / "group_vars/microlab_management/ca-vault.yml")],
+                                               check=True, stdout=subprocess.PIPE).stdout)
+        fingerprint = cli.check_material(ca / "root_ca.crt", ca / "intermediate_ca.crt", ca / "intermediate_ca_key",
+                                         secret["microlab_step_ca_intermediate_key_password"])
+        self.assertEqual(fingerprint, plain["microlab_step_ca_root_fingerprint_sha256"])
+        self.assertEqual(secret["microlab_step_ca_technitium_jwk_encrypted_key"].count("."), 4)
+        self.assertEqual(oct((ca / "intermediate_ca_key").stat().st_mode & 0o777), "0o600")
+
     def test_status_reports_past_encrypted_setup_vault_without_opening_it(self):
         # Setup itself writes an encrypted sidecar; status must stay useful after it.
         self.save(self.inventory_data())
@@ -274,7 +329,7 @@ class SetupCLI(unittest.TestCase):
         with patch.object(cli, "inspection", return_value=("infra-alias", values)), patch.object(cli, "need_tool"), patch.object(cli.subprocess, "run") as run:
             self.assertEqual(self.run_cli(["deploy", "--inventory", str(self.inventory)]), 2)
         run.assert_not_called()
-        self.assertIn("BEFORE host mutation", self.err.getvalue())
+        self.assertIn("./microlab ca-init", self.err.getvalue())
 
     def test_consumed_enrollment_token_never_routes_to_bootstrap(self):
         (self.root / "playbooks").mkdir()

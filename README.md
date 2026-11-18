@@ -57,9 +57,10 @@ admin `/32` may overlap the client `/24`; separate VLANs are not an installation
 requirement. Infra self-traffic must still support CA HTTP01 and local Git
 checks. Missing real external denial vantages remain pending acceptance.
 
-Keep the root private key offline. Setup does not perform an offline root
-ceremony, escrow its key, distribute trust to arbitrary clients, or invent API
-tokens. Renewal with WAN disconnected still needs the local issuing CA running.
+`./microlab ca-init` creates the CA (root, intermediate and Technitium
+provisioner) and adds it to inventory; move the root key it creates off the
+workstation afterwards. Nothing distributes trust to arbitrary clients or
+invents API tokens. Renewal with WAN disconnected still needs the local issuing CA running.
 A stopped CA cannot renew certificates.
 
 ## References

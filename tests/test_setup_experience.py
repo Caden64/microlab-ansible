@@ -267,7 +267,7 @@ sys.exit(int(os.environ.get('MICROLAB_TEST_EXIT', '0')))
         inventory, variables, vault = self.filled_inventory()
         self.resolved_inventory(inventory, variables, vault, ca=False)
         result = self.cli("deploy", "--inventory", inventory, code=2)
-        self.assertIn("BEFORE host mutation", result.stderr)
+        self.assertIn("./microlab ca-init", result.stderr)
         self.assertNotIn("test-secret-must-not-be-printed", result.stdout + result.stderr)
         self.assertFalse(any(c["tool"] == "ansible-playbook" for c in self.calls()))
 

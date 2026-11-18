@@ -8,6 +8,7 @@ deploy.yml; verify selects verify.yml. No local marker implies acceptance.
 import argparse
 import copy
 import getpass
+import importlib.util
 import ipaddress
 import json
 import os
@@ -400,7 +401,7 @@ def setup(args):
                 exclusive_write(path, content)
         (ROOT / "artifacts").mkdir(exist_ok=True, mode=0o700)
         print("Local setup saved. Existing values/secrets retained; new application secrets encrypted independently.")
-        print("Next: ./microlab artifacts; prepare offline-issued CA material and protected CA credentials in this inventory.")
+        print("Next: ./microlab artifacts, then ./microlab ca-init to create the CA.")
         print("No CA was created. Root private key must remain offline. Default powered-off budget is 24h; review against certificate lifetime/renewal policy.")
         print("Then ./microlab deploy establishes bootstrap and reports its credential checkpoint. No host has been contacted.")
 
@@ -466,7 +467,7 @@ def execute_playbook(args):
         raise Checkpoint("Admin CIDR cannot be the entire player subnet. Supply the actual workstation /32 or protected VPN.")
     missing = readiness(values)
     if missing:
-        raise Checkpoint("Offline CA preparation checkpoint BEFORE host mutation. Supply controller files/credentials: " + ", ".join(missing) + ". Use ansible-vault edit for secrets; never stage the root private key. No playbook ran.")
+        raise Checkpoint("CA checkpoint: missing " + ", ".join(missing) + ". Run ./microlab ca-init to create the CA and add these, or supply your own offline CA (docs/ca-recovery.md). No playbook ran.")
     missing_secrets = [key for key in SECRET_KEYS if not present(values.get(key))]
     if missing_secrets:
         raise Checkpoint("Application credential checkpoint: run setup to generate missing durable secrets privately. No playbook ran.")
@@ -503,6 +504,150 @@ def execute_playbook(args):
     else:
         print("Deployment playbook completed. Run ./microlab verify for acceptance; remote denial probes require real vantages.")
     return 0
+
+
+CA_PLAIN = "ca.yml"
+CA_VAULT = "ca-vault.yml"
+CA_ALL_KEYS = CA_PATHS + CA_VALUES + ("microlab_step_ca_initial_deploy",)
+CONTROLLER_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+
+
+def controller_step(workdir):
+    """Pinned step CLI for this controller's CPU, cached beside infra artifacts."""
+    import platform
+    spec = importlib.util.spec_from_file_location("microlab_artifacts", Path(__file__).resolve().parent / "microlab_artifacts.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    arch = CONTROLLER_ARCH.get(platform.machine())
+    if arch is None:
+        raise Checkpoint("ca-init needs an amd64 or arm64 controller for the pinned step CLI.")
+    entry = json.loads(module.LOCK.read_text())["artifacts"]["step-cli"][arch]
+    cache = ROOT / "artifacts"
+    cache.mkdir(exist_ok=True, mode=0o700)
+    archive = cache / ("step-cli-%s-%s.tar.gz" % (entry["version"], arch))
+    try:
+        if not archive.is_file():
+            partial = Path(workdir) / "step-cli.tar.gz"
+            print("Downloading pinned step CLI %s (%s) for this controller..." % (entry["version"], arch), flush=True)
+            module.download(entry["url"], partial)
+            module.validate(partial, entry, arch, "step-cli")
+            shutil.copyfile(partial, archive)
+        module.validate(archive, entry, arch, "step-cli")
+    except module.ArtifactError as error:
+        raise Checkpoint(str(error)) from None
+    import tarfile
+    binary = Path(workdir) / "step"
+    with tarfile.open(archive, "r:gz") as bundle, bundle.extractfile(entry["member"]) as source, binary.open("wb") as target:
+        shutil.copyfileobj(source, target)
+    binary.chmod(0o700)
+    return binary
+
+
+def jwe_compact(serialized):
+    """step writes JSON-serialized JWE; ca.json's encryptedKey is the compact form."""
+    data = json.loads(serialized)
+    parts = [data.get(key) for key in ("protected", "encrypted_key", "iv", "ciphertext", "tag")]
+    if not all(isinstance(part, str) and part and "." not in part for part in parts):
+        raise Checkpoint("step produced an unexpected JWK encryption format; nothing was written.")
+    return ".".join(parts)
+
+
+def check_material(root, crt, key, password):
+    """The same OpenSSL checks the step_ca role runs before deployment."""
+    def openssl(*argv, stdin=None):
+        result = subprocess.run(["openssl", *argv], input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            raise Checkpoint("Generated CA material failed OpenSSL validation; nothing was written to inventory.")
+        return result.stdout.decode()
+    if "OK" not in openssl("verify", "-CAfile", str(root), str(crt)):
+        raise Checkpoint("Generated intermediate does not chain to the root; nothing was written.")
+    for cert in (root, crt):
+        if "CA:TRUE" not in openssl("x509", "-in", str(cert), "-noout", "-ext", "basicConstraints", "-checkend", "0"):
+            raise Checkpoint("Generated certificate is not a valid CA; nothing was written.")
+    secret = (password + "\n").encode()
+    if openssl("x509", "-in", str(crt), "-noout", "-pubkey") != openssl("pkey", "-in", str(key), "-passin", "stdin", "-pubout", stdin=secret):
+        raise Checkpoint("Generated intermediate key does not match its certificate; nothing was written.")
+    return openssl("x509", "-in", str(root), "-noout", "-fingerprint", "-sha256").split("=", 1)[1].strip().replace(":", "").lower()
+
+
+def ca_init(args):
+    """Create root, intermediate and Technitium JWK provisioner; wire them into inventory."""
+    need_tool("openssl")
+    if not args.inventory.is_file():
+        raise Checkpoint("Site inventory missing. Run ./microlab setup first.")
+    output = (args.output or args.inventory.parent / "ca").expanduser().resolve()
+    if output.exists():
+        raise Checkpoint("%s already exists. ca-init never replaces CA material; move it away only if you mean to discard that CA." % output)
+    with Vault() as vault:
+        inventory = read_mapping(args.inventory, vault)
+        name, _ = topology(inventory)
+        # Unlocking every vars file also proves the Vault password matches setup's.
+        values = local_vars(args.inventory, inventory, name, vault)
+        existing = [key for key in CA_ALL_KEYS if key in values]
+        if existing:
+            raise Checkpoint("Inventory already has CA settings (%s). ca-init only creates a new CA; nothing changed." % ", ".join(existing))
+        directory = output_vars_directory(args.inventory, name)
+        for filename in (CA_PLAIN, CA_VAULT):
+            if (directory / filename).exists():
+                raise Checkpoint("%s already exists; nothing changed." % (directory / filename))
+        with tempfile.TemporaryDirectory(prefix="microlab-ca-") as work:
+            work = Path(work)
+            step = controller_step(work)
+            stage = Path(tempfile.mkdtemp(prefix=".ca-", dir=output.parent if output.parent.is_dir() else None))
+            try:
+                (stage / "offline-root").mkdir(mode=0o700)
+                passwords = {label: secrets.token_urlsafe(32) for label in ("root", "intermediate", "provisioner")}
+                for label, value in passwords.items():
+                    exclusive_write(work / (label + ".pw"), value.encode())
+                env = dict(os.environ, STEPPATH=str(work / "steppath"))
+                def run(*argv):
+                    result = subprocess.run([str(step), *argv], cwd=stage, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if result.returncode:
+                        raise Checkpoint("step %s failed; no CA material or inventory was kept." % argv[0])
+                run("certificate", "create", "%s Root CA" % args.name, "root_ca.crt", "offline-root/root_ca_key",
+                    "--profile", "root-ca", "--password-file", str(work / "root.pw"), "--not-after", "87600h")
+                run("certificate", "create", "%s Intermediate CA" % args.name, "intermediate_ca.crt", "intermediate_ca_key",
+                    "--profile", "intermediate-ca", "--ca", "root_ca.crt", "--ca-key", "offline-root/root_ca_key",
+                    "--ca-password-file", str(work / "root.pw"), "--password-file", str(work / "intermediate.pw"),
+                    "--not-after", "43800h")
+                run("crypto", "jwk", "create", str(work / "jwk.pub.json"), str(work / "jwk.priv.json"),
+                    "--kty", "EC", "--crv", "P-256", "--use", "sig", "--password-file", str(work / "provisioner.pw"))
+                public_jwk = json.loads((work / "jwk.pub.json").read_text())
+                if "d" in public_jwk or not all(k in public_jwk for k in ("kty", "kid", "x", "y")):
+                    raise Checkpoint("step produced an unexpected public JWK; nothing was written.")
+                encrypted_jwk = jwe_compact((work / "jwk.priv.json").read_text())
+                fingerprint = check_material(stage / "root_ca.crt", stage / "intermediate_ca.crt",
+                                             stage / "intermediate_ca_key", passwords["intermediate"])
+                vault.encrypt({"microlab_ca_root_key_password": passwords["root"]}, stage / "offline-root/root-key-password.vault.yml")
+                vault.encrypt({"microlab_ca_technitium_provisioner_password": passwords["provisioner"]}, stage / "technitium-provisioner-password.vault.yml")
+                for path in stage.rglob("*"):
+                    path.chmod(0o700 if path.is_dir() else 0o600)
+                stage.chmod(0o700)
+                os.rename(stage, output)
+            except BaseException:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise
+        vault.encrypt({"microlab_step_ca_intermediate_key_password": passwords["intermediate"],
+                       "microlab_step_ca_technitium_jwk_encrypted_key": encrypted_jwk}, directory / CA_VAULT)
+        exclusive_write(directory / CA_PLAIN, ("# Written by ./microlab ca-init. Remove the initial_deploy line after the first\n"
+                                               "# successful bootstrap; never point these paths at a different CA.\n").encode()
+                        + yaml.safe_dump({
+                            "microlab_step_ca_root_cert_src": str(output / "root_ca.crt"),
+                            "microlab_step_ca_intermediate_cert_src": str(output / "intermediate_ca.crt"),
+                            "microlab_step_ca_intermediate_key_src": str(output / "intermediate_ca_key"),
+                            "microlab_step_ca_root_fingerprint_sha256": fingerprint,
+                            "microlab_step_ca_technitium_jwk_key": public_jwk,
+                            "microlab_step_ca_initial_deploy": True,
+                        }, sort_keys=False).encode())
+    print("CA created: %s" % output)
+    print("  root fingerprint (sha256): %s" % fingerprint)
+    print("  inventory: %s, %s (encrypted)" % (directory / CA_PLAIN, directory / CA_VAULT))
+    print("Move the root key off this machine now (USB, password manager, offline storage):")
+    print("  %s/offline-root/   (root_ca_key + its Vault-encrypted password)" % output)
+    print("It is only needed to issue a replacement intermediate; deploy never uses it.")
+    print("Technitium token password, needed on infra when minting the enrollment token:")
+    print("  ansible-vault view %s/technitium-provisioner-password.vault.yml" % output)
+    print("Next: ./microlab deploy --stage bootstrap")
 
 
 def status(args):
@@ -545,6 +690,9 @@ def main(argv=None):
         command.add_argument("--no-become-prompt", action="store_true", help="use existing passwordless sudo or protected Ansible become credentials")
         if name == "deploy":
             command.add_argument("--stage", choices=("bootstrap", "services"), help="bootstrap: DNS/CA/Caddy credential checkpoint; services: continue or reconverge services (first enrollment needs a fresh token)")
+    ca = sub.add_parser("ca-init", help="create the CA (root, intermediate, Technitium provisioner) locally and add it to inventory")
+    ca.add_argument("--output", type=Path, help="CA directory (default: ca/ beside the inventory; must not exist)")
+    ca.add_argument("--name", default="MicroLab", help="certificate name prefix (default: MicroLab)")
     sub.add_parser("status", help="local prerequisites only; never contacts hosts or claims installation")
     # Accept --inventory on either side of the verb, keeping one stable contract.
     for command in sub.choices.values():
@@ -558,6 +706,8 @@ def main(argv=None):
             setup(args)
         elif args.command == "status":
             status(args)
+        elif args.command == "ca-init":
+            ca_init(args)
         elif args.command == "artifacts":
             module = ROOT / "scripts/microlab_artifacts.py"
             if not module.is_file():

@@ -143,10 +143,29 @@ already configured passwordless sudo or protected Ansible become credentials.
 It limits execution to localhost and the single infra alias. Setup/status do
 not deploy. Missing offline CA inputs stop locally before a playbook runs.
 
-1. Prepare reviewed artifacts, vaulted durable secrets, and public-root plus
-   encrypted intermediate inputs. Complete the offline ceremony and separate
-   root-key escrow using [CA recovery](ca-recovery.md). Add its results to your
-   inventory's `group_vars/microlab_management/` (secrets in a Vault file):
+1. Create the CA. After `setup` and `artifacts`, run:
+
+   ```bash
+   ./microlab ca-init --inventory inventories/site/hosts.yml
+   ```
+
+   It downloads the pinned `step` CLI for this machine and creates a 10-year
+   root, a 5-year intermediate and the Technitium JWK provisioner. It checks
+   them with the same OpenSSL tests deploy uses, then writes
+   `group_vars/microlab_management/ca.yml` and the Vault-encrypted
+   `ca-vault.yml`. Material goes in `inventories/site/ca/` (git-ignored); it
+   refuses to run if that directory or any CA setting already exists.
+
+   Then move `inventories/site/ca/offline-root/` (the root private key and its
+   encrypted password) off this machine, onto a USB stick or into a password
+   manager. Deploy never needs it; you only need it to issue a new
+   intermediate. Keep a backup of the rest of `inventories/site/ca/`: deploy
+   reads those files.
+
+   The root key is briefly created on this workstation, which is fine for a
+   lab. For a stricter split, run the
+   [manual ceremony](ca-recovery.md#one-time-offline-initialization) on an
+   offline machine and set these variables yourself (secrets in a Vault file):
 
    | Variable | Value |
    | --- | --- |
@@ -175,7 +194,10 @@ not deploy. Missing offline CA inputs stop locally before a playbook runs.
    protected inputs for unattended renewal.
 4. On infra, mint the short-lived single-use enrollment token with
    `/usr/local/sbin/step-ca-technitium-token dns.microlab.hnh` using the JWK
-   provisioner password. Store it privately and resume the TLS/install stage
+   provisioner password. If `ca-init` created the CA, show that password on
+   the workstation with `ansible-vault view
+   inventories/site/ca/technitium-provisioner-password.vault.yml`. Store the
+   token privately and resume the TLS/install stage
    promptly. Clear it after enrollment; keep the persistent API/PFX secrets.
    The token's lifetime is ten minutes; expiry requires a fresh token.
 5. Finish Forgejo/final Caddy and installation checks. Prepare the initialized

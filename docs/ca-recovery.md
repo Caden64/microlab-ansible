@@ -42,6 +42,12 @@ enabled in the DNS role.
 
 ## One-time offline initialization
 
+`./microlab ca-init` automates this section on the Ansible controller (see
+[fresh-clone onboarding](fresh-clone.md#deliberate-bootstrap-handoffs)): it
+uses `step certificate create` and `step crypto jwk create` directly rather
+than `step ca init`, and writes the inventory values for you. Follow the
+manual steps below instead when the root must never touch the controller.
+
 Run this on a trusted, offline or access-controlled administration workstation.
 Do not run it on the management host.
 
