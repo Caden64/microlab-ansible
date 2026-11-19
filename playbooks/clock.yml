@@ -1,0 +1,15 @@
+---
+# ./microlab sync-clock: only the baseline clock check, for an offline lab
+# whose infra host lost time across a reboot. Changes nothing else.
+- name: Sync the infra host clock
+  hosts: microlab_management
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Load inventory-preserving shared defaults
+      ansible.builtin.import_tasks: install_defaults.yml
+  tasks:
+    - name: Check and, without NTP, correct the clock from the controller
+      ansible.builtin.include_role:
+        name: baseline
+        tasks_from: clock

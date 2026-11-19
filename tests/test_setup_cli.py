@@ -331,6 +331,16 @@ class SetupCLI(unittest.TestCase):
         run.assert_not_called()
         self.assertIn("./microlab ca-init", self.err.getvalue())
 
+    def test_sync_clock_runs_only_the_clock_playbook_without_deploy_checkpoints(self):
+        # A rebooted offline lab must be able to fix its clock even before CA
+        # material, secrets or artifacts are ready.
+        with patch.object(cli, "inspection", return_value=("infra-alias", {})), patch.object(cli, "need_tool"), \
+                patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(self.run_cli(["sync-clock", "--inventory", str(self.inventory)]), 0, self.err.getvalue())
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[3], str(self.root / "playbooks/clock.yml"))
+        self.assertEqual(argv[argv.index("--limit") + 1], "localhost,infra-alias")
+
     def test_consumed_enrollment_token_never_routes_to_bootstrap(self):
         (self.root / "playbooks").mkdir()
         (self.root / "playbooks/deploy.yml").touch()

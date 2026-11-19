@@ -14,30 +14,8 @@
   ansible.builtin.package_facts:
     manager: auto
 
-- name: Check clock synchronization
-  ansible.builtin.command:
-    argv:
-      - /usr/bin/timedatectl
-      - show
-      - -p
-      - NTPSynchronized
-      - --value
-  register: micolab_baseline_ntp
-  changed_when: false
-  failed_when: false
-  check_mode: false
-
-- name: Require an NTP-synchronized clock before issuing certificates or DNS
-  ansible.builtin.assert:
-    that:
-      - micolab_baseline_ntp.rc == 0
-      - micolab_baseline_ntp.stdout | trim == 'yes'
-    fail_msg: >-
-      The host clock is not NTP-synchronized (timedatectl
-      NTPSynchronized={{ micolab_baseline_ntp.stdout | default('unavailable') }}).
-      Certificate validity, DNS TTLs, and record serials are unsafe until time
-      synchronization is working.
-    quiet: true
+- name: Require a trusted clock before issuing certificates or DNS
+  ansible.builtin.import_tasks: clock.yml
 
 - name: Inspect listening sockets before changing the resolver
   ansible.builtin.command:

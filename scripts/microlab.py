@@ -460,6 +460,8 @@ def readiness(values):
 def execute_playbook(args):
     need_tool("ansible-playbook")
     name, values = inspection(args, unlock=True)
+    if args.command == "sync-clock":
+        return run_playbook(args, name, ROOT / "playbooks/clock.yml")
     architecture(values.get("micolab_expected_architecture"))
     admin = cidrs(values.get("micolab_admin_cidrs"), admin=True)
     clients = cidrs(values.get("micolab_client_cidrs"))
@@ -485,18 +487,9 @@ def execute_playbook(args):
     playbook = ROOT / "playbooks" / (play + ".yml")
     if not playbook.is_file():
         raise Checkpoint("Required playbook is not available yet: playbooks/%s.yml. No fallback to full site.yml; no host contacted." % play)
-    command = ["ansible-playbook", "--inventory", str(args.inventory), str(playbook), "--limit", "localhost," + name]
-    if not (os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE") or os.environ.get("ANSIBLE_VAULT_IDENTITY_LIST")):
-        command.append("--ask-vault-pass")
-    if not args.no_become_prompt:
-        if sys.stdin.isatty():
-            command.append("--ask-become-pass")
-        else:
-            print("No terminal: become uses configured protected Ansible credentials or passwordless sudo. No password will be read from stdin.", flush=True)
-    print("Running %s for infra only; rCTF is excluded." % playbook.name, flush=True)
-    result = subprocess.run(command, cwd=ROOT)
-    if result.returncode:
-        return result.returncode
+    returncode = run_playbook(args, name, playbook)
+    if returncode:
+        return returncode
     if args.command == "verify":
         print("Verification playbook completed. Acceptance is limited to checks actually executed; missing external probes remain pending.")
     elif bootstrap:
@@ -650,6 +643,19 @@ def ca_init(args):
     print("Next: ./microlab deploy --stage bootstrap")
 
 
+def run_playbook(args, name, playbook):
+    command = ["ansible-playbook", "--inventory", str(args.inventory), str(playbook), "--limit", "localhost," + name]
+    if not (os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE") or os.environ.get("ANSIBLE_VAULT_IDENTITY_LIST")):
+        command.append("--ask-vault-pass")
+    if not args.no_become_prompt:
+        if sys.stdin.isatty():
+            command.append("--ask-become-pass")
+        else:
+            print("No terminal: become uses configured protected Ansible credentials or passwordless sudo. No password will be read from stdin.", flush=True)
+    print("Running %s for infra only; rCTF is excluded." % playbook.name, flush=True)
+    return subprocess.run(command, cwd=ROOT).returncode
+
+
 def status(args):
     print("Local controller prerequisites:")
     for name in ("ansible-playbook", "ansible-inventory", "ansible-vault"):
@@ -685,8 +691,9 @@ def main(argv=None):
     artifacts = sub.add_parser("artifacts", help="stage pinned controller artifacts with the artifact module")
     artifacts.add_argument("--offline", action="store_true", help="use existing staged files only; no downloads")
     artifacts.add_argument("--check", action="store_true", help="inspect existing staged files without downloads or metadata writes")
-    for name in ("deploy", "verify"):
-        command = sub.add_parser(name)
+    helps = {"sync-clock": "offline labs: set the infra clock from this machine when NTP is unavailable (run after an infra reboot)"}
+    for name in ("deploy", "verify", "sync-clock"):
+        command = sub.add_parser(name, help=helps.get(name))
         command.add_argument("--no-become-prompt", action="store_true", help="use existing passwordless sudo or protected Ansible become credentials")
         if name == "deploy":
             command.add_argument("--stage", choices=("bootstrap", "services"), help="bootstrap: DNS/CA/Caddy credential checkpoint; services: continue or reconverge services (first enrollment needs a fresh token)")

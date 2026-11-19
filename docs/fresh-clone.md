@@ -45,7 +45,7 @@ vantages with the appropriate policy; missing vantages stay unexecuted.
 ## Prepare the infra host once
 
 Deploy checks these on the infra host and stops at its first validation step
-if any is missing; it does not install OS packages or fix the clock for you.
+if any is missing; it does not install OS packages for you.
 On the **infra host** (`10.72.78.73`), while its package mirror still works:
 
 ```bash
@@ -53,13 +53,36 @@ sudo apt-get update
 sudo apt-get install python3 sudo openssh-server ca-certificates curl \
   bind9-dnsutils knot-dnsutils git git-lfs gzip iproute2 logrotate nftables \
   openssl tar util-linux libicu-dev
-timedatectl show -p NTPSynchronized --value   # must print: yes
 sudo ss -lntup | grep -E ':(53|80|443|853|5380)\s' || echo 'service ports free'
 ```
 
 Port 53, 80, 443, 853 or 5380 already in use by another program (for example
 `systemd-resolved` on 53) must be resolved first. Your SSH user needs working
 `sudo`. The [advanced reference](setup.md) covers account creation and storage.
+
+### Running the lab without internet
+
+Only the package install above needs the internet. Everything after it,
+including `artifacts` and `ca-init` on your laptop, works with the lab
+offline, once those downloads are done.
+
+The clock is the one thing that would otherwise need internet. Certificates
+need correct time, and without NTP the infra host has no time source. Deploy
+therefore uses **your laptop's clock**: when NTP is not synchronized, it
+measures the infra clock against the laptop and sets it when the two differ by
+more than 5 seconds. Keep the laptop's own clock correct.
+
+A Raspberry Pi has no battery-backed clock (a Pi 5 has one only if you fit its
+RTC battery). After it reboots offline, its clock resumes from the last saved
+time and runs behind. Correct it from the laptop without a full deploy:
+
+```bash
+./microlab sync-clock --inventory inventories/site/hosts.yml
+```
+
+Do this after every offline power-on, before players connect. To require real
+NTP instead, set `micolab_time_mode: ntp`. `micolab_time_max_drift_seconds` and
+`micolab_time_set_from_controller` in `group_vars/all.yml` tune the fallback.
 
 ## Prepare locally and keep your inventory
 

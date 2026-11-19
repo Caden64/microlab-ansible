@@ -210,6 +210,13 @@ micolab_required_packages:
 micolab_required_package_prefixes:
   - libicu
 micolab_min_free_bytes: 2147483648
+# Clock trust. auto: NTP if synchronized, otherwise the Ansible controller's
+# clock (offline labs); the host is set from it when more than
+# micolab_time_max_drift_seconds off. ntp: require NTP synchronization.
+micolab_time_mode: auto
+micolab_time_max_drift_seconds: 5
+micolab_time_set_from_controller: true
+micolab_time_floor_epoch: 1767225600       # 2026-01-01; controller sanity check
 micolab_required_storage_path: "{{ micolab_technitium_config_dir }}"
 micolab_admin_cidrs: []                    # REQUIRED (SSH and admin web)
 micolab_client_cidrs: []                   # REQUIRED (lab/VPN DNS and web)

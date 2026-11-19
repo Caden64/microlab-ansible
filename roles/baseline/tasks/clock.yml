@@ -1,0 +1,154 @@
+---
+# Clock trust before certificates, DNS serials or TTLs depend on it.
+#
+# micolab_time_mode:
+#   auto (default)  NTP sync is accepted. Without it (an offline lab), the
+#                   host clock is measured against the Ansible controller and,
+#                   when micolab_time_set_from_controller is true, set from it.
+#   ntp             NTP sync is required (the original strict behaviour).
+#
+# The controller reference is read with `date` on the controller at the moment
+# each task is templated, immediately before it runs on the host, so SSH
+# latency is the only error (well under the default 5 second tolerance).
+
+- name: Require a known clock mode
+  ansible.builtin.assert:
+    that:
+      - micolab_time_mode | default('auto') in ['auto', 'ntp']
+      - (micolab_time_max_drift_seconds | default(5) | int) > 0
+    fail_msg: micolab_time_mode must be auto or ntp, and micolab_time_max_drift_seconds positive.
+    quiet: true
+
+- name: Check clock synchronization
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timedatectl
+      - show
+      - -p
+      - NTPSynchronized
+      - --value
+  register: micolab_baseline_ntp
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Record whether NTP is synchronized
+  ansible.builtin.set_fact:
+    micolab_baseline_ntp_synced: "{{ micolab_baseline_ntp.rc == 0 and micolab_baseline_ntp.stdout | trim == 'yes' }}"
+
+- name: Require an NTP-synchronized clock in strict NTP mode
+  ansible.builtin.assert:
+    that:
+      - micolab_baseline_ntp_synced | bool
+    fail_msg: >-
+      The host clock is not NTP-synchronized (timedatectl
+      NTPSynchronized={{ micolab_baseline_ntp.stdout | default('unavailable') }}).
+      Certificate validity, DNS TTLs, and record serials are unsafe until time
+      synchronization is working. For an offline lab, set micolab_time_mode: auto
+      to use the controller clock instead.
+    quiet: true
+  when: micolab_time_mode | default('auto') == 'ntp'
+
+- name: Use the controller clock when NTP is unavailable
+  when:
+    - micolab_time_mode | default('auto') == 'auto'
+    - not (micolab_baseline_ntp_synced | bool)
+  block:
+    - name: Require a plausible controller clock
+      ansible.builtin.assert:
+        that:
+          - (lookup('ansible.builtin.pipe', 'date -u +%s') | int) >= (micolab_time_floor_epoch | default(1767225600) | int)
+        fail_msg: >-
+          The controller clock reads {{ lookup('ansible.builtin.pipe', 'date -u +%FT%TZ') }},
+          which is earlier than allowed. Fix this machine's clock before using
+          it as the lab's time reference.
+        quiet: true
+      delegate_to: localhost
+      become: false
+
+    - name: Measure host clock drift against the controller
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - "import sys, time; print(round(time.time() - float(sys.argv[1]), 3))"
+          - "{{ lookup('ansible.builtin.pipe', 'date -u +%s.%N') }}"
+      register: micolab_baseline_clock_drift
+      changed_when: false
+      check_mode: false
+
+    - name: Set the host clock from the controller
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/date
+          - -u
+          - -s
+          - "@{{ lookup('ansible.builtin.pipe', 'date -u +%s.%N') }}"
+      register: micolab_baseline_clock_set
+      changed_when: true
+      when:
+        - (micolab_baseline_clock_drift.stdout | float | abs) > (micolab_time_max_drift_seconds | default(5) | float)
+        - micolab_time_set_from_controller | default(true) | bool
+
+    - name: Check for a hardware clock
+      ansible.builtin.stat:
+        path: /dev/rtc0
+      register: micolab_baseline_rtc
+      when: micolab_baseline_clock_set is changed
+
+    - name: Save the corrected time to the hardware clock
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/hwclock
+          - --systohc
+          - --utc
+      changed_when: true
+      failed_when: false
+      when:
+        - micolab_baseline_clock_set is changed
+        - micolab_baseline_rtc.stat.exists | default(false)
+
+    - name: Check for the timesyncd clock file
+      ansible.builtin.stat:
+        path: /var/lib/systemd/timesync
+      register: micolab_baseline_timesync_dir
+
+    # systemd-timesyncd never starts below this file's mtime after a reboot, so
+    # a host without a hardware clock does not fall back before this run.
+    - name: Record the trusted time as the reboot floor
+      ansible.builtin.file:
+        path: /var/lib/systemd/timesync/clock
+        state: touch
+        owner: "{{ micolab_baseline_timesync_dir.stat.pw_name }}"
+        mode: "0644"
+      when: micolab_baseline_timesync_dir.stat.isdir | default(false)
+
+    - name: Re-measure host clock drift against the controller
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - "import sys, time; print(round(time.time() - float(sys.argv[1]), 3))"
+          - "{{ lookup('ansible.builtin.pipe', 'date -u +%s.%N') }}"
+      register: micolab_baseline_clock_recheck
+      changed_when: false
+      check_mode: false
+
+    - name: Require the host clock to match the controller
+      ansible.builtin.assert:
+        that:
+          - (micolab_baseline_clock_recheck.stdout | float | abs) <= (micolab_time_max_drift_seconds | default(5) | float)
+        fail_msg: >-
+          The host clock is {{ micolab_baseline_clock_recheck.stdout }}s off the
+          controller (limit {{ micolab_time_max_drift_seconds | default(5) }}s) and NTP is not
+          synchronized. Set micolab_time_set_from_controller: true to correct it
+          automatically, or fix the clock by hand.
+        quiet: true
+
+    - name: Report the time source
+      ansible.builtin.debug:
+        msg: >-
+          No NTP; using the controller clock. Host was
+          {{ micolab_baseline_clock_drift.stdout }}s off and
+          {{ 'was corrected' if micolab_baseline_clock_set is changed else 'is within tolerance' }}.
+          After the host reboots offline, run ./microlab sync-clock.

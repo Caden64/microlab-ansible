@@ -327,7 +327,9 @@ Before installing anything, baseline checks:
 - paths are absolute and non-overlapping; storage is not volatile and has
   `micolab_min_free_bytes`
 - required packages and `libicu*` are installed
-- `timedatectl NTPSynchronized=yes`
+- `timedatectl NTPSynchronized=yes`, or (default `micolab_time_mode: auto`)
+  a clock within `micolab_time_max_drift_seconds` of the controller, which
+  deploy sets when NTP is unavailable
 - artifacts exist on the controller and match pinned SHA256
 - no unexpected listener owns 53, 5380, 80, 443, 853, or the SSH port;
   `systemd-resolved` on 53 is a hard failure

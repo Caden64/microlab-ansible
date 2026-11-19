@@ -323,8 +323,10 @@ manager. Configure these through the OS/network tools used by your installation
 before continuing. There is no universal safe command for replacing an unknown
 NetworkManager/systemd-resolved setup. Setting `micolab_dns_manage_resolv_conf:
 false` alone does not free port 53 or configure local name resolution. If port
-53 is occupied or `NTPSynchronized` is not `yes`, stop here and finish that OS
-preparation; do not proceed expecting a later role to fix it.
+53 is occupied, stop here and finish that OS preparation; do not proceed
+expecting a later role to fix it. Without NTP, deploy sets the clock from the
+controller (`micolab_time_mode: auto`; see
+[offline labs](fresh-clone.md#running-the-lab-without-internet)).
 
 Collect your real network values before filling in the examples. On the target
 and each probe, `ip -4 address` shows assigned addresses. On each probe run
