@@ -1,0 +1,97 @@
+---
+# Stage the digest-pinned guest images into the agent's imagesDir.
+# The controller-side check already verified the local bytes against the
+# manifests; every transfer here re-verifies on the host and then asserts the
+# image-trust rules the agent enforces (root ownership, no group/world-writable
+# bits, regular files).
+
+- name: Ensure the agent images directory exists with trusted ownership
+  ansible.builtin.file:
+    path: "{{ micolab_rctf_images_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure one directory per challenge image
+  ansible.builtin.file:
+    path: "{{ micolab_rctf_images_dir }}/{{ item.image }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ micolab_challenges_definitions }}"
+  loop_control:
+    label: "{{ item.image }}"
+
+- name: Copy every pinned image file to the host
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ micolab_rctf_images_dir }}/{{ item.image }}/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "{{ micolab_rctf_challenges_image_file_mode }}"
+    force: true
+  loop: "{{ micolab_challenges_image_files }}"
+  loop_control:
+    label: "{{ item.image }}/{{ item.name }}"
+  register: micolab_rctf_image_copies
+
+- name: Re-verify each staged file digest on the host
+  ansible.builtin.command:
+    argv:
+      - sha256sum
+      - "{{ micolab_rctf_images_dir }}/{{ item.image }}/{{ item.name }}"
+  loop: "{{ micolab_challenges_image_files }}"
+  loop_control:
+    label: "{{ item.image }}/{{ item.name }}"
+  register: micolab_rctf_image_digests
+  changed_when: false
+
+- name: Assert every staged digest matches the manifest pin
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_image_digests.results[index].stdout.split(' ')[0] == item.sha256
+    fail_msg: >-
+      Staged file {{ item.image }}/{{ item.name }} does not match the pinned
+      build digest. The transfer or the local build changed underneath the
+      manifest; re-run ./microlab challenges manifest --allow-update only after
+      reviewing the new build.
+    quiet: true
+  loop: "{{ micolab_challenges_image_files }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.image }}/{{ item.name }}"
+
+- name: Assert the agent's image-trust rules hold for every staged file
+  ansible.builtin.stat:
+    path: "{{ micolab_rctf_images_dir }}/{{ item.image }}/{{ item.name }}"
+  loop: "{{ micolab_challenges_image_files }}"
+  loop_control:
+    label: "{{ item.image }}/{{ item.name }}"
+  register: micolab_rctf_image_stats
+
+- name: Assert ownership, mode and file type
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_image_stats.results[index].stat.isreg | default(false)
+      - micolab_rctf_image_stats.results[index].stat.pw_name == 'root'
+      - micolab_rctf_image_stats.results[index].stat.gr_name == 'root'
+      - micolab_rctf_image_stats.results[index].stat.mode == micolab_rctf_challenges_image_file_mode
+    fail_msg: >-
+      {{ item.image }}/{{ item.name }} must be a regular file owned by
+      root:root with mode {{ micolab_rctf_challenges_image_file_mode }}; the
+      agent refuses image directories it cannot trust.
+    quiet: true
+  loop: "{{ micolab_challenges_image_files }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.image }}/{{ item.name }}"
+
+- name: Report staged images
+  ansible.builtin.debug:
+    msg: >-
+      Staged {{ micolab_challenges_image_files | map(attribute='image') | unique | list | join(', ') }}
+      into {{ micolab_rctf_images_dir }} ({{ micolab_rctf_image_copies.results
+      | selectattr('changed') | list | length }} changed,
+      {{ micolab_rctf_image_copies.results | length }} verified).

@@ -1,0 +1,30 @@
+[Unit]
+Description=rCTF challenge workload edge (Traefik on loopback, behind rctf-edge Caddy)
+Documentation=https://github.com/Caden64/rctf deploy/firecracker/host/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{ micolab_rctf_challenges_traefik_binary }} --configFile={{ micolab_rctf_challenges_traefik_config_dir }}/traefik.yml
+Restart=on-failure
+RestartSec=2
+# The edge only needs to read its static config and the agent's dynamic
+# directory; it binds a loopback port and writes nothing.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -25,11 +25,17 @@ interface is:
 ./microlab deploy
 ./microlab verify
 ./microlab status
+./microlab challenges manifest   # pin lab image digests, no host contact
+./microlab challenges artifacts  # stage the pinned edge binary, no host contact
+./microlab challenges flags      # generate + vault-encrypt event flags (local)
+./microlab challenges deploy     # stage images/edge/records on the rCTF host
 ```
 
 Read each command's `--help` for its implemented options. Setup and artifact
 preparation are controller work; deploy and verify are deliberate operations
-against inventory targets. Reuse your already filled private inventory. Never
+against inventory targets. The `challenges` commands deploy CTF workloads to
+the separate rCTF host — see [the challenges runbook](docs/challenges.md).
+Reuse your already filled private inventory. Never
 copy example values over it to start again.
 
 This remains experimental; no live infra deployment has been validated.
@@ -65,6 +71,8 @@ A stopped CA cannot renew certificates.
 
 ## References
 
+- [rCTF on the NUC](docs/rctf-deployment.md) covers the deployed application, admin login, storage layout and Firecracker handoff.
+- [CTF challenge deployment](docs/challenges.md): building the labs, pinning manifests, staging the edge and registering challenges.
 - [Advanced inputs and legacy site workflow](docs/setup.md), preserving the
   detailed manual reference; `playbooks/site.yml` remains the compatibility entry point.
 - [DNS and firewall](docs/dns.md).
@@ -72,7 +80,8 @@ A stopped CA cannot renew certificates.
 - [Backup and isolated restore](docs/backup-restore.md).
 - Role interfaces: [step-ca](roles/step_ca/README.md),
   [Technitium TLS](roles/technitium_tls/README.md), [Caddy](roles/caddy/README.md),
-  [Forgejo](roles/forgejo/README.md), [verify](roles/verify/README.md).
+  [Forgejo](roles/forgejo/README.md), [verify](roles/verify/README.md),
+  [rctf challenges](roles/rctf_challenges/README.md).
 
 Shared/DNS/Caddy/Forgejo variables currently use `micolab_`; CA/TLS use
 `microlab_`, with documented aliases. Keep existing spellings. Deployment

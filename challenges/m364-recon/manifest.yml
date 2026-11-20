@@ -1,0 +1,11 @@
+# Pinned build output for the m364-recon challenge image. This record shares
+# the exact fc-m364-credit image (one build, two staged records); keep the two
+# manifests in sync when the lab rebuild is re-pinned.
+image: php2shell-vuln
+files:
+  - name: vmlinux
+    sha256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+    size: 44279576
+  - name: rootfs.ext4
+    sha256: 3562042b1088c8c1cbc749acfabccdb6107a38e5f8eea77f4ccad056338d2e4a
+    size: 805306368

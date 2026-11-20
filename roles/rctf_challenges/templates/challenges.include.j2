@@ -1,0 +1,12 @@
+# Managed by the rctf_challenges role. Player-facing per-instance challenge
+# endpoints for the workload namespace: every instance is published by the
+# Firecracker agent as <hostPrefix>-<instance id>.{{ micolab_rctf_challenges_http_domain }}
+# and routed by the loopback Traefik. This file is imported by the
+# operator-owned Caddyfile; this role never rewrites that file.
+#
+# Plain HTTP only: TLS for the workload namespace is not implemented
+# (docs/challenges.md).
+
+http://*.{{ micolab_rctf_challenges_http_domain }} {
+	reverse_proxy {{ micolab_rctf_challenges_traefik_bind_address }}:{{ micolab_rctf_challenges_traefik_bind_port }}
+}

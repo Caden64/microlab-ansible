@@ -1,0 +1,19 @@
+# Pinned build output for the m364-credit challenge image.
+# Staged records: fc-m364-recon and fc-m364-credit share this ONE image
+# (built by the same lab run); keep both manifests in sync when re-pinning
+# a rebuild. Rootfs bytes are build-specific (mkfs timestamps).
+# Source lab: rctf-firecracker deploy/firecracker/labs/php2shell
+# (branch challenge/php2shell-m365, staging-manifest.json at source commit
+# ba1e7afd; the guest service accepts both flag delivery names — lab "main"
+# and the platform's registered "flags/static" — and places the flag by the
+# CHALLENGE env value: fc-m364-recon -> static incident note,
+# fc-m364-credit -> /run/flag.txt readable through the RCE only).
+image: php2shell-vuln
+files:
+  - name: vmlinux
+    sha256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+    size: 44279576
+  - name: rootfs.ext4
+    sha256: 3562042b1088c8c1cbc749acfabccdb6107a38e5f8eea77f4ccad056338d2e4a
+    size: 805306368
+

@@ -1,0 +1,79 @@
+---
+# rctf_challenges deploys CTF challenge workloads to the dedicated rCTF
+# Firecracker host (the single microlab_challenge inventory host).
+#
+# The role never runs on the management host and never configures the rCTF
+# application itself; it stages the images the Firecracker agent boots, the
+# loopback edge proxy behind the existing rctf-edge Caddy, and the challenge
+# records in the local rCTF admin API.
+#
+# Variables use the shared micolab_ prefix. REQUIRED inputs (from the private
+# challenge-host inventory) are listed in README.md and fail closed.
+#
+# Definitions come from the controller-side check (scripts/microlab_challenges.py)
+# through the localhost play: micolab_challenges_definitions and
+# micolab_challenges_image_files hold only validated, digest-pinned paths.
+
+# --- rCTF host layout (matches the pinned host installation) -------------
+micolab_rctf_challenges_agent_config: /etc/rctf-firecracker/agent.yaml
+micolab_rctf_challenges_app_dir: /home/rctf-data/application
+micolab_rctf_challenges_admin_token_file: "{{ micolab_rctf_challenges_app_dir }}/admin-team-token"
+micolab_rctf_challenges_api_base: http://127.0.0.1:8080/api
+micolab_rctf_challenges_api_timeout_seconds: 30
+# Services that must be active before anything is staged or registered.
+micolab_rctf_challenges_required_services:
+  - docker
+  - rctf-edge
+  - rctf-firecracker-agent
+  - rctf-firecracker-controller
+
+# --- workload namespace ---------------------------------------------------
+# The DNS namespace under which http/https endpoints are published as
+# <hostPrefix>-<instance id>.<domain>. The same name is asserted against the
+# agent's network.httpDomain.
+micolab_rctf_challenges_http_domain: fc.rctf.microlab.hnh
+
+# --- stage selection (set by ./microlab challenges deploy) ----------------
+micolab_rctf_challenges_stage_images: true
+micolab_rctf_challenges_stage_edge: true
+micolab_rctf_challenges_stage_register: true
+
+# --- image staging --------------------------------------------------------
+# The images directory is read from the agent configuration; nothing here
+# overrides the agent's own imagesDir.
+micolab_rctf_challenges_image_file_mode: "0644"
+
+# --- edge proxy (Traefik behind the existing rctf-edge Caddy) ------------
+# Traefik routes the per-instance hostnames the Firecracker agent writes into
+# its dynamic directory. It listens on loopback only; the public port stays
+# with rctf-edge Caddy, which proxies the whole workload namespace here.
+# Plain HTTP only: TLS for the workload namespace is not implemented; see
+# docs/challenges.md.
+micolab_rctf_challenges_traefik_binary: /usr/local/bin/traefik
+micolab_rctf_challenges_traefik_config_dir: /etc/traefik
+micolab_rctf_challenges_traefik_bind_address: "127.0.0.1"
+micolab_rctf_challenges_traefik_bind_port: 8180
+micolab_rctf_challenges_traefik_service: rctf-traefik
+micolab_rctf_challenges_edge_caddy_dir: /etc/rctf-edge/challenges
+micolab_rctf_challenges_caddy_config: /etc/rctf-edge/Caddyfile
+micolab_rctf_challenges_caddy_service: rctf-edge
+# Pinned Traefik artifact (staged by ./microlab challenges artifacts and
+# published by the generated vars file). REQUIRED when the edge stage runs.
+micolab_rctf_traefik_version: ""
+micolab_rctf_traefik_artifact_src: ""
+micolab_rctf_traefik_checksums: {}
+micolab_rctf_traefik_binary_sha256: {}
+# Architecture of the challenge host for artifact verification.
+micolab_rctf_expected_architecture: amd64
+
+# --- DNS verification (management-host play) ------------------------------
+# The wildcard record is owned by the technitium_dns role
+# (micolab_dns_extra_records in the private inventory). This deployment only
+# verifies it; accepting an unverified namespace is an explicit operator
+# decision recorded here.
+micolab_rctf_challenges_dns_accept_unverified: false
+
+# --- challenge registration ----------------------------------------------
+# REQUIRED, vault: mapping of challenge id to the event flag. Flags are never
+# stored in this repository and never printed by tasks or reports.
+micolab_rctf_challenges_flags: {}

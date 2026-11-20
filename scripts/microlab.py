@@ -34,6 +34,7 @@ SECRET_KEYS = (
     "micolab_forgejo_jwt_secret", "micolab_forgejo_lfs_jwt_secret",
     "micolab_forgejo_admin_password",
 )
+FORGEJO_JWT_KEYS = ("micolab_forgejo_jwt_secret", "micolab_forgejo_lfs_jwt_secret")
 CA_PATHS = ("microlab_step_ca_root_cert_src", "microlab_step_ca_intermediate_cert_src",
             "microlab_step_ca_intermediate_key_src")
 CA_VALUES = ("microlab_step_ca_root_fingerprint_sha256",
@@ -369,7 +370,7 @@ def setup(args):
             if present(values.get("vault_" + key)):
                 additions[key] = "{{ vault_" + key + " }}"
             else:
-                generated[key] = secrets.token_urlsafe(48)
+                generated[key] = secrets.token_urlsafe(32 if key in FORGEJO_JWT_KEYS else 48)
         directory = output_vars_directory(path, infra_name) if generated or additions else path.parent / "group_vars" / MANAGEMENT
         # Review before any durable writes. Never rewrite an encrypted inventory.
         changed = not existing or original != inventory
@@ -647,7 +648,15 @@ def run_playbook(args, name, playbook):
     command = ["ansible-playbook", "--inventory", str(args.inventory), str(playbook), "--limit", "localhost," + name]
     if not (os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE") or os.environ.get("ANSIBLE_VAULT_IDENTITY_LIST")):
         command.append("--ask-vault-pass")
-    if not args.no_become_prompt:
+    # A protected become password file replaces the prompt or passwordless
+    # sudo for non-interactive runs (the challenge orchestrator sets it when
+    # converging the infra DNS record).
+    become_file = os.environ.get("ANSIBLE_BECOME_PASSWORD_FILE")
+    if become_file:
+        if not Path(become_file).is_file():
+            raise Checkpoint("ANSIBLE_BECOME_PASSWORD_FILE does not exist: " + become_file)
+        command += ["--become-password-file", become_file]
+    elif not args.no_become_prompt:
         if sys.stdin.isatty():
             command.append("--ask-become-pass")
         else:
@@ -679,8 +688,212 @@ def status(args):
     print("Remote installation: UNVERIFIED. Acceptance: UNVERIFIED. No hosts contacted. Use ./microlab verify explicitly.")
 
 
+CHALLENGES_MODULE = "scripts/microlab_challenges.py"
+FLAG_PREFIX = "rctf{"
+FLAG_SUFFIX = "}"
+FLAGS_VAULT_STEM = "challenges-vault"
+
+
+def challenge_ids(definitions_dir):
+    """Stable, validated challenge ids from the checked-in definitions."""
+    directory = ROOT / definitions_dir
+    if not directory.is_dir():
+        raise Checkpoint("Challenge definitions directory is missing: %s" % directory)
+    ids = []
+    for child in sorted(directory.iterdir()):
+        path = child / "challenge.yaml"
+        if not child.is_dir() or not path.is_file():
+            continue
+        definition = read_mapping(path)
+        value = definition.get("id")
+        if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", value):
+            raise Checkpoint("Invalid challenge id in %s." % path)
+        ids.append(value)
+    if not ids:
+        raise Checkpoint("No challenge definitions found under %s." % directory)
+    return ids
+
+
+def generate_missing_flags(ids, existing):
+    """New random flags for ids without one; existing values are never replaced."""
+    return {value: FLAG_PREFIX + secrets.token_urlsafe(24) + FLAG_SUFFIX
+            for value in ids if not present(existing.get(value))}
+
+
+def challenges_flags(args):
+    """Generate and vault-encrypt an event flag for every challenge definition.
+
+    Flags are secrets: they are encrypted immediately, never written in
+    plaintext, and printed exactly once for the operator's answer key.
+    Existing stored flags are preserved; change one deliberately with
+    ansible-vault edit on the generated file. The store is one canonical
+    encrypted file that is replaced atomically after a decrypt+merge, so
+    generated sidecars from other tools (the artifact vars file sorts after
+    this name) can never redirect or shadow it.
+    """
+    ids = challenge_ids("challenges")
+    if not args.inventory.is_file():
+        raise Checkpoint("Site inventory missing; run ./microlab setup first (existing inventories can be selected with --inventory).")
+    directory = args.inventory.parent / "group_vars" / CHALLENGE
+    canonical = directory / (FLAGS_VAULT_STEM + ".yml")
+    with Vault() as vault:
+        existing, legacy = {}, []
+        if directory.is_dir():
+            for path in sorted(directory.glob(FLAGS_VAULT_STEM + "*.yml")):
+                stored = vault.read(path).get("micolab_rctf_challenges_flags")
+                if not isinstance(stored, dict):
+                    continue
+                if path == canonical:
+                    existing = stored
+                else:
+                    legacy.append(path)
+        if legacy:
+            raise Checkpoint("Multiple flag vault files exist (%s). Merge them manually into %s with ansible-vault edit; nothing was generated." % (", ".join(str(path) for path in legacy), canonical))
+        if canonical.is_file() and not canonical.read_text().startswith("$ANSIBLE_VAULT;"):
+            raise Checkpoint("%s exists but is not an encrypted vault file; nothing was written over it." % canonical)
+        new = generate_missing_flags(ids, existing)
+        if not new:
+            print("Every challenge already has a stored flag; nothing was generated or changed.")
+            return 0
+        unknown = sorted(set(existing) - set(ids))
+        if unknown:
+            raise Checkpoint("Stored flags exist for unknown challenge ids (%s); refusing to drop them. "
+                             "Review the vault file privately." % ", ".join(unknown))
+        merged = dict(sorted(existing.items()))
+        merged.update(new)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle, temporary = tempfile.mkstemp(prefix=".challenges-vault-", dir=directory)
+        os.close(handle)
+        os.unlink(temporary)  # ansible-vault --output must create the file itself
+        vault.encrypt({"micolab_rctf_challenges_flags": merged}, Path(temporary))
+        os.replace(temporary, canonical)
+    print("Event flags generated and encrypted into %s/group_vars/%s/%s*.yml."
+          % (args.inventory.parent.name, CHALLENGE, FLAGS_VAULT_STEM))
+    print("Record these once; they are only recoverable from that vault file or this output:")
+    for key in sorted(new):
+        print("  %s: %s" % (key, new[key]))
+    print("Existing stored flags were preserved. Change one deliberately with ansible-vault edit.")
+    return 0
+
+
+def challenges_local(args):
+    """Local, host-free subcommands: manifest pinning and edge artifact staging."""
+    module = ROOT / CHALLENGES_MODULE
+    if not module.is_file():
+        raise Checkpoint("Challenge module is not available yet: " + CHALLENGES_MODULE)
+    command = [sys.executable, str(module), args.challenges_command,
+               "--inventory", str(args.inventory), "--definitions", str(ROOT / "challenges")]
+    if args.challenges_command == "manifest":
+        if not args.images_dir:
+            raise Checkpoint("Pass at least one --images-dir containing the lab's built images.")
+        for directory in args.images_dir:
+            command += ["--images-dir", str(directory)]
+        if args.allow_update:
+            command.append("--allow-update")
+    elif args.challenges_command == "artifacts":
+        if args.offline:
+            command.append("--offline")
+        if args.check:
+            command.append("--check")
+    print("Running challenges %s locally; no inventory host is contacted." % args.challenges_command, flush=True)
+    return subprocess.run(command, cwd=ROOT).returncode
+
+
+def challenges_deploy(args):
+    """Deliberate operation against the rCTF host; infra is only probed for DNS."""
+    need_tool("ansible-playbook")
+    module = ROOT / CHALLENGES_MODULE
+    if not module.is_file():
+        raise Checkpoint("Challenge module is not available yet: " + CHALLENGES_MODULE)
+    stage = getattr(args, "stage", None) or "all"
+    stages = ["images", "edge", "register"] if stage == "all" else [stage]
+    if any(item not in ("images", "edge", "register") for item in stages):
+        raise Checkpoint("Unknown challenges deploy stage: %s" % stage)
+    images = [Path(directory).expanduser().resolve() for directory in (args.images_dir or [])]
+    if not images:
+        raise Checkpoint("Pass at least one --images-dir containing the lab's built images "
+                         '(directories holding <image>/{vmlinux,rootfs.ext4}).')
+    # Local gates first: nothing below contacts a host unless the definitions,
+    # manifests and local image bytes already agree.
+    precheck = subprocess.run(
+        [sys.executable, str(module), "check", "--inventory", str(args.inventory),
+         "--definitions", str(ROOT / "challenges")]
+        + sum((["--images-dir", str(directory)] for directory in images), []),
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        result = json.loads(precheck.stdout.decode())
+    except ValueError:
+        result = {}
+    if precheck.returncode or result.get("status") != "ready":
+        detail = result.get("error") if isinstance(result.get("error"), str) else "review definitions and manifests"
+        raise Checkpoint("Challenge preflight failed: %s. No host was contacted." % detail)
+    definitions = result.get("definitions") or []
+    needs_edge = any(item.get("needs_edge") for item in definitions)
+    if "edge" in stages and needs_edge:
+        edge = subprocess.run([sys.executable, str(module), "artifacts", "--check",
+                                "--inventory", str(args.inventory), "--definitions", str(ROOT / "challenges")],
+                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            edge_result = json.loads(edge.stdout.decode())
+        except ValueError:
+            edge_result = {}
+        if edge.returncode or edge_result.get("status") not in ("checked", "ready"):
+            raise Checkpoint("Edge artifact missing: run ./microlab challenges artifacts first "
+                             "(web challenge endpoints need the pinned Traefik). No host was contacted.")
+    command = ["ansible-playbook", "--inventory", str(args.inventory),
+               str(ROOT / "playbooks/challenges.yml"),
+               "--limit", "localhost,microlab_management,microlab_challenge"]
+    if not (os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE") or os.environ.get("ANSIBLE_VAULT_IDENTITY_LIST")):
+        command.append("--ask-vault-pass")
+    become_file = os.environ.get("ANSIBLE_BECOME_PASSWORD_FILE")
+    if become_file and not Path(become_file).is_file():
+        raise Checkpoint("ANSIBLE_BECOME_PASSWORD_FILE does not exist: " + become_file)
+    if args.no_become_prompt:
+        if become_file:
+            # Passwordless sudo is not required: a protected become password
+            # file drives the playbook without any prompt.
+            command += ["--become-password-file", become_file]
+        else:
+            print("No become prompt: relying on configured protected Ansible become "
+                  "credentials or passwordless sudo. No password will be read from stdin.",
+                  flush=True)
+    elif become_file:
+        command += ["--become-password-file", become_file]
+    elif sys.stdin.isatty():
+        command.append("--ask-become-pass")
+    else:
+        print("No terminal: become needs a terminal prompt, passwordless sudo, or "
+              "ANSIBLE_BECOME_PASSWORD_FILE for a non-interactive run. No password "
+              "will be read from stdin.", flush=True)
+    # One JSON object for every extra variable: parse_kv would otherwise turn
+    # the images list into a single string and dump the remainder into
+    # _raw_params, which the localhost play's loop then rejects. A JSON object
+    # preserves the list and the booleans.
+    command += ["-e", json.dumps({
+        "micolab_rctf_challenges_stage_images": "images" in stages,
+        "micolab_rctf_challenges_stage_edge": "edge" in stages,
+        "micolab_rctf_challenges_stage_register": "register" in stages,
+        "micolab_rctf_challenges_images_dirs": [str(directory) for directory in images],
+        # The live inventory may live outside this checkout (its
+        # group_vars/all.yml has no challenges namespace), so the launcher
+        # pins the documented default here. The role asserts it matches the
+        # agent's network.httpDomain either way, and
+        # micolab_rctf_challenges_dns_accept_unverified stays
+        # inventory-owned (the playbook defaults it to false).
+        "micolab_rctf_challenges_http_domain": "fc.rctf.microlab.hnh",
+    })]
+    print("Deploying challenges to the rCTF host (stages: %s); infra is only probed for the "
+          "workload DNS namespace." % ", ".join(stages), flush=True)
+    returncode = subprocess.run(command, cwd=ROOT).returncode
+    if returncode:
+        return returncode
+    print("Challenges playbook completed. Acceptance is limited to what actually ran: player instance "
+          "launch and endpoint reachability are separate probes; see docs/challenges.md before the event.")
+    return 0
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="./microlab", description="MicroLab two-host controller. setup/artifacts/status are local; deploy/verify explicitly contact infra.")
+    parser = argparse.ArgumentParser(prog="./microlab", description="MicroLab two-host controller. setup/artifacts/status are local; deploy/verify explicitly contact infra; challenges manifest/artifacts are local and challenges deploy deliberately contacts the rCTF host.")
     parser.add_argument("--inventory", type=Path, default=ROOT / "inventories/site/hosts.yml", help="reuse your existing YAML inventory")
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("setup", help="create or conservatively complete local site inventory and Vault")
@@ -700,9 +913,32 @@ def main(argv=None):
     ca = sub.add_parser("ca-init", help="create the CA (root, intermediate, Technitium provisioner) locally and add it to inventory")
     ca.add_argument("--output", type=Path, help="CA directory (default: ca/ beside the inventory; must not exist)")
     ca.add_argument("--name", default="MicroLab", help="certificate name prefix (default: MicroLab)")
+    challenges = sub.add_parser("challenges", help="CTF challenge definitions: pin manifests, stage the edge artifact, deploy to the rCTF host")
+    challenges.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
+    challenges_commands = challenges.add_subparsers(dest="challenges_command", required=True)
+    manifest = challenges_commands.add_parser("manifest", help="fill manifest.yml pins from locally built lab images (no host contact)")
+    manifest.add_argument("--images-dir", action="append", type=Path, help="directory containing <image>/{vmlinux,rootfs.ext4}; repeatable")
+    manifest.add_argument("--allow-update", action="store_true", help="reviewed re-pin after a rebuilt image")
+    manifest.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
+    challenge_artifacts = challenges_commands.add_parser("artifacts", help="stage the pinned Traefik edge archive for the rCTF host")
+    challenge_artifacts.add_argument("--offline", action="store_true", help="use an existing staged file; no downloads")
+    challenge_artifacts.add_argument("--check", action="store_true", help="validate an existing staged file; no writes")
+    challenge_artifacts.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
+    challenges_deploy_parser = challenges_commands.add_parser("deploy", help="stage images, edge proxy and challenge records on the rCTF host")
+    challenges_deploy_parser.add_argument("--stage", choices=("images", "edge", "register", "all"), default="all",
+                                           help="all: images, edge proxy, then challenge records")
+    challenges_deploy_parser.add_argument("--images-dir", action="append", type=Path,
+                                          help="directory containing <image>/{vmlinux,rootfs.ext4}; repeatable")
+    challenges_deploy_parser.add_argument("--no-become-prompt", action="store_true",
+                                          help="use existing passwordless sudo or protected Ansible become credentials")
+    challenges_deploy_parser.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
+    challenge_flags = challenges_commands.add_parser("flags", help="generate and vault-encrypt an event flag for every challenge definition (needs the Vault password)")
+    challenge_flags.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
     sub.add_parser("status", help="local prerequisites only; never contacts hosts or claims installation")
     # Accept --inventory on either side of the verb, keeping one stable contract.
-    for command in sub.choices.values():
+    for name, command in sub.choices.items():
+        if name == "challenges":
+            continue  # challenges and its subcommands already accept --inventory
         command.add_argument("--inventory", type=Path, default=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.inventory = args.inventory.expanduser().resolve()
@@ -715,6 +951,12 @@ def main(argv=None):
             status(args)
         elif args.command == "ca-init":
             ca_init(args)
+        elif args.command == "challenges":
+            if args.challenges_command == "deploy":
+                return challenges_deploy(args)
+            if args.challenges_command == "flags":
+                return challenges_flags(args)
+            return challenges_local(args)
         elif args.command == "artifacts":
             module = ROOT / "scripts/microlab_artifacts.py"
             if not module.is_file():

@@ -1,0 +1,301 @@
+---
+# Deploy the loopback edge: pinned Traefik behind the existing rctf-edge
+# Caddy. Traefik routes the per-instance hostnames the Firecracker agent
+# writes into its dynamic directory; Caddy stays the only public listener and
+# proxies the whole workload namespace to Traefik over plain HTTP.
+#
+# TLS for the workload namespace is deliberately not implemented; see
+# docs/challenges.md. Everything here fails closed.
+
+- name: Require web challenge endpoints for this stage
+  ansible.builtin.set_fact:
+    micolab_rctf_edge_needed: "{{ micolab_challenges_definitions | selectattr('needs_edge') | list | length > 0 }}"
+
+- name: Refuse the edge stage without web challenge endpoints
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_edge_needed | bool
+    fail_msg: >-
+      No challenge definition exposes http/https/tcp-ssl endpoints; the edge
+      proxy is not needed. Deploy with --stage images,register instead.
+    quiet: true
+  when: not micolab_rctf_edge_needed | bool
+
+- name: Run the edge deployment
+  when: micolab_rctf_edge_needed | bool
+  block:
+    - name: Require the Caddyfile to import the challenge include
+      # Checked BEFORE any edge change so an import-only fix never lands after
+      # the fact. Line-anchored: a commented import does not satisfy it.
+      ansible.builtin.slurp:
+        src: "{{ micolab_rctf_challenges_caddy_config }}"
+      register: microlab_rctf_caddyfile_head
+
+    - name: Assert the import line is active
+      ansible.builtin.assert:
+        that:
+          - (micolab_rctf_caddyfile_head.content | b64decode) is search('(?m)^[ \t]*import[ \t]+[^ \t#]*challenges[^\n]*\.include')
+        fail_msg: >-
+          {{ micolab_rctf_challenges_caddy_config }} does not actively import
+          the challenge include. Add exactly one line to it (inside the global
+          options or at top level as appropriate for your file):
+          import {{ micolab_rctf_challenges_edge_caddy_dir }}/challenges.include
+          This role never rewrites the operator-owned Caddyfile; the deploy
+          orchestrator's caddy stage can add and validate it for you.
+        quiet: true
+
+    - name: Require the staged pinned Traefik artifact
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_traefik_version | string | length > 0
+          - micolab_rctf_traefik_artifact_src | string | length > 0
+          - micolab_rctf_traefik_checksums[micolab_rctf_expected_architecture] is defined
+          - micolab_rctf_traefik_binary_sha256[micolab_rctf_expected_architecture] is defined
+        fail_msg: >-
+          The pinned Traefik artifact is not staged. Run
+          ./microlab challenges artifacts first; the edge stage never downloads
+          anything itself.
+        quiet: true
+
+    - name: Stat the controller Traefik archive
+      delegate_to: localhost
+      become: false
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ micolab_rctf_traefik_artifact_src }}"
+      register: micolab_rctf_traefik_src_stat
+
+    - name: Refuse a missing or replaced controller archive
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_traefik_src_stat.stat.isreg | default(false)
+        fail_msg: >-
+          {{ micolab_rctf_traefik_artifact_src }} is missing; re-run
+          ./microlab challenges artifacts.
+        quiet: true
+
+    - name: Copy the Traefik archive to the host
+      ansible.builtin.copy:
+        src: "{{ micolab_rctf_traefik_artifact_src }}"
+        dest: "/tmp/rctf-traefik-{{ micolab_rctf_traefik_version }}.tar.gz"
+        owner: root
+        group: root
+        mode: "0600"
+      register: micolab_rctf_traefik_copy
+
+    - name: Verify the archive digest on the host
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - /tmp/rctf-traefik-{{ micolab_rctf_traefik_version }}.tar.gz
+      register: micolab_rctf_traefik_archive_digest
+      changed_when: false
+
+    - name: Assert the archive digest matches the pin
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_traefik_archive_digest.stdout.split(' ')[0] ==
+            micolab_rctf_traefik_checksums[micolab_rctf_expected_architecture]
+        fail_msg: >-
+          The staged Traefik archive does not match the pinned digest; refuse
+          to install it. Re-run ./microlab challenges artifacts after
+          reviewing the pin.
+        quiet: true
+
+    - name: Extract the pinned Traefik binary
+      ansible.builtin.unarchive:
+        src: "/tmp/rctf-traefik-{{ micolab_rctf_traefik_version }}.tar.gz"
+        dest: "/tmp/rctf-traefik-extract-{{ micolab_rctf_traefik_version }}"
+        remote_src: true
+        creates: "/tmp/rctf-traefik-extract-{{ micolab_rctf_traefik_version }}/traefik"
+
+    - name: Verify the extracted binary digest
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - /tmp/rctf-traefik-extract-{{ micolab_rctf_traefik_version }}/traefik
+      register: micolab_rctf_traefik_binary_digest
+      changed_when: false
+
+    - name: Assert the binary digest matches the pin
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_traefik_binary_digest.stdout.split(' ')[0] ==
+            micolab_rctf_traefik_binary_sha256[micolab_rctf_expected_architecture]
+        fail_msg: >-
+          The extracted Traefik binary does not match the pinned digest;
+          refusing to install it.
+        quiet: true
+
+    - name: Install the Traefik binary
+      ansible.builtin.command:
+        argv:
+          - install
+          - "-m"
+          - "0755"
+          - /tmp/rctf-traefik-extract-{{ micolab_rctf_traefik_version }}/traefik
+          - "{{ micolab_rctf_challenges_traefik_binary }}"
+      register: micolab_rctf_traefik_install
+      changed_when: true
+
+    - name: Ensure the Traefik configuration directory exists
+      ansible.builtin.file:
+        path: "{{ micolab_rctf_challenges_traefik_config_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure the agent dynamic directory exists
+      ansible.builtin.file:
+        path: "{{ micolab_rctf_traefik_dynamic_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Render the Traefik static configuration
+      ansible.builtin.template:
+        src: traefik.yml.j2
+        dest: "{{ micolab_rctf_challenges_traefik_config_dir }}/traefik.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      register: micolab_rctf_traefik_config_render
+
+    - name: Render the Traefik systemd unit
+      ansible.builtin.template:
+        src: rctf-traefik.service.j2
+        dest: "/etc/systemd/system/{{ micolab_rctf_challenges_traefik_service }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      register: micolab_rctf_traefik_unit_render
+
+    - name: Ensure the challenge edge proxy is enabled and started
+      ansible.builtin.systemd:
+        name: "{{ micolab_rctf_challenges_traefik_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Hash the binary that is about to be replaced
+      ansible.builtin.stat:
+        path: "{{ micolab_rctf_challenges_traefik_binary }}"
+      register: microlab_rctf_traefik_binary_before
+
+    - name: Record the installed binary digest
+      ansible.builtin.command:
+        argv: ["sha256sum", "{{ micolab_rctf_challenges_traefik_binary }}"]
+      register: microlab_rctf_traefik_binary_after
+      changed_when: false
+      failed_when: false
+
+    - name: Restart the edge proxy when the binary, unit or config changed
+      # A binary-only update must not leave the old process serving.
+      ansible.builtin.systemd:
+        name: "{{ micolab_rctf_challenges_traefik_service }}"
+        state: restarted
+      when: microlab_rctf_traefik_unit_render.changed
+            or microlab_rctf_traefik_config_render.changed
+            or (microlab_rctf_traefik_binary_before.stat.exists | default(false)
+                and microlab_rctf_traefik_binary_after.stdout.split(' ') | first
+                != microlab_rctf_traefik_binary_digest.stdout.split(' ') | first)
+    - name: Assert the challenge edge proxy is active
+      ansible.builtin.command:
+        argv: ["systemctl", "is-active", "{{ micolab_rctf_challenges_traefik_service }}"]
+      register: micolab_rctf_traefik_active
+      changed_when: false
+
+    - name: Assert the loopback edge listener is Traefik itself
+      # An unknown instance hostname must be answered with Traefik's default
+      # "404 page not found" body; an empty 404 is some other listener.
+      ansible.builtin.uri:
+        url: "http://{{ micolab_rctf_challenges_traefik_bind_address }}:{{ micolab_rctf_challenges_traefik_bind_port }}/"
+        method: GET
+        status_code: [404]
+        return_content: true
+        timeout: "{{ microlab_rctf_challenges_api_timeout_seconds }}"
+        headers:
+          Host: "edge-probe.{{ micolab_rctf_challenges_http_domain }}"
+      register: microlab_rctf_traefik_probe
+      changed_when: false
+
+    - name: Assert Traefik answered the loopback probe
+      ansible.builtin.assert:
+        that:
+          - microlab_rctf_traefik_probe.content is search('404 page not found')
+        fail_msg: >-
+          The loopback edge answered 404 but not with Traefik's default body;
+          something else is listening on
+          {{ micolab_rctf_challenges_traefik_bind_address }}:{{ micolab_rctf_challenges_traefik_bind_port }}.
+        quiet: true
+    - name: Render the Caddy include for the workload namespace
+      ansible.builtin.file:
+        path: "{{ micolab_rctf_challenges_edge_caddy_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Render the workload namespace site block
+      ansible.builtin.template:
+        src: challenges.include.j2
+        dest: "{{ micolab_rctf_challenges_edge_caddy_dir }}/challenges.include"
+        owner: root
+        group: root
+        mode: "0644"
+      register: micolab_rctf_caddy_include_render
+
+    - name: Reload the rctf-edge Caddy
+      ansible.builtin.systemd:
+        name: "{{ micolab_rctf_challenges_caddy_service }}"
+        state: reloaded
+      when: micolab_rctf_caddy_include_render.changed or micolab_rctf_traefik_config_render.changed
+
+    - name: Probe the workload namespace through the public edge
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/"
+        method: GET
+        status_code: [404]
+        return_content: true
+        timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+        headers:
+          Host: "edge-probe.{{ micolab_rctf_challenges_http_domain }}"
+      register: microlab_rctf_edge_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the public edge routes the namespace to Traefik
+      ansible.builtin.assert:
+        that:
+          - microlab_rctf_edge_probe.status | default(0) == 404
+          - micolab_rctf_edge_probe.content | default('') is search('404 page not found')
+        fail_msg: >-
+          A request for Host edge-probe.{{ microlab_rctf_challenges_http_domain }}
+          on the public edge was not answered by Traefik (expected its
+          "404 page not found" body; got status
+          {{ microlab_rctf_edge_probe.status | default('no response') }}). An
+          empty 404 means Caddy served its own default site: the include is
+          not routed. Check the Caddy import and
+          {{ microlab_rctf_challenges_edge_caddy_dir }}/challenges.include.
+        quiet: true
+    - name: Remove the temporary extraction tree
+      ansible.builtin.file:
+        path: "/tmp/rctf-traefik-extract-{{ micolab_rctf_traefik_version }}"
+        state: absent
+
+    - name: Remove the transferred archive
+      ansible.builtin.file:
+        path: "/tmp/rctf-traefik-{{ micolab_rctf_traefik_version }}.tar.gz"
+        state: absent
+
+- name: Report the edge state
+  ansible.builtin.debug:
+    msg: >-
+      Edge proxy ready: Traefik {{ micolab_rctf_traefik_version }} on
+      {{ micolab_rctf_challenges_traefik_bind_address }}:{{ micolab_rctf_challenges_traefik_bind_port }}
+      (entrypoint {{ micolab_rctf_traefik_entrypoint }}, dynamic files
+      {{ micolab_rctf_traefik_dynamic_dir }}), fronted by
+      {{ micolab_rctf_challenges_caddy_service }} for
+      *.{{ micolab_rctf_challenges_http_domain }}. Plain HTTP only.

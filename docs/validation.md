@@ -170,3 +170,23 @@ Record real-host evidence before treating this as an accepted deployment.
 See [certificate renewal](certificate-renewal.md) and [DNS](dns.md) for the
 operational procedures. Live deployment, reboot, WAN-disconnected renewal,
 and isolated restore have **not** been exercised in the recorded verification.
+
+## CTF challenge tooling (2026-11-19)
+
+Added with no live deployment exercised: the `./microlab challenges`
+commands, `scripts/microlab_challenges.py`, `playbooks/challenges.yml`, the
+`rctf_challenges` role, the `challenges/` definitions and
+`config/challenges.lock.json`. What has actually passed locally:
+
+- `microlab_challenges.py` `check`/`manifest`/`artifacts` modes exercised
+  against the example inventory with fixture images: markers fail closed,
+  digest/size/diskMiB drift fails closed, rebuild re-pins require
+  `--allow-update`, and the manifest fill produces the recorded output.
+- `challenges.yml` parses and passes `ansible-playbook --syntax-check` with
+  only `inventories/example/hosts.yml`; no target connection was made.
+
+Not exercised: the Traefik download (the pin reuses the rCTF fork's reviewed
+v3.7.15 sha256 pair), any play against a real NUC or Pi, the rCTF admin API
+login/upsert/readback, DNS wildcard verification, Caddy reload, and the
+acceptance probes in [challenges.md](challenges.md). A green playbook is not
+challenge acceptance.

@@ -1,0 +1,11 @@
+# Pinned build output for the xweb-recon challenge image. This record shares
+# the exact fc-xweb image (one build, two staged records); keep the two
+# manifests in sync when the lab rebuild is re-pinned.
+image: xweb-vuln
+files:
+  - name: vmlinux
+    sha256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+    size: 44279576
+  - name: rootfs.ext4
+    sha256: afde9cd2a1d566d3fdb72c2159664334b5db4b582264b5b336c60bcd541faf0a
+    size: 268435456

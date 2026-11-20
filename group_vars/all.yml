@@ -200,6 +200,7 @@ micolab_required_packages:
   - ca-certificates
   - curl
   - git
+  - git-lfs
   - gzip
   - iproute2
   - knot-dnsutils
@@ -273,3 +274,18 @@ micolab_verify_expected_a_records:
   ca.microlab.hnh: "{{ micolab_dns_addresses.ca }}"
   dns.microlab.hnh: "{{ micolab_dns_addresses.dns }}"
   git.microlab.hnh: "{{ micolab_dns_addresses.git }}"
+
+# ---------------------------------------------------------------------------
+# CTF challenge workloads (rctf_challenges role, ./microlab challenges)
+# ---------------------------------------------------------------------------
+# DNS namespace under which instanced web endpoints are published as
+# <hostPrefix>-<instance id>.<domain>. Must equal the Firecracker agent's
+# network.httpDomain; the role asserts both sides agree. The wildcard A record
+# for this namespace is owned by technitium_dns: add
+#   { name: "*.fc.rctf.microlab.hnh", type: A, value: <rctf host address> }
+# to micolab_dns_extra_records in the private inventory.
+micolab_rctf_challenges_http_domain: fc.rctf.microlab.hnh
+# The DNS verification in playbooks/challenges.yml fails closed when the
+# wildcard record does not resolve to the rCTF host. Accepting an unverified
+# namespace is an explicit operator decision recorded here; never the default.
+micolab_rctf_challenges_dns_accept_unverified: false

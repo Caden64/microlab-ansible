@@ -1,0 +1,202 @@
+---
+# Deploy CTF challenges to the rCTF host. Run through ./microlab challenges
+# deploy, which validates the definitions and images locally first and then
+# executes this playbook against localhost (validation), the management host
+# (DNS namespace verification only) and the challenge host (staging).
+#
+# Stage selection is passed by the launcher as booleans:
+#   micolab_rctf_challenges_stage_images / _edge / _register
+
+- name: Validate challenge definitions without connecting to targets
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    micolab_rctf_challenges_definitions_dir: "{{ playbook_dir }}/../challenges"
+    micolab_rctf_challenges_images_dirs: []
+  tasks:
+    - name: Require exactly one dedicated rCTF host isolated from infra
+      ansible.builtin.assert:
+        that:
+          - groups['microlab_management'] | default([]) | length == 1
+          - groups['microlab_challenge'] | default([]) | length == 1
+          - (groups['microlab_management'] | default([]) | intersect(groups['microlab_challenge'] | default([]))) | length == 0
+        fail_msg: >-
+          Define one infra host in microlab_management and the separate
+          rCTF host in microlab_challenge. Challenge deployment requires the
+          second host; probe hosts need neither group.
+        quiet: true
+
+    - name: Reject a challenge alias pointing at the infra address
+      ansible.builtin.assert:
+        that:
+          - (hostvars[item].ansible_host | default(item)) != (hostvars[groups['microlab_management'][0]].ansible_host | default(groups['microlab_management'][0]))
+        fail_msg: The rCTF/microVM host must have a different address from infra.
+        quiet: true
+      loop: "{{ groups['microlab_challenge'] | default([]) }}"
+
+    - name: Require the launcher-provided images directories
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_challenges_images_dirs | length > 0
+        fail_msg: >-
+          The launcher must pass --images-dir for the lab builds;
+          ./microlab challenges deploy does this. Run deployment through
+          ./microlab.
+        quiet: true
+
+    - name: Assemble the controller-side validation command
+      ansible.builtin.set_fact:
+        micolab_rctf_challenges_check_argv: >-
+          {{ ['python3', playbook_dir ~ '/../scripts/microlab_challenges.py', 'check',
+              '--inventory', ansible_inventory_sources | first,
+              '--definitions', micolab_rctf_challenges_definitions_dir] }}
+
+    - name: Append each images directory to the validation command
+      ansible.builtin.set_fact:
+        micolab_rctf_challenges_check_argv: "{{ micolab_rctf_challenges_check_argv + ['--images-dir', item] }}"
+      loop: "{{ micolab_rctf_challenges_images_dirs }}"
+
+    - name: Validate definitions, manifests and local image bytes
+      ansible.builtin.command:
+        argv: "{{ micolab_rctf_challenges_check_argv }}"
+      register: micolab_challenges_check
+      changed_when: false
+
+    - name: Refuse to deploy on validation failure
+      ansible.builtin.assert:
+        that:
+          - micolab_challenges_check.rc == 0
+        fail_msg: >-
+          Challenge validation failed (details in the task output above);
+          nothing was deployed and no host was contacted beyond this check.
+        quiet: true
+
+    - name: Load the validated definitions
+      ansible.builtin.set_fact:
+        micolab_challenges_definitions: "{{ (micolab_challenges_check.stdout | from_json).definitions }}"
+        micolab_challenges_image_files: "{{ (micolab_challenges_check.stdout | from_json).image_files }}"
+
+    - name: Require a vaulted flag for every registered challenge
+      when: micolab_rctf_challenges_stage_register | bool
+      vars:
+        micolab_rctf_challenge_flags: >-
+          {{ hostvars[groups['microlab_challenge'] | first]['micolab_rctf_challenges_flags'] | default({}) }}
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_challenge_flags[item.id] is defined
+          - micolab_rctf_challenge_flags[item.id] | string | trim | length > 0
+        fail_msg: >-
+          No event flag for {{ item.id }}: add it to the vault mapping
+          micolab_rctf_challenges_flags in the challenge host inventory
+          (group_vars/microlab_challenge, ansible-vault edit).
+        quiet: true
+      loop: "{{ micolab_challenges_definitions }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Summarize the validated deployment
+      ansible.builtin.debug:
+        msg: >-
+          Validated {{ micolab_challenges_definitions | map(attribute='id') | list | join(', ') }};
+          {{ micolab_challenges_image_files | length }} pinned image files;
+          edge proxy required: {{ micolab_challenges_definitions | selectattr('needs_edge') | list | length > 0 }};
+          stages: images={{ micolab_rctf_challenges_stage_images | bool }},
+          edge={{ micolab_rctf_challenges_stage_edge | bool }},
+          register={{ micolab_rctf_challenges_stage_register | bool }}.
+
+- name: Verify the workload DNS namespace on infra
+  hosts: microlab_management
+  gather_facts: false
+  # Read-only dig checks against the local resolver; no root operations here.
+  # Adding or converging the record itself is the technitium_dns role's job
+  # (./microlab deploy --stage services in the infra checkout).
+  become: false
+  vars:
+    micolab_rctf_challenges_rctf_address: "{{ hostvars[groups['microlab_challenge'] | first].ansible_host }}"
+    micolab_rctf_challenges_edge_wanted: >-
+      {{ (hostvars['localhost']['micolab_challenges_definitions'] | selectattr('needs_edge') | list | length > 0)
+         and (micolab_rctf_challenges_stage_edge | bool) }}
+  tasks:
+    - name: Resolve the workload namespace wildcard on the authoritative server
+      when: micolab_rctf_challenges_edge_wanted | bool
+      ansible.builtin.command:
+        argv:
+          - dig
+          - "@127.0.0.1"
+          - "*.{{ micolab_rctf_challenges_http_domain }}"
+          - A
+          - "+short"
+      register: micolab_rctf_dns_wildcard
+      changed_when: false
+
+    - name: Assert the wildcard resolves to the rCTF host
+      when: (micolab_rctf_challenges_edge_wanted | bool) and
+            not (micolab_rctf_challenges_dns_accept_unverified | default(false) | bool)
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_dns_wildcard.stdout_lines | length > 0
+          - micolab_rctf_dns_wildcard.stdout_lines | first == micolab_rctf_challenges_rctf_address
+        fail_msg: >-
+          *.{{ micolab_rctf_challenges_http_domain }} does not resolve to
+          {{ micolab_rctf_challenges_rctf_address }} on the authoritative
+          server (got: {{ micolab_rctf_dns_wildcard.stdout_lines | default([]) | join(', ') | default('no answer', true) }}).
+          Add the record through the technitium_dns role: append
+          { name: "*.{{ micolab_rctf_challenges_http_domain }}", type: A, value: "{{ micolab_rctf_challenges_rctf_address }}" }
+          to micolab_dns_extra_records in the private inventory and re-run
+          ./microlab deploy --stage services.
+        quiet: true
+
+    - name: Record an explicitly accepted unverified namespace
+      when: (micolab_rctf_challenges_edge_wanted | bool) and (micolab_rctf_challenges_dns_accept_unverified | default(false) | bool)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the workload DNS namespace was NOT verified
+          (micolab_rctf_challenges_dns_accept_unverified is set). Web
+          challenge endpoints may not resolve for players.
+
+- name: Deploy challenge workloads to the rCTF host
+  hosts: microlab_challenge
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    micolab_challenges_definitions: "{{ hostvars['localhost']['micolab_challenges_definitions'] }}"
+    micolab_challenges_image_files: "{{ hostvars['localhost']['micolab_challenges_image_files'] }}"
+  tasks:
+    - name: "Phase 1: preflight against the pinned Firecracker host installation"
+      ansible.builtin.include_role:
+        name: rctf_challenges
+
+    - name: "Phase 2: stage the pinned guest images"
+      when: micolab_rctf_challenges_stage_images | bool
+      ansible.builtin.include_role:
+        name: rctf_challenges
+        tasks_from: images
+
+    - name: "Phase 3: loopback edge proxy for the workload namespace"
+      when: micolab_rctf_challenges_stage_edge | bool
+      ansible.builtin.include_role:
+        name: rctf_challenges
+        tasks_from: edge
+
+    - name: "Phase 4: register the challenge records"
+      when: micolab_rctf_challenges_stage_register | bool
+      ansible.builtin.include_role:
+        name: rctf_challenges
+        tasks_from: register
+
+    - name: Report the honest deployment state
+      ansible.builtin.debug:
+        msg: >-
+          Challenge deployment stages completed. What is proven: images
+          staged with verified digests{% if micolab_rctf_challenges_stage_edge | bool %},
+          the edge chain Caddy -> Traefik answering for the namespace{%
+          endif %}{% if micolab_rctf_challenges_stage_register | bool %}, and
+          challenge records present with their pinned images{% endif %}.
+          NOT proven: a real player instance launch, endpoint reachability
+          from the player network, and instance teardown. Run the acceptance
+          probes in docs/challenges.md before the event; do not treat a
+          completed playbook as acceptance.

@@ -1,0 +1,23 @@
+# Managed by the rctf_challenges role; the pinned host Traefik config for the
+# workload namespace. The Firecracker agent writes one dynamic file per
+# instance into {{ micolab_rctf_traefik_dynamic_dir }}; the file provider
+# watches that directory and picks up new rctf-fc-*.yml files without restarts.
+#
+# TLS is NOT terminated here: this Traefik listens on loopback only and the
+# public rctf-edge Caddy proxies the whole namespace to it over plain HTTP.
+# The entrypoint name below is the agent's own network.httpEntrypoint so the
+# agent-generated routers attach to it.
+
+log:
+  level: INFO
+
+entryPoints:
+  {{ micolab_rctf_traefik_entrypoint }}:
+    address: "{{ micolab_rctf_challenges_traefik_bind_address }}:{{ micolab_rctf_challenges_traefik_bind_port }}"
+
+providers:
+  file:
+    directory: {{ micolab_rctf_traefik_dynamic_dir }}
+    watch: true
+    # The agent writes its files atomically (temp + rename), so a partial
+    # file is never observed by the provider.

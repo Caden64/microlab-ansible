@@ -1,0 +1,17 @@
+# Pinned build output for the xweb challenge image.
+# Staged records: fc-xweb-recon and fc-xweb share this ONE image (built by
+# the same lab run); keep both manifests in sync when re-pinning a rebuild.
+# Filled from the lab's built images; a rebuild is a reviewed change
+# (--allow-update). Rootfs bytes are build-specific (mkfs timestamps).
+# Source lab: rctf-firecracker deploy/firecracker/labs/xweb
+# (branch challenge/xweb-portal; MANIFEST.txt records the pinned inputs:
+# Alpine 3.24.4 minirootfs, python3 3.14.10-r1, sqlite-libs 3.53.4-r0,
+# shared smoke kernel 6.1.155).
+image: xweb-vuln
+files:
+  - name: vmlinux
+    sha256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+    size: 44279576
+  - name: rootfs.ext4
+    sha256: afde9cd2a1d566d3fdb72c2159664334b5db4b582264b5b336c60bcd541faf0a
+    size: 268435456

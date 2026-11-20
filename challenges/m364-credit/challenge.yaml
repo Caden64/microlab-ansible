@@ -1,0 +1,51 @@
+# MicroLab CTF challenge definition. `./microlab challenges deploy --stage register`
+# sends `data` to the rCTF admin challenge API (PUT /api/v2/admin/challs/:id).
+# Flags are injected from the vault variable `micolab_rctf_challenges_flags`.
+# See docs/challenges.md before editing.
+#
+# Build provenance: rCTF fork lab deploy/firecracker/labs/php2shell (branch
+# challenge/php2shell-m365); pinned digests in manifest.yml beside this file.
+id: fc-m364-credit
+data:
+  name: Service Credit (M364)
+  author: microlab
+  category: web
+  description: |-
+    After the big outage, the M364 admin center opened its service-credit
+    request form. File your claim, attach your usage export, and the pipeline
+    will process it.
+
+    The processing pipeline has not been patched.
+  points:
+    min: 200
+    max: 500
+  tags:
+    - web
+    - php
+    - rce
+  tiebreakEligible: true
+  sortWeight: 20
+  hidden: true
+  releaseTime: null
+  instancerConfig:
+    instancer: firecracker
+    challengeIntegrationId: fc-m364-credit
+    timeoutMilliseconds: 1800000
+    extendable: true
+    config:
+      image: php2shell-vuln
+      vcpus: 1
+      memMiB: 512
+      diskMiB: 1536
+      egress: false
+      bootTimeoutSeconds: 180
+      readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
+      env:
+        CHALLENGE: fc-m364-credit
+    expose:
+      - kind: http
+        hostPrefix: m364-credit
+        containerName: app
+        containerPort: 8080
+        shouldDisplay: true
+        title: M364 service credit

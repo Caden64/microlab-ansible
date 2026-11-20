@@ -1,0 +1,51 @@
+# MicroLab CTF challenge definition. `./microlab challenges deploy --stage register`
+# sends `data` to the rCTF admin challenge API (PUT /api/v2/admin/challs/:id).
+#
+# The flag is deliberately NOT in this file: deploy injects it from the vault
+# variable `micolab_rctf_challenges_flags` keyed by `id` below. See
+# docs/challenges.md before editing.
+#
+# Build provenance: rCTF fork lab deploy/firecracker/labs/sshole-yocto
+# (branch challenge/sshole-yocto); pinned digests in manifest.yml beside
+# this file. The glibc control image is a lab fixture, not event-deployed.
+id: fc-sshhole-yocto
+data:
+  name: sshhole
+  author: microlab
+  category: pwn
+  description: |-
+    A tiny Yocto Linux box runs sshd with password logins for two users:
+    alice has no password set, bob has one. Log in as alice to read the flag.
+  points:
+    min: 200
+    max: 500
+  tags:
+    - ssh
+    - musl
+    - yocto
+  tiebreakEligible: true
+  sortWeight: 30
+  hidden: true
+  releaseTime: null
+  instancerConfig:
+    instancer: firecracker
+    challengeIntegrationId: fc-sshhole-yocto
+    timeoutMilliseconds: 1800000
+    extendable: true
+    config:
+      image: sshole-yocto-musl
+      vcpus: 1
+      memMiB: 256
+      diskMiB: 1024
+      egress: false
+      bootTimeoutSeconds: 90
+      readiness: { kind: tcp, port: 22 }
+      env:
+        CHALLENGE: fc-sshhole-yocto
+    expose:
+      - kind: tcp
+        hostPrefix: fc-sshhole-yocto
+        containerName: app
+        containerPort: 22
+        shouldDisplay: true
+        title: SSH

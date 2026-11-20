@@ -1,0 +1,180 @@
+---
+# Preflight for every challenge stage: prove the rCTF host is the pinned
+# Firecracker installation before anything is staged or registered.
+# Everything here fails closed with pointers to the operator documentation.
+
+- name: Require the challenge definitions from the controller check
+  ansible.builtin.assert:
+    that:
+      - micolab_challenges_definitions | default([]) | length > 0
+      - micolab_challenges_image_files | default([]) | length > 0
+    fail_msg: >-
+      The controller-side validation produced no challenge definitions;
+      run ./microlab challenges deploy again from the launcher.
+    quiet: true
+
+- name: Require the Firecracker agent configuration
+  ansible.builtin.stat:
+    path: "{{ micolab_rctf_challenges_agent_config }}"
+  register: micolab_rctf_agent_config_stat
+
+- name: Refuse to deploy without the pinned Firecracker host setup
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_agent_config_stat.stat.isreg | default(false)
+    fail_msg: >-
+      {{ micolab_rctf_challenges_agent_config }} is missing. Complete the rCTF
+      Firecracker host setup first (rCTF fork deploy/firecracker/host/README.md
+      and docs/rctf-deployment.md in this repository).
+    quiet: true
+
+- name: Read the agent configuration
+  ansible.builtin.slurp:
+    src: "{{ micolab_rctf_challenges_agent_config }}"
+  register: micolab_rctf_agent_config_raw
+  no_log: true
+
+- name: Parse the agent configuration
+  ansible.builtin.set_fact:
+    micolab_rctf_agent: "{{ micolab_rctf_agent_config_raw.content | b64decode | from_yaml }}"
+  no_log: true
+
+- name: Validate the agent configuration shape
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_agent is mapping
+      - micolab_rctf_agent.network is mapping
+      - micolab_rctf_agent.network.httpDomain | default('') | length > 0
+    fail_msg: >-
+      {{ micolab_rctf_challenges_agent_config }} is not the expected agent
+      configuration (network.httpDomain is required; imagesDir lives under
+      vm: and may fall back to the agent default).
+    quiet: true
+
+- name: Assert the agent serves the workload DNS namespace
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_agent.network.httpDomain == micolab_rctf_challenges_http_domain
+    fail_msg: >-
+      The agent publishes http/https endpoints under
+      {{ micolab_rctf_agent.network.httpDomain | default('<unset>') }} but this
+      deployment expects {{ micolab_rctf_challenges_http_domain }}. Align
+      micolab_rctf_challenges_http_domain (group_vars/all.yml) or the agent
+      network.httpDomain; both sides must agree before players are pointed at
+      the namespace.
+    quiet: true
+
+- name: Record the images directory and edge routing facts
+  # The agent configuration nests imagesDir under `vm:` (the platform's own
+  # sample); a legacy top-level key is still accepted, and the agent's
+  # documented default is used only when the setting is omitted entirely.
+  ansible.builtin.set_fact:
+    micolab_rctf_images_dir: >-
+      {{ (micolab_rctf_agent.vm | default({})).imagesDir
+         | default(micolab_rctf_agent.imagesDir
+                   | default('/var/lib/rctf-firecracker/images')) }}
+    micolab_rctf_traefik_dynamic_dir: "{{ micolab_rctf_agent.network.traefikDynamicDir | default('') }}"
+    micolab_rctf_traefik_entrypoint: "{{ micolab_rctf_agent.network.httpEntrypoint | default('web') }}"
+
+- name: Validate the resolved images directory
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_images_dir is string
+      - micolab_rctf_images_dir is match('^/')
+    fail_msg: >-
+      No usable imagesDir in {{ micolab_rctf_challenges_agent_config }}:
+      set vm.imagesDir (or the legacy top-level imagesDir) to an absolute
+      path, matching the pinned Firecracker host setup.
+    quiet: true
+
+- name: Require a Traefik dynamic directory when web endpoints are deployed
+  ansible.builtin.assert:
+    that:
+      - (not (micolab_rctf_challenges_stage_edge | bool and
+             micolab_challenges_definitions | selectattr('needs_edge') | list | length > 0))
+        or (micolab_rctf_traefik_dynamic_dir is match('^/'))
+    fail_msg: >-
+      The agent configuration has no network.traefikDynamicDir but web
+      challenge endpoints are being deployed. Complete the Firecracker host
+      networking setup first (rCTF fork deploy/firecracker/host/README.md).
+    quiet: true
+
+- name: Require the rCTF application and control plane services
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ item }}"
+  loop: "{{ micolab_rctf_challenges_required_services }}"
+  loop_control:
+    label: "{{ item }}"
+  register: micolab_rctf_services_check
+  changed_when: false
+
+- name: Assert every required service is active
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_services_check.results | map(attribute='stdout') | unique | list == ['active']
+    fail_msg: >-
+      Expected services active: {{ micolab_rctf_challenges_required_services | join(', ') }}.
+      Got: {{ micolab_rctf_services_check.results | map(attribute='stdout')
+             | zip(micolab_rctf_challenges_required_services) | list | join(', ') }}.
+      The rCTF host must be the healthy pinned installation first
+      (docs/rctf-deployment.md).
+    quiet: true
+
+- name: Require the local rCTF API before registering challenges
+  when: micolab_rctf_challenges_stage_register | bool
+  block:
+    - name: Probe the local rCTF health endpoint
+      ansible.builtin.uri:
+        url: "{{ micolab_rctf_challenges_api_base }}/healthz"
+        method: GET
+        status_code: [200]
+        return_content: true
+        timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+      register: micolab_rctf_healthz
+      changed_when: false
+
+    - name: Assert the rCTF API answers
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_healthz.content | trim == 'ok'
+        fail_msg: >-
+          The local rCTF API did not answer "ok" on /api/healthz.
+        quiet: true
+
+    - name: Require the admin team token on the host
+      ansible.builtin.stat:
+        path: "{{ micolab_rctf_challenges_admin_token_file }}"
+      register: micolab_rctf_admin_token_stat
+
+    - name: Refuse registration without the admin team token
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_admin_token_stat.stat.isreg | default(false)
+        fail_msg: >-
+          {{ micolab_rctf_challenges_admin_token_file }} is missing. It is
+          created by the pinned rCTF installation (docs/rctf-deployment.md,
+          "Admin login and event settings"); registration needs it.
+        quiet: true
+
+- name: Require the edge Caddy before publishing web endpoints
+  when: micolab_rctf_challenges_stage_edge | bool and
+        micolab_challenges_definitions | selectattr('needs_edge') | list | length > 0
+  block:
+    - name: Require the rctf-edge Caddyfile
+      ansible.builtin.stat:
+        path: "{{ micolab_rctf_challenges_caddy_config }}"
+      register: micolab_rctf_caddy_config_stat
+
+    - name: Refuse the edge stage without the pinned rctf-edge Caddy
+      ansible.builtin.assert:
+        that:
+          - micolab_rctf_caddy_config_stat.stat.isreg | default(false)
+        fail_msg: >-
+          {{ micolab_rctf_challenges_caddy_config }} is missing. The workload
+          namespace is proxied by the existing rctf-edge Caddy installed with
+          the rCTF host (docs/rctf-deployment.md); this role only adds an
+          imported include file to it.
+        quiet: true

@@ -1,0 +1,18 @@
+# Pinned build output for the sshhole-yocto challenge image.
+# Filled from the lab's built images; a rebuild is a reviewed change
+# (--allow-update). Rootfs bytes are build-specific (mkfs timestamps).
+# Source lab: rctf-firecracker deploy/firecracker/labs/sshole-yocto
+# (branch challenge/sshole-yocto; genuine Yocto/poky yocto-6.0.4 musl
+# userspace, stock openssh 10.3p1, no PAM; the guest service accepts both
+# flag delivery names — lab "main" and the platform's registered
+# "flags/static" — per the lab's platform-path assertions; glibc control
+# image is a lab fixture and is not staged for the event).
+image: sshole-yocto-musl
+files:
+  - name: vmlinux
+    sha256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+    size: 44279576
+  - name: rootfs.ext4
+    sha256: b9f66eed6aef1507646b2706c7cc489a1fb0284f0dae9cafee23b9af277a3aba
+    size: 268435456
+

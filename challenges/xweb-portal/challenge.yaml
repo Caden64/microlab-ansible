@@ -1,0 +1,51 @@
+# MicroLab CTF challenge definition. `./microlab challenges deploy --stage register`
+# sends `data` to the rCTF admin challenge API (PUT /api/v2/admin/challs/:id).
+# Flags are injected from the vault variable `micolab_rctf_challenges_flags`.
+# See docs/challenges.md before editing.
+#
+# Build provenance: rCTF fork lab deploy/firecracker/labs/xweb (branch
+# challenge/xweb-portal); pinned digests in manifest.yml beside this file.
+id: fc-xweb
+data:
+  name: XWEB-500 Portal
+  author: microlab
+  category: web
+  description: |-
+    The refrigeration supervisor portal for the site's XWEB-500 controller
+    is reachable from the store network. Rumour says the commissioning crew
+    never changed the factory access code, and the "remote assistance"
+    diagnostics archive has never been audited. Recover the factory
+    maintenance override code.
+  points:
+    min: 100
+    max: 400
+  tags:
+    - web
+    - sql
+    - default-credentials
+  tiebreakEligible: true
+  sortWeight: 10
+  hidden: true
+  releaseTime: null
+  instancerConfig:
+    instancer: firecracker
+    challengeIntegrationId: fc-xweb
+    timeoutMilliseconds: 1800000
+    extendable: true
+    config:
+      image: xweb-vuln
+      vcpus: 1
+      memMiB: 256
+      diskMiB: 512
+      egress: false
+      bootTimeoutSeconds: 60
+      readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
+      env:
+        CHALLENGE: fc-xweb
+    expose:
+      - kind: http
+        hostPrefix: xweb
+        containerName: app
+        containerPort: 8080
+        shouldDisplay: true
+        title: XWEB-500 Portal

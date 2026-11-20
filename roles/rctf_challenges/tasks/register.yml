@@ -1,0 +1,181 @@
+---
+# Register or update the challenge records through the local rCTF admin API.
+#
+# Authentication: the host's admin team token (root-only file) is exchanged for
+# a bearer authToken at /v1/auth/login, then each definition is upserted with
+# PUT /v2/admin/challs/:id. The API validates the instancer configuration
+# against the firecracker provider schema (BadInstancerConfig on drift).
+#
+# Flags come from the vault mapping micolab_rctf_challenges_flags keyed by
+# challenge id. No task prints a flag or an API body: every request and the
+# admin readback run with no_log, and only status, kind and safe fields are
+# reported afterwards.
+
+- name: Read the admin team token
+  ansible.builtin.slurp:
+    src: "{{ micolab_rctf_challenges_admin_token_file }}"
+  register: micolab_rctf_admin_token_raw
+  no_log: true
+
+- name: Sign in to the local rCTF API
+  ansible.builtin.uri:
+    url: "{{ micolab_rctf_challenges_api_base }}/v1/auth/login"
+    method: POST
+    body_format: json
+    status_code: [200]
+    timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+    body:
+      teamToken: "{{ micolab_rctf_admin_token_raw.content | b64decode | trim }}"
+  register: micolab_rctf_login
+  no_log: true
+
+- name: Refuse an unsuccessful admin login
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_login.json.kind | default('') == 'goodLogin'
+      - micolab_rctf_login.json.data.authToken | default('') | length > 0
+    fail_msg: >-
+      The admin team token did not authenticate against the local rCTF API.
+      Verify {{ micolab_rctf_challenges_admin_token_file }} against
+      docs/rctf-deployment.md; nothing was registered.
+    quiet: true
+
+- name: Hold the admin session token
+  ansible.builtin.set_fact:
+    micolab_rctf_auth_token: "{{ micolab_rctf_login.json.data.authToken }}"
+  no_log: true
+
+- name: Require a vaulted flag for every challenge
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_challenges_flags[item.id] is defined
+      - micolab_rctf_challenges_flags[item.id] | string | trim | length > 0
+    fail_msg: >-
+      No event flag is stored for {{ item.id }}. Add it to the vault mapping
+      micolab_rctf_challenges_flags (challenge host inventory,
+      ansible-vault edit) keyed by challenge id. Nothing was registered.
+    quiet: true
+  loop: "{{ micolab_challenges_definitions }}"
+  loop_control:
+    label: "{{ item.id }}"
+  no_log: true
+
+- name: Read back the admin challenge list before registering
+  ansible.builtin.uri:
+    url: "{{ micolab_rctf_challenges_api_base }}/v2/admin/challs"
+    method: GET
+    status_code: [200]
+    timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+    headers:
+      Authorization: "Bearer {{ micolab_rctf_auth_token }}"
+  register: microlab_rctf_preread
+  no_log: true
+
+- name: Refuse an unreadable admin challenge list
+  ansible.builtin.assert:
+    that:
+      - microlab_rctf_preread.json.kind | default('') == 'goodAdminChallengesV2'
+      - microlab_rctf_preread.json.data is defined
+    fail_msg: >-
+      The admin challenge list could not be read before registering; nothing
+      was changed.
+    quiet: true
+
+- name: Record which challenges already exist
+  # Only the ids: the full list carries flags and stays protected above.
+  ansible.builtin.set_fact:
+    micolab_rctf_existing_ids: "{{ microlab_rctf_preread.json.data | map(attribute='id') | list }}"
+
+- name: Upsert each challenge record
+  # Existing records keep their current hidden/releaseTime state: a routine
+  # re-deploy must never re-hide a challenge the operator opened for the
+  # event. New records register with the definition's initial visibility.
+  ansible.builtin.uri:
+    url: "{{ micolab_rctf_challenges_api_base }}/v2/admin/challs/{{ item.id }}"
+    method: PUT
+    body_format: json
+    status_code: [200, 400, 401, 403]
+    timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+    headers:
+      Authorization: "Bearer {{ micolab_rctf_auth_token }}"
+    body:
+      data: >-
+        {{ (item.data | dict2items
+            | rejectattr('key', 'in', (['hidden', 'releaseTime'] if item.id in micolab_rctf_existing_ids else []))
+            | items2dict)
+           | combine({'flags': [{'provider': 'flags/static',
+                                 'config': {'flag': micolab_rctf_challenges_flags[item.id]}}]}) }}
+  register: microlab_rctf_upserts
+  loop: "{{ microlab_challenges_definitions }}"
+  loop_control:
+    label: "{{ item.id }}"
+  no_log: true
+
+- name: Classify every upsert result without printing payloads
+  # Response bodies carry the stored flags. Loop over the safe definition
+  # list (aligned by index) and surface only id, status, kind and message;
+  # the raw results stay behind the upsert task's no_log.
+  ansible.builtin.assert:
+    that:
+      - (microlab_rctf_upserts.results[index].status | default(0)) == 200
+      - (microlab_rctf_upserts.results[index].json.kind | default('')) == 'goodChallengeUpdateV2'
+    fail_msg: >-
+      {{ item.id }}: the rCTF API refused the record (status
+      {{ microlab_rctf_upserts.results[index].status | default('none') }},
+      {{ microlab_rctf_upserts.results[index].json.kind | default('unknown error') }}:
+      {{ microlab_rctf_upserts.results[index].json.message | default('no message') }}).
+      Fix the definition or the host state and re-run; partial registration is
+      safe to repeat (the API upserts by id).
+    success_msg: "{{ item.id }}: registered"
+    quiet: true
+  loop: "{{ microlab_challenges_definitions }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.id }}"
+
+- name: Read back the admin challenge list
+  ansible.builtin.uri:
+    url: "{{ micolab_rctf_challenges_api_base }}/v2/admin/challs"
+    method: GET
+    status_code: [200]
+    timeout: "{{ micolab_rctf_challenges_api_timeout_seconds }}"
+    headers:
+      Authorization: "Bearer {{ micolab_rctf_auth_token }}"
+  register: micolab_rctf_readback
+  no_log: true
+
+- name: Refuse an unreadable admin challenge list
+  ansible.builtin.assert:
+    that:
+      - micolab_rctf_readback.json.kind | default('') == 'goodAdminChallengesV2'
+      - micolab_rctf_readback.json.data is defined
+    fail_msg: >-
+      The admin challenge list could not be read back; registration state is
+      unverified. Nothing else was changed.
+    quiet: true
+
+- name: Assert every challenge is registered with its pinned image
+  ansible.builtin.assert:
+    that:
+      - (micolab_rctf_readback.json.data | selectattr('id', 'equalto', item.id) | list | length) == 1
+      - (micolab_rctf_readback.json.data | selectattr('id', 'equalto', item.id) | first).instancerConfig.config.image == item.image
+      - (micolab_rctf_readback.json.data | selectattr('id', 'equalto', item.id) | first).instancerConfig.challengeIntegrationId == item.id
+    fail_msg: >-
+      {{ item.id }} was not confirmed in the admin challenge list with image
+      {{ item.image }}; the readback did not match. Re-run the register stage.
+    quiet: true
+  loop: "{{ micolab_challenges_definitions }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Drop the admin session token from the fact cache
+  ansible.builtin.set_fact:
+    micolab_rctf_auth_token: ""
+
+- name: Report the registered challenges
+  ansible.builtin.debug:
+    msg: >-
+      Registered {{ micolab_challenges_definitions | map(attribute='id') | list | join(', ') }}
+      (hidden by default; unhide from the admin UI when the event opens).
+      Instance launch and player reachability are NOT proven by this stage;
+      see the acceptance probes in docs/challenges.md.

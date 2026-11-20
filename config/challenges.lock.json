@@ -1,0 +1,19 @@
+{
+ "schema_version": 1,
+ "verification": "Publisher HTTPS metadata pins for the challenge (rCTF) host; no signature verification or live integration certification. The Traefik pin reuses the same reviewed sha256 values as the pinned fetcher in the rCTF fork (deploy/firecracker/edge/fetch-traefik.sh at 9bc7c10): the tarball digest is the official traefik_v3.7.15_checksums.txt line cross-checked against the GitHub release-asset digest, and the binary digest is the sha256 of the 'traefik' member of that verified tarball. Only linux_amd64 is pinned; the challenge host is an amd64 NUC. No binary was executed during inspection.",
+ "artifacts": {
+  "traefik": {
+   "amd64": {
+    "version": "3.7.15",
+    "filename": "traefik-3.7.15-amd64.tar.gz",
+    "url": "https://github.com/traefik/traefik/releases/download/v3.7.15/traefik_v3.7.15_linux_amd64.tar.gz",
+    "publisher_url": "https://github.com/traefik/traefik/releases/download/v3.7.15/traefik_v3.7.15_checksums.txt",
+    "publisher_member": "traefik_v3.7.15_linux_amd64.tar.gz",
+    "sha256": "5b9f51199fcb7a3b5f7ae0f9dae8dcf01efadafd92c5fca96ea2822eca81f8e6",
+    "member": "traefik",
+    "member_sha256": "34bfdfa88e321ad496d829910c6145a0743eae09cdf290e3e114b137eb948e30",
+    "metadata_url": "https://api.github.com/repos/traefik/traefik/releases/tags/v3.7.15"
+   }
+  }
+ }
+}
