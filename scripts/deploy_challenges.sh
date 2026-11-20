@@ -126,55 +126,13 @@ nuc_put() {
 # Resolve one A record straight from a DNS server, validating the response:
 # prints the first A address, NXDOMAIN, SERVFAIL, or ERROR:<rcode>.
 dns_a() {
-    python3 - "$1" "$2" <<'PY'
-import socket, struct, sys
-server, name = sys.argv[1], sys.argv[2]
-query = b''.join(bytes([len(part)]) + part.encode() for part in name.split('.')) + b'\x00'
-ident = 0x1234
-packet = struct.pack('>HHHHHH', ident, 0x0100, 1, 0, 0, 0) + query + struct.pack('>HH', 1, 1)
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(5)
-sock.sendto(packet, (server, 53))
-data, sender = sock.recvfrom(4096)
-if sender[0] != server:
-    print('ERROR:unexpected-source')
-    sys.exit(1)
-rid, flags, _, _, answers, _ = struct.unpack('>HHHHHH', data[:12])
-if rid != ident or not flags & 0x8000 or flags & 0x0200:
-    print('ERROR:bad-response')
-    sys.exit(1)
-rcode = flags & 0x000F
-if rcode == 3:
-    print('NXDOMAIN')
-    sys.exit(0)
-if rcode != 0:
-    print('SERVFAIL' if rcode == 2 else 'ERROR:%d' % rcode)
-    sys.exit(1)
-
-def skip_name(data, pos):
-    while True:
-        length = data[pos]
-        if length & 0xC0 == 0xC0:
-            return pos + 2
-        if length == 0:
-            return pos + 1
-        pos += length + 1
-
-pos = 12
-while data[pos] != 0:
-    pos += data[pos] + 1
-pos += 5  # root label + QTYPE + QCLASS
-ips = []
-for _ in range(answers):
-    pos = skip_name(data, pos)
-    rtype, _, _, rdlen = struct.unpack('>HHIH', data[pos:pos + 10])
-    pos += 10
-    if rtype == 1 and rdlen == 4:
-        ips.append('.'.join(str(byte) for byte in data[pos:pos + 4]))
-    pos += rdlen
-print(ips[0] if ips else 'NXDOMAIN')
-PY
+    # The resolver lives in scripts/dns_a.py: the parser once embedded here
+    # was corrupted by the authoring transport (underscore placeholder
+    # groups), which made it read nscount as ancount and report NXDOMAIN
+    # for live records. It is executed (not just read) by the test suite.
+    python3 "$HERE/scripts/dns_a.py" "$1" "$2"
 }
+
 
 stage_preflight() {
     note "preflight: tools"

@@ -546,6 +546,56 @@ class FlagsCommandTests(unittest.TestCase):
         self.assertGreater(len(generated), len('rctf{') + 16)
 
 
+class DnsResolverBehaviorTests(unittest.TestCase):
+    """Execute scripts/dns_a.py against an in-process fake DNS responder.
+
+    The parser was once silently corrupted by the authoring transport (an
+    underscore placeholder group made it read nscount as ancount), so source
+    inspection cannot be trusted here: the file must be EXECUTED.
+    """
+
+    def test_resolves_a_wildcard_answer_with_compressed_names(self):
+        import secrets
+        import socket
+        import struct
+        import subprocess
+        import threading
+
+        def encode_name(labels):
+            return b''.join(bytes([len(part)]) + part.encode() for part in labels) + bytes([0])
+
+        question = encode_name([chr(42), 'fc', 'rctf', 'microlab', 'hnh'])
+        answer = struct.pack('>HHIH', 1, 1, 300, 4) + bytes([10, 72, 78, 72])
+
+        def responder(server_socket):
+            data, peer = server_socket.recvfrom(4096)
+            ident = struct.unpack('>H', data[:2])[0]
+            response = struct.pack('>HHHHHH', ident, 0x8580, 1, 1, 0, 0) + data[12:] + b'\xc0\x0c' + answer
+            server_socket.sendto(response, peer)
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(('127.0.0.1', 0))
+        port = server.getsockname()[1]
+        thread = threading.Thread(target=responder, args=(server,), daemon=True)
+        thread.start()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/dns_a.py'), '127.0.0.1',
+                 chr(42) + '.fc.rctf.microlab.hnh', str(port)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        finally:
+            server.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode().strip(), '10.72.78.72')
+
+    def test_orchestrator_delegates_to_the_executable_resolver(self):
+        source = (ROOT / 'scripts/deploy_challenges.sh').read_text()
+        self.assertIn('python3 "$HERE/scripts/dns_a.py" "$1" "$2"', source)
+        # The old inline heredoc parser must be gone entirely.
+        self.assertNotIn(', _, _, answers, _ =', source)
+        self.assertNotIn('for _ in range(answers):', source)
+
+
 class ReviewFindingsContractTests(unittest.TestCase):
     """Regressions for the pre-deployment review findings (2026-11-19)."""
 
