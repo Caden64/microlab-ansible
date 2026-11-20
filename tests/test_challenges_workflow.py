@@ -699,7 +699,12 @@ class ReviewFindingsContractTests(unittest.TestCase):
         # The DNS convergence passes the infra host's own password file
         # through the site launcher, never a shared one.
         self.assertIn('export ANSIBLE_BECOME_PASSWORD_FILE="$PI_PASS_FILE"', source)
-        self.assertIn('--no-become-prompt deploy --stage services', source)
+        # Flag order: --no-become-prompt belongs to the deploy subcommand,
+        # and the interactive path must not pass it at all.
+        self.assertIn('BECOME_ARGS=(--no-become-prompt)', source)
+        self.assertIn('BECOME_ARGS=()', source)
+        self.assertIn('./microlab deploy "${BECOME_ARGS[@]}" --stage services', source)
+        self.assertNotIn('--no-become-prompt deploy --stage services', source)
         # Users are inventory-driven, with documented fallbacks only.
         self.assertIn("values.get('ansible_user') or 'caden64'", source)
         self.assertIn("values.get('ansible_user') or 'hopkeeper'", source)

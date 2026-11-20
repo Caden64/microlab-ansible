@@ -242,8 +242,13 @@ stage_dns() {
         # The infra host has its own password: hand it to the site launcher's
         # ansible run through a protected become file, never a prompt.
         export ANSIBLE_BECOME_PASSWORD_FILE="$PI_PASS_FILE"
+        BECOME_ARGS=(--no-become-prompt)
+    else
+        # Interactive run: let the site launcher prompt (--ask-become-pass)
+        # for the infra host's sudo password.
+        BECOME_ARGS=()
     fi
-    (cd "$SITE_CHECKOUT" && ./microlab --no-become-prompt deploy --stage services) \
+    (cd "$SITE_CHECKOUT" && ./microlab deploy "${BECOME_ARGS[@]}" --stage services) \
         || die "infra convergence failed; the wildcard record is not applied"
     answer="$(dns_a "$PI_ADDRESS" '*.fc.rctf.microlab.hnh')"
     [ "$answer" = "$NUC_ADDRESS" ] \
