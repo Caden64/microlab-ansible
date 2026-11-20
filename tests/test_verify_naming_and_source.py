@@ -29,6 +29,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.test_verify_acceptance import DohTestServer
+
 ROOT = Path(__file__).resolve().parents[1]
 TMP_ROOT = Path("/tmp/opencode")
 if not TMP_ROOT.is_dir() or not os.access(TMP_ROOT, os.W_OK):
@@ -386,15 +388,8 @@ import json, os, sys
 with open(os.environ.get("ARGV_LOG", "/dev/null"), "a", encoding="utf-8") as h:
     h.write(json.dumps(["curl"] + sys.argv[1:]) + "\n")
 args = sys.argv[1:]
-out = args[args.index("-o") + 1] if "-o" in args else None
-check, expect = os.environ.get("CHECK", "local-doh"), os.environ.get("EXPECT", "allowed")
-body = json.dumps({"Status": 0, "Answer": [{"type": 1, "data": os.environ.get("FAKE_DOH_A", os.environ.get("PROBE_IP", ""))}]})
-if check == "local-doh":
-    sys.stdout.write(body)
-    sys.exit(0)
+expect = os.environ.get("EXPECT", "allowed")
 code = "403" if expect == "denied" else "200"
-if out:
-    open(out, "w", encoding="utf-8").write(body)
 sys.stdout.write(code)
 """
 
@@ -460,7 +455,6 @@ class RolePlaybookMixin:
             "ANSIBLE_CONFIG": str(self.root / "ansible.cfg"),
             "FAKE_DOMAIN": "microlab.hnh", "FAKE_A": self.mgmt_ip,
             "FAKE_NS_ZONE": "hnh", "FAKE_NS": "ns1.microlab.hnh.",
-            "FAKE_DOH_A": self.mgmt_ip,
         })
         env.update(env_extra or {})
         cmd = [self.ansible, "-i", str(inventory or self.inventory()), str(play)]
@@ -529,22 +523,20 @@ class RenderedRoleCommandTests(RolePlaybookMixin, unittest.TestCase):
         git_ip = "10.0.0.9"
         server = PolicyDotServer(self.crt, self.key, lambda p, n, rd: (0, git_ip))
         self.addCleanup(server.close)
+        doh = DohTestServer(self.crt, self.key, [(200, git_ip)])
+        self.addCleanup(doh.close)
         addresses = {k: self.mgmt_ip for k in ("ns1", "ca", "dns")}
         addresses["git"] = git_ip
         result, argv = self.play(
             ["targets.yml", "encrypted_dns.yml"],
             extra_vars={"micolab_verify_tls_root": str(self.ca),
                         "micolab_verify_dot_port": server.port,
-                        "micolab_dns_addresses": addresses},
-            env_extra={"FAKE_DOH_A": git_ip})
+                        "micolab_verify_https_port": doh.port,
+                        "micolab_dns_addresses": addresses})
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
-        self.assertEqual(argv, [[
-            "curl", "--fail", "--silent", "--show-error", "--max-time", "15",
-            "--cacert", str(self.ca),
-            "--resolve", "dns.microlab.hnh:443:127.0.0.1",
-            "-H", "accept: application/dns-json",
-            "https://dns.microlab.hnh/dns-query?name=git.microlab.hnh&type=A",
-        ]])
+        self.assertEqual(argv, [])
+        self.assertEqual(doh.log, [(f"dns.microlab.hnh:{doh.port}", "/dns-query",
+                                    b"\x03git\x08microlab\x03hnh\x00")])
         self.assertEqual(server.log, [{"peer": "127.0.0.1", "sni": "dns.microlab.hnh",
                                        "qname": "git.microlab.hnh", "rd": True}])
 
@@ -582,10 +574,13 @@ class ExternalAclPlaybookSourceTests(RolePlaybookMixin, unittest.TestCase):
         server = PolicyDotServer(self.crt, self.key, policy)
         self.addCleanup(server.close)
         stage = self.root / "stage-{}.py".format(uuid.uuid4().hex)
+        doh = DohTestServer(self.crt, self.key, [(200, self.mgmt_ip), (403, None)])
+        self.addCleanup(doh.close)
         extra = {
             "micolab_verify_tls_root": str(self.ca),
             "micolab_verify_dot_port": server.port,
             "micolab_verify_dot_probe_stage_path": str(stage),
+            "micolab_verify_https_port": doh.port,
             "micolab_verify_external_probe_timeout": 3,
             "micolab_admin_cidrs": [ALLOWED_SRC + "/32"],
             "micolab_client_cidrs": [],

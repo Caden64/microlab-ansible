@@ -1,4 +1,5 @@
 """Controller-only tests: ephemeral inventories, no SSH or real playbook runs."""
+import base64
 import contextlib
 import importlib.util
 import io
@@ -74,6 +75,10 @@ class SetupCLI(unittest.TestCase):
         self.assertEqual(values["micolab_admin_cidrs"], ["10.72.78.21/32"])
         self.assertEqual(values["micolab_client_cidrs"], ["10.72.78.0/24"])
         self.assertEqual(len(set(self.generated.values())), len(cli.SECRET_KEYS))
+        for name in ("micolab_forgejo_jwt_secret", "micolab_forgejo_lfs_jwt_secret"):
+            key = self.generated[name]
+            self.assertRegex(key, r"^[A-Za-z0-9_-]{43}$")
+            self.assertEqual(len(base64.b64decode(key + "=", altchars=b"-_", validate=True)), 32)
         self.assertEqual(self.inventory.stat().st_mode & 0o777, 0o600)
         for value in self.generated.values():
             self.assertNotIn(value, self.out.getvalue() + self.err.getvalue() + vars_file.read_text())

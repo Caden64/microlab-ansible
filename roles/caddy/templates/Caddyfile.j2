@@ -23,22 +23,36 @@
 }
 
 {% if micolab_caddy_enable_ca | bool %}
-# CA frontend. Remote access is restricted to the management CIDRs.
-# Loopback is always permitted for local health gates.
+(ca_backend) {
+	reverse_proxy https://{{ micolab_caddy_ca_upstream_host }}:{{ micolab_caddy_ca_upstream_port }} {
+		transport http {
+			{{ micolab_caddy_upstream_trust_directive }} {{ micolab_caddy_acme_trusted_roots }}
+			tls_server_name {{ micolab_caddy_ca_upstream_host }}
+		}
+		# step-ca uses Host to construct absolute ACME endpoint URLs.
+		header_up Host {{ micolab_caddy_ca_host }}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+
+# CA frontend. Full access stays restricted to administrators.
 {{ micolab_caddy_ca_host }} {
 	import tls_step_ca
 
 	@management remote_ip 127.0.0.1/32 ::1/128 {{ micolab_caddy_management_cidrs | join(' ') }}
 	handle @management {
-		reverse_proxy https://{{ micolab_caddy_ca_upstream_host }}:{{ micolab_caddy_ca_upstream_port }} {
-			transport http {
-				{{ micolab_caddy_upstream_trust_directive }} {{ micolab_caddy_acme_trusted_roots }}
-				tls_server_name {{ micolab_caddy_ca_upstream_host }}
-			}
-			header_up X-Real-IP {remote_host}
-			header_up X-Forwarded-For {remote_host}
-		}
+		import ca_backend
 	}
+{% if micolab_caddy_acme_client_cidrs | default([]) | length %}
+	@acme_clients {
+		path /acme/acme/*
+		remote_ip {{ micolab_caddy_acme_client_cidrs | join(' ') }}
+	}
+	handle @acme_clients {
+		import ca_backend
+	}
+{% endif %}
 	respond 403
 }
 {% endif %}

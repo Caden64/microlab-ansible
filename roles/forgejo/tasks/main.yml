@@ -33,9 +33,7 @@
       - ((micolab_forgejo_checksums | default({})).get(micolab_forgejo_arch, '')) is match('^[0-9a-fA-F]{64}$')
       - (micolab_forgejo_artifact_src_amd64 | length > 0) or (micolab_forgejo_artifact_src_arm64 | length > 0) or (micolab_forgejo_allow_online_download | bool)
       - micolab_forgejo_secret_key is match('^[A-Za-z0-9+/=_-]{32,}$')
-      - micolab_forgejo_internal_token is match('^[A-Za-z0-9+/=_-]{32,}$')
-      - micolab_forgejo_jwt_secret is match('^[A-Za-z0-9+/=_-]{32,}$')
-      - micolab_forgejo_lfs_jwt_secret is match('^[A-Za-z0-9+/=_-]{32,}$')
+      - micolab_forgejo_internal_token is match('^[A-Za-z0-9+/=_.-]{32,}$')
       - micolab_forgejo_admin_username is match('^[A-Za-z0-9_.-]+$')
       - micolab_forgejo_admin_email is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
       - micolab_forgejo_admin_password | length >= (micolab_forgejo_admin_password_min_length | int)
@@ -51,10 +49,24 @@
       - not (micolab_forgejo_actions_enabled | bool)
       - micolab_forgejo_lfs_enabled | bool
     fail_msg: >-
-      Forgejo requires a pinned version/checksum/offline artifact, four durable
-      base64-style secrets, a usable admin password, loopback HTTP, HTTPS
+      Forgejo requires a pinned version/checksum/offline artifact, durable
+      secrets, a usable admin password, loopback HTTP, HTTPS
       ROOT_URL, system OpenSSH on port 22, install lock, registration disabled,
       and Actions disabled. The role never generates or defaults secrets.
+  no_log: true
+
+- name: Require valid Forgejo OAuth2 and LFS signing keys
+  ansible.builtin.assert:
+    that:
+      - micolab_forgejo_jwt_secret is match('^[A-Za-z0-9_-]{43}$')
+      - micolab_forgejo_lfs_jwt_secret is match('^[A-Za-z0-9_-]{43}$')
+      - micolab_forgejo_jwt_secret != micolab_forgejo_lfs_jwt_secret
+    fail_msg: >-
+      Forgejo requires two distinct 32-byte JWT signing keys encoded as
+      unpadded base64url. For a fresh installation, generate each with
+      forgejo generate secret JWT_SECRET or LFS_JWT_SECRET and save it in Vault.
+    quiet: true
+  no_log: true
 
 - name: Select Forgejo artifact for this architecture
   ansible.builtin.set_fact:
@@ -94,8 +106,10 @@
     that:
       - micolab_forgejo_command_check.results | rejectattr('rc', 'equalto', 0) | list | length == 0
     fail_msg: >-
-      Missing a required dependency (git, git-lfs, systemd, util-linux, OpenSSH,
-      awk, grep). Install the documented dependency bundle before deploying.
+      Required commands missing on the host:
+      {{ micolab_forgejo_command_check.results | rejectattr('rc', 'equalto', 0)
+         | map(attribute='item') | join(', ') }}.
+      Install the Debian dependency bundle in docs/fresh-clone.md.
 
 - name: Confirm system OpenSSH listens on port 22
   ansible.builtin.command:
@@ -191,7 +205,7 @@
     micolab_forgejo_fs_type: "{{ (micolab_forgejo_filesystem.stdout | default('')) | regex_replace('\\s.*$', '') }}"
     micolab_forgejo_fs_source: "{{ (micolab_forgejo_filesystem.stdout | default('')) | regex_replace('^\\S+\\s*', '') }}"
 
-- name: Require Forgejo state to live on a local SSD-backed filesystem
+- name: Require Forgejo state to live on a supported local filesystem
   ansible.builtin.assert:
     that:
       - micolab_forgejo_filesystem.rc == 0
@@ -199,9 +213,8 @@
       - micolab_forgejo_fs_source is not match('^//')
     fail_msg: >-
       {{ micolab_forgejo_data_dir }} is on '{{ micolab_forgejo_fs_type }}'
-      ({{ micolab_forgejo_fs_source }}); the plan requires local SSD storage
-      for Forgejo state. Override micolab_forgejo_required_local_filesystems
-      only with a documented, intentional exception.
+      ({{ micolab_forgejo_fs_source }}). Forgejo requires a supported local
+      filesystem. Check the backing device separately when an SSD is required.
   when: micolab_forgejo_require_local_filesystem | bool
 
 - name: Stage the pinned Forgejo artifact from the offline bundle
@@ -339,8 +352,6 @@
         --admin \
         --must-change-password=false
     fi
-    "$BIN" --config "$CFG" --work-path "$WORK" admin user must-change-password \
-      --unset --username "$ADMIN_USER"
     touch "$MARKER"
   args:
     executable: /bin/bash
@@ -371,7 +382,7 @@
       - user
       - must-change-password
       - --unset
-      - --username
+      - --
       - "{{ micolab_forgejo_admin_username }}"
   become: true
   become_user: "{{ micolab_forgejo_user }}"

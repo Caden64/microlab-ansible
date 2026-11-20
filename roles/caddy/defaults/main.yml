@@ -59,6 +59,7 @@ micolab_caddy_ca_probe_path: "/"
 # Access control. Loopback is always allowed for local health gates; these
 # lists govern remote clients and are kept separate per route class.
 micolab_caddy_management_cidrs: []
+micolab_caddy_acme_client_cidrs: []
 micolab_caddy_dns_client_cidrs: []
 micolab_caddy_admin_cidrs: []
 

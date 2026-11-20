@@ -190,7 +190,7 @@
           Every external probe host needs curl and python3. Install the
           documented probe tooling; do not skip the ACL check.
 
-    - name: Stage the strict DoT probe on every external probe host
+    - name: Stage the encrypted DNS probe on every external probe host
       ansible.builtin.copy:
         src: dot_probe.py
         dest: "{{ micolab_verify_dot_probe_stage_path }}"
@@ -230,31 +230,21 @@
             echo "$check $expect observed_http=$code"
             ;;
           doh)
-            body=$(mktemp)
-            trap 'rm -f "$body"' EXIT
-            code=$(curl --silent --show-error --max-time "$timeout" \
-              --cacert "$ca" \
-              --resolve "$DOH_HOST:$HTTPS_PORT:$MGMT_IP" \
-              -H 'accept: application/dns-json' \
-              -o "$body" -w '%{http_code}' \
-              "https://$DOH_HOST:$HTTPS_PORT$DOH_PATH?name=$PROBE_NAME&type=A") || code=000
-            if [ "$expect" = "allowed" ]; then
-              if [ "$code" != "200" ]; then
-                echo "doh allowed failed: observed_http=$code, expected 200 with a validated A answer" >&2
-                exit 1
-              fi
-              if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); a=[x.get("data") for x in d.get("Answer", []) if x.get("type") == 1]; sys.exit(0 if d.get("Status") == 0 and sys.argv[2] in a else 1)' "$body" "$PROBE_IP"; then
-                echo "doh allowed failed: response did not contain the expected A $PROBE_IP" >&2
-                exit 1
-              fi
-              echo "doh allowed observed_http=$code expected_a=$PROBE_IP"
+            args=()
+            if [ "$expect" = "denied" ]; then
+              args+=(--expect-http-denial)
             else
-              if [ "$code" != "403" ]; then
-                echo "doh denied inconclusive: observed_http=$code; only the Caddy ACL's explicit 403 is denial evidence, not a transport failure or another status" >&2
-                exit 1
-              fi
-              echo "doh denied observed_http=403"
+              args+=(--expect "$PROBE_IP")
             fi
+            python3 "$DOT_PROBE" \
+              --connect-host "$MGMT_IP" \
+              --port "$HTTPS_PORT" \
+              --server-name "$DOH_HOST" \
+              --ca-file "$ca" \
+              --doh-path "$DOH_PATH" \
+              --name "$PROBE_NAME" \
+              --timeout "$timeout" \
+              "${args[@]}"
             ;;
           dot)
             # The DoT socket is bound to the declared source_address; the

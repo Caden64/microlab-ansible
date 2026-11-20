@@ -28,13 +28,16 @@
       {{ microlab_technitium_pfx_path
          | technitium_api_path(microlab_technitium_config_dir) }}
 
-- name: Normalize the current Technitium certificate path before comparison
+- name: Normalize current Technitium settings before comparison
   ansible.builtin.set_fact:
     microlab_technitium_current_settings_normalized: >-
       {{ microlab_technitium_current_settings_response | combine({
            'dnsTlsCertificatePath':
              (microlab_technitium_current_settings_response.get('dnsTlsCertificatePath', '')
-              | technitium_api_path(microlab_technitium_config_dir))
+              | technitium_api_path(microlab_technitium_config_dir)),
+           'dnsReverseProxyNetworkACL':
+             (microlab_technitium_current_settings_response.get('dnsReverseProxyNetworkACL') | default([], true)
+              | map('regex_replace', '^127[.]0[.]0[.]1/32$', '127.0.0.1') | list)
          }) }}
   no_log: true
 
@@ -44,7 +47,8 @@
       enableDnsOverHttp: true
       dnsOverHttpPort: "{{ microlab_technitium_doh_port | int }}"
       dnsOverHttpRealIpHeader: "{{ microlab_technitium_doh_real_ip_header }}"
-      dnsReverseProxyNetworkACL: "{{ microlab_technitium_doh_reverse_proxy_acl }}"
+      # Technitium omits /32 when serializing a single IPv4 host.
+      dnsReverseProxyNetworkACL: "{{ microlab_technitium_doh_reverse_proxy_acl | map('regex_replace', '^127[.]0[.]0[.]1/32$', '127.0.0.1') | list }}"
       enableDnsOverHttps: false
       enableDnsOverTls: true
       dnsOverTlsPort: "{{ microlab_technitium_dot_port | int }}"
@@ -113,13 +117,16 @@
       {{ (microlab_technitium_verified_settings.json | default({})).response | default({}) }}
   no_log: true
 
-- name: Normalize the verified Technitium certificate path before comparison
+- name: Normalize verified Technitium settings before comparison
   ansible.builtin.set_fact:
     microlab_technitium_verified_settings_normalized: >-
       {{ microlab_technitium_verified_settings_response | combine({
            'dnsTlsCertificatePath':
              (microlab_technitium_verified_settings_response.get('dnsTlsCertificatePath', '')
-              | technitium_api_path(microlab_technitium_config_dir))
+              | technitium_api_path(microlab_technitium_config_dir)),
+           'dnsReverseProxyNetworkACL':
+             (microlab_technitium_verified_settings_response.get('dnsReverseProxyNetworkACL') | default([], true)
+              | map('regex_replace', '^127[.]0[.]0[.]1/32$', '127.0.0.1') | list)
          }) }}
   no_log: true
 

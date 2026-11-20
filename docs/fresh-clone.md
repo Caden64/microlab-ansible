@@ -114,6 +114,10 @@ and adds separate `setup.yml` / `setup-vault.yml` group-var files. It does not
 reset your existing secrets. Review its 24-hour powered-off budget default
 against your certificate lifetime and renewal policy before deploying.
 
+If an older setup generated 64-character Forgejo JWT keys and Forgejo has
+never started, replace those two keys in `setup-vault.yml`. Generate each
+independently using the JWT commands in [the advanced setup guide](setup.md#8-create-the-encrypted-vaultyml).
+
 Review non-secret values in your private `hosts.yml` and
 `group_vars/microlab_management/main.yml`. Use `ansible-vault edit` for an
 existing encrypted secrets file. Never print decrypted inventory, use `--diff`
@@ -277,6 +281,8 @@ and isolated restore are separate operational acceptance work. See
 
 Prepare its OS using [the Debian installation guide](rctf-debian-install.md),
 including the network reservation and KVM readiness checks, before this handoff.
+Use the [NUC deployment runbook](rctf-deployment.md) for the deployed layout,
+admin login, and service checks.
 
 Infra and workload share a player-accessible subnet, not a trust boundary.
 Workload host `.72` uses infra `.73` for internal DNS as authorized by its

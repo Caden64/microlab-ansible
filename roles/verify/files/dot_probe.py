@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perform one real DNS-over-TLS A query with strict certificate validation.
+"""Perform one DNS-over-TLS or DNS-over-HTTPS A query with certificate validation.
 
 This exists so the MicroLab verify role does not depend on kdig. It uses only
 the Python standard library, validates the server certificate and hostname with
@@ -13,6 +13,8 @@ response, or a wrong answer is not evidence that an ACL denied the client.
 """
 
 import argparse
+import base64
+import http.client
 import ipaddress
 import json
 import random
@@ -20,6 +22,7 @@ import socket
 import ssl
 import struct
 import sys
+from urllib.parse import quote
 
 EXIT_OK = 0
 EXIT_INTERNAL = 2
@@ -187,8 +190,38 @@ def finish(args, category, exit_code, detail, addresses=None):
         status["addresses"] = addresses
     write_status(args.status_file, **status)
     if exit_code != EXIT_OK:
-        print("DoT probe failed [{}]: {}".format(category, detail), file=sys.stderr)
+        protocol = "DoH" if args.doh_path else "DoT"
+        print("{} probe failed [{}]: {}".format(protocol, category, detail), file=sys.stderr)
     return exit_code
+
+
+def request_doh(tls, args, query):
+    # RFC 8484 GET carries the DNS wire message as unpadded base64url.
+    encoded = base64.urlsafe_b64encode(query).rstrip(b"=").decode("ascii")
+    path = quote(args.doh_path, safe="/")
+    authority = args.server_name
+    if args.port != 443:
+        authority = f"{authority}:{args.port}"
+    request = (
+        f"GET {path}?dns={encoded} HTTP/1.1\r\n"
+        f"Host: {authority}\r\n"
+        "Accept: application/dns-message\r\nConnection: close\r\n\r\n"
+    )
+    tls.sendall(request.encode("ascii"))
+    with http.client.HTTPResponse(tls) as response:
+        response.begin()
+        if args.expect_http_denial:
+            if response.status != 403:
+                raise ValueError(f"denial inconclusive: expected HTTP 403, got {response.status}")
+            return None
+        if response.status != 200:
+            raise ValueError(f"expected HTTP 200, got {response.status}")
+        if response.headers.get_content_type() != "application/dns-message":
+            raise ValueError("expected Content-Type application/dns-message")
+        body = response.read(65536)
+        if len(body) > 65535:
+            raise ValueError("oversized DoH response")
+        return body
 
 
 def main():
@@ -200,6 +233,8 @@ def main():
     parser.add_argument("--name", required=True)
     parser.add_argument("--expect", default="")
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--doh-path", help="Use DNS-over-HTTPS GET at this path.")
+    parser.add_argument("--expect-http-denial", action="store_true", help="Require HTTP 403 from DoH.")
     parser.add_argument(
         "--source-address",
         default="",
@@ -217,6 +252,8 @@ def main():
         help="Write a machine-readable JSON outcome with a stable category.",
     )
     args = parser.parse_args()
+    if args.expect_http_denial and not args.doh_path:
+        parser.error("--expect-http-denial requires --doh-path")
 
     query_id = random.randint(0, 0xFFFF)
     query = (
@@ -293,27 +330,30 @@ def main():
     try:
         with tls:
             tls.settimeout(args.timeout)
-            tls.sendall(struct.pack("!H", len(query)) + query)
-            header = tls.recv(2)
-            if len(header) != 2:
-                return finish(
-                    args,
-                    "protocol",
-                    EXIT_PROTOCOL,
-                    "missing DNS-over-TLS length prefix",
-                )
-            length = struct.unpack("!H", header)[0]
-            response = b""
-            while len(response) < length:
-                chunk = tls.recv(length - len(response))
-                if not chunk:
+            if args.doh_path:
+                response = request_doh(tls, args, query)
+                if response is None:
+                    print("doh denied observed_http=403")
+                    return finish(args, "http_denied", EXIT_OK, "server returned HTTP 403")
+            else:
+                tls.sendall(struct.pack("!H", len(query)) + query)
+                header = tls.recv(2)
+                if len(header) != 2:
                     return finish(
                         args,
                         "protocol",
                         EXIT_PROTOCOL,
-                        "truncated DNS-over-TLS response",
+                        "missing DNS-over-TLS length prefix",
                     )
-                response += chunk
+                length = struct.unpack("!H", header)[0]
+                response = b""
+                while len(response) < length:
+                    chunk = tls.recv(length - len(response))
+                    if not chunk:
+                        return finish(args, "protocol", EXIT_PROTOCOL, "truncated DNS-over-TLS response")
+                    response += chunk
+    except (http.client.HTTPException, ValueError) as exc:
+        return finish(args, "protocol", EXIT_PROTOCOL, str(exc))
     except (socket.timeout, TimeoutError) as exc:
         return finish(
             args,
@@ -337,6 +377,8 @@ def main():
         return finish(
             args, "protocol", EXIT_PROTOCOL, "DNS transaction ID mismatch"
         )
+    if not flags & 0x8000:
+        return finish(args, "protocol", EXIT_PROTOCOL, "DNS message is not a response")
     rcode = flags & 0x000F
     if rcode == 5:
         return finish(
@@ -360,7 +402,8 @@ def main():
     except ValueError as exc:
         return finish(args, "protocol", EXIT_PROTOCOL, str(exc))
 
-    print("DoT A {} -> {}".format(args.name, ",".join(addresses) or "(none)"))
+    protocol = "DoH" if args.doh_path else "DoT"
+    print("{} A {} -> {}".format(protocol, args.name, ",".join(addresses) or "(none)"))
     if not addresses:
         return finish(
             args,
@@ -379,7 +422,7 @@ def main():
             ),
             addresses=addresses,
         )
-    return finish(args, "ok", EXIT_OK, "validated DoT A answer", addresses=addresses)
+    return finish(args, "ok", EXIT_OK, f"validated {protocol} A answer", addresses=addresses)
 
 
 if __name__ == "__main__":

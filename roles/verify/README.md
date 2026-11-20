@@ -31,13 +31,11 @@ Run this role with `become: true` so it can read root-owned trust material and q
 - Real TLS certificates for each public site, verified against the public
   step-ca root, with hostname and expiry checks; Caddy's local issuer is
   rejected.
-- DoH at the exact `/dns-query` path returns a valid DNS JSON answer for the
-  expected A address (catches path stripping and query loss).
+- DoH at the exact `/dns-query` path returns the expected A address in an RFC 8484 DNS wire response. The probe
+  sends the DNS query in the base64url-encoded `dns` parameter.
 - Local DoH and DoT (`tasks/encrypted_dns.yml`) query `git.microlab.hnh` and
-  expect its `micolab_verify_expected_a_records` address. DoT uses a stdlib
-  Python probe with strict CA and hostname validation against
-  `micolab_verify_dot_host` (`dns.microlab.hnh`). Never opportunistic mode and
-  no external `kdig` dependency.
+  expect its `micolab_verify_expected_a_records` address. Both use a Python
+  standard-library probe that verifies the CA and server hostname.
 - Real Git over HTTPS acceptance: clone the explicitly supplied disposable
   test repository with a username/token supplied through an askpass helper,
   create a unique branch, stage exactly `micolab-verify.txt`, commit, push,
@@ -245,9 +243,8 @@ because it cannot prove source-specific isolation from a single delegated
 probe. Record such a result as a network limitation, not acceptance.
 
 For `doh`, a `denied` probe passes only with the Caddy ACL's explicit HTTP 403.
-A curl transport failure (`000`) is not denial evidence. An `allowed` DoH
-response must parse as DNS JSON with status 0 and contain the expected A
-address.
+The probe fails on transport errors and every other HTTP status. An `allowed`
+probe requires HTTP 200, a valid DNS wire response, and the expected A address.
 
 ### Technitium admin proxy trust
 

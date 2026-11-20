@@ -48,8 +48,8 @@ WAL and a 60000 ms busy timeout, and is exposed by `roles/caddy` at
 | `micolab_forgejo_artifact_src_arm64` | Controller path to the staged `forgejo-<version>-linux-arm64` binary. |
 | `micolab_forgejo_secret_key` | Durable Forgejo `SECRET_KEY` (32+ base64-style characters). |
 | `micolab_forgejo_internal_token` | Durable `INTERNAL_TOKEN` (32+ base64-style characters). |
-| `micolab_forgejo_jwt_secret` | Durable OAuth2 `JWT_SECRET` (32+ base64-style characters). |
-| `micolab_forgejo_lfs_jwt_secret` | Durable LFS JWT secret (32+ base64-style characters). |
+| `micolab_forgejo_jwt_secret` | Durable OAuth2 key, 32 random bytes encoded as 43 unpadded base64url characters. |
+| `micolab_forgejo_lfs_jwt_secret` | Separate durable LFS key in the same 32-byte format. |
 | `micolab_forgejo_admin_username` | Admin login, `[A-Za-z0-9_.-]+`. |
 | `micolab_forgejo_admin_email` | Admin email address. |
 | `micolab_forgejo_admin_password` | Admin password, at least 16 characters by default. |

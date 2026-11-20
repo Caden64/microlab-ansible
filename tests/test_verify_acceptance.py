@@ -742,85 +742,99 @@ class ProbeClassificationTests(unittest.TestCase):
         self.assertEqual(self.errors(probes), [])
 
 
+class DohTestServer:
+    def __init__(self, cert, key, answers):
+        self.log = []
+        self.answers = iter(answers)
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                url = urllib.parse.urlsplit(self.path)
+                encoded = urllib.parse.parse_qs(url.query).get("dns", [""])[0]
+                query = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+                fixture.log.append((self.headers.get("Host"), url.path, query[12:-4]))
+                if (url.path != "/dns-query" or len(query) < 17
+                        or self.headers.get("Accept") != "application/dns-message"):
+                    self.send_error(400)
+                    return
+                code, address = next(fixture.answers, (500, None))
+                self.send_response(code)
+                if code == 200:
+                    self.send_header("Content-Type", "application/dns-message")
+                self.end_headers()
+                if code == 200:
+                    header = query[:2] + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0)
+                    record = (b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4)
+                              + socket.inet_aton(address))
+                    self.wfile.write(header + query[12:] + record)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
 @unittest.skipUnless(yaml is not None, "PyYAML is required")
 class DohClassificationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="verify-doh-", dir=str(TMP_ROOT))
         cls.root = Path(cls.tmp.name)
-        cls.ca, _crt, _key = make_ca_and_server_cert(cls.root)
+        cls.ca, cls.crt, cls.key = make_ca_and_server_cert(cls.root)
         cls.script = external_acl_shell()
-        cls.bin = cls.root / "bin"
-        cls.bin.mkdir()
-        curl = cls.bin / "curl"
-        curl.write_text(
-            "#!/bin/sh\n"
-            "out=''\n"
-            "while [ $# -gt 0 ]; do\n"
-            "  case \"$1\" in\n"
-            "    -o) out=\"$2\"; shift 2 ;;\n"
-            "    *) shift ;;\n"
-            "  esac\n"
-            "done\n"
-            "if [ -n \"$out\" ] && [ -n \"${FAKE_DOH_BODY:-}\" ]; then\n"
-            "  printf '%s' \"$FAKE_DOH_BODY\" > \"$out\"\n"
-            "fi\n"
-            "printf '%s' \"${FAKE_DOH_CODE:-000}\"\n",
-            encoding="utf-8",
-        )
-        curl.chmod(0o700)
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def probe_env(self, expect, code, body=""):
-        return {
-            "CHECK": "doh",
-            "EXPECT": expect,
-            "CA_FILE": str(self.ca),
-            "TIMEOUT": "2",
-            "TARGET_HOST": "127.0.0.1",
-            "MGMT_IP": "127.0.0.1",
-            "HTTPS_PORT": "443",
-            "DOH_HOST": "127.0.0.1",
-            "DOH_PATH": "/dns-query",
-            "PROBE_NAME": "ns.example",
-            "PROBE_IP": "10.0.0.5",
-            "DOT_PROBE": str(DOT_PROBE),
-            "DOT_HOST": "127.0.0.1",
-            "DOT_PORT": "853",
-            "FAKE_DOH_CODE": code,
-            "FAKE_DOH_BODY": body,
-        }
+    def run_probe(self, expect, code, answer="10.0.0.5"):
+        server = DohTestServer(self.crt, self.key, [(code, answer)])
+        try:
+            return run_external_acl_script(self.script, {
+                "CHECK": "doh",
+                "EXPECT": expect,
+                "CA_FILE": str(self.ca),
+                "TIMEOUT": "2",
+                "MGMT_IP": "127.0.0.1",
+                "HTTPS_PORT": str(server.port),
+                "DOH_HOST": "127.0.0.1",
+                "DOH_PATH": "/dns-query",
+                "PROBE_NAME": "ns.example",
+                "PROBE_IP": "10.0.0.5",
+                "DOT_PROBE": str(DOT_PROBE),
+            })
+        finally:
+            server.close()
 
-    def test_allowed_doh_requires_expected_answer(self):
-        body = json.dumps({"Status": 0, "Answer": [{"type": 1, "data": "10.0.0.5"}]})
-        result = run_external_acl_script(
-            self.script, self.probe_env("allowed", "200", body), fake_curl_dir=self.bin
-        )
+    def test_allowed_doh_requires_expected_wire_answer(self):
+        result = self.run_probe("allowed", 200)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
-
-        wrong = json.dumps({"Status": 0, "Answer": [{"type": 1, "data": "10.0.0.9"}]})
-        result = run_external_acl_script(
-            self.script, self.probe_env("allowed", "200", wrong), fake_curl_dir=self.bin
-        )
+        result = self.run_probe("allowed", 200, "10.0.0.9")
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wrong_answer", result.stderr)
+        result = self.run_probe("allowed", 302)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected HTTP 200, got 302", result.stderr)
 
     def test_only_explicit_403_counts_as_doh_denial(self):
-        for code in ("403",):
+        result = self.run_probe("denied", 403)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("doh denied observed_http=403", result.stdout)
+        for code in (200, 302, 401, 404, 500):
             with self.subTest(code=code):
-                result = run_external_acl_script(
-                    self.script, self.probe_env("denied", code), fake_curl_dir=self.bin
-                )
-                self.assertEqual(result.returncode, 0, msg=result.stderr)
-                self.assertIn("doh denied observed_http=403", result.stdout)
-
-        for code in ("000", "401", "404", "500", "200"):
-            with self.subTest(code=code):
-                result = run_external_acl_script(
-                    self.script, self.probe_env("denied", code), fake_curl_dir=self.bin
-                )
+                result = self.run_probe("denied", code)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("inconclusive", result.stderr)
 
